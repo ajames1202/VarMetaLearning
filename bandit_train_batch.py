@@ -181,7 +181,8 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
             reward_logits = agent.reward_compute(h_rnn).squeeze(0)  # (2,) -> [logit_left, logit_right]
 
             # 2) Convert logits -> probabilities
-            probs = torch.sigmoid(reward_logits)  # (2,), in (0,1)
+            eps = 1e-4
+            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)  # (2,)  # (2,), in (0,1)
             p_left, p_right = probs[0], probs[1]
 
             # 3) Build an approximate Beta posterior around each p
