@@ -438,10 +438,13 @@ if __name__ == "__main__":
                 # (example: alternate high/low like before)
                 # You can use any schedule you like here.
                 global_ses = update_idx * B + total_sessions_collected + w_id
-                if global_ses % 2 == 0:
-                    probs_this_session = [(0.8, 0.2)] * session_K
-                else:
-                    probs_this_session = [(0.2, 0.8)] * session_K
+                # if global_ses % 2 == 0:
+                #     probs_this_session = [(0.8, 0.2)] * session_K
+                # else:
+                #     probs_this_session = [(0.2, 0.8)] * session_K
+                L = np.random.uniform(0.1, 0.9, size=session_K)
+                R = 1.0 - L
+                probs_this_session = [(L[i], R[i]) for i in range(session_K)]
                 probs_list.append(probs_this_session)
 
             # ---------- broadcast current weights (CPU) ----------
