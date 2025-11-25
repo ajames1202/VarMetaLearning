@@ -12,7 +12,7 @@ import argparse
 
 
 import visual_bandit_env2 as vbe
-import var_bandit_learner as bl
+import var_bandit_learner2 as bl
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
 import pygame
@@ -52,7 +52,7 @@ class RolloutWorker:
         # rebuild a fresh agent with same hyperparams as in main
         hidden_size = 128
         feature_dim = 128
-        input_size = feature_dim + 2 + 1
+        input_size = feature_dim + 2 + 1 + 1
 
         agent = bl.BanditLearner(
             input_size=input_size,
@@ -72,12 +72,8 @@ class RolloutWorker:
 
         with torch.no_grad():
             return meta_ep_rollout(
-                self.env,
-                agent,
-                self.device,
-                [], [], [], [], [], [], [],   # empty buffers
-                self.session_K,
-                self.session_N,
+                self.env, agent, self.device,
+                self.session_K, self.session_N,
                 worker_id=self.worker_id,
                 print_this_session=print_this_session
             )
@@ -106,7 +102,7 @@ def load_checkpoint(path, agent, optimizer=None, map_location="cpu"):
 
 
                     
-def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, ep_start_buf, done_buf, choice_target_buf, session_K, session_N, worker_id=0, print_this_session=False):
+def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print_this_session=False):
 
     def log(*args, **kwargs):
         if worker_id == 0:
@@ -125,22 +121,19 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
     high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32) # counts per N
 
     # prev_action = torch.zeros((1, agent.action_dim), dtype=torch.float32, device=device)  # assuming action_dim=2
-    ep_start_flag = 1.0  # Indicates the start of a new episode
-    # choice_inp_ep_start = None # initial choice input is None, computed at t=0, then constant until t=T
-    # choice_logit_ep_start = None # initial choice prob is None, computed at t=0, then constant until t=T
-    choice_target = None # initial choice target is None, computed at t=0, then constant until t=T
-    episode_timeout = np.empty((0,), dtype=np.float32)
-    ep_len = 0
-    info_buf = []
-    bandit_rewards_buf = []
+    meta_ep_len = 0
     xy_pos_buf = []
     goal_vec_buf = []
-    choice_logp_buf = []
-    seen_before_buf = []
-    feats_buf = []
+    feats_motor = []
+    chosen_bandits_motor_buf = []
+    feats_bandit = []
+    chosen_bandits_buf = []
+    bandit_rewards_buf = []
+    meta_ep_start_buf = []
+
     # rnn_outputs = torch.empty((0, agent.gru.hidden_size), dtype=torch.float32, device=device)
-    logp = 0.0
     t = 0
+    ep_start_flag = 1.0  # first step of episode
     while not done:
         obs_tensor = (
             torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
@@ -149,14 +142,11 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
         if agent.feature_source == "vision":
             features = agent.encode(small).squeeze(0)
                  # (F,) for this step
-        ep_start = torch.tensor([[ep_start_flag]], device=device, dtype=torch.float32).squeeze(0)  # (1,) -> we'll expand below
-
 
         # CHOICE at episode start
         if ep_start_flag == 1.0:
                 # build single-step tensors as (1, D)
             # f1  = features.unsqueeze(0)        # (1, F)
-            es1 = ep_start.unsqueeze(0)        # (1, 1)
             if agent.feature_source == "ids":
                 # NB: make sure these are 0-based; if your env is 1-based, subtract 1.
                 pair_idx_now  = info.get("pair_index_in_session", -1)
@@ -202,9 +192,10 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
 
             samples = torch.stack([u_left, u_right])           # (2,)
             a_t = torch.argmax(samples)                        # index of chosen arm
-            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0)  # (1,2)
+            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
 
-            ep += 1
+
+            meta_ep_len += 1
 
 
         # --- Motor forward (now we have choice_target) ---
@@ -237,48 +228,27 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
         action = torch.tanh(y)
         action_np = action.squeeze(0).detach().cpu().numpy()
 
-        info_buf.append(info)  # store info for training
         next_obs, reward, term, _, info = env.step(action_np)
-        ep_len += 1
         done = term
         
-        bandit_reward_t = reward
-
         pair_idx_now = info.get("pair_index_in_session", -1)
 
-        if ep_start_flag == 1.0 and pair_idx_now != -1:
-            # true at the first step of the trial; before incrementing counters
-            seen_before_flag = float(pair_index_counter[pair_idx_now] >= 0)
-        else:
-            seen_before_flag = 0.0  # we only supervise at starts
 
-        seen_before_buf.append(seen_before_flag)
-
-        feats_buf.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
+        feats_motor.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
         small_np = small.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
-        obs_buf.append(small_np.astype(np.uint8))
-        pretanh_buf.append(y.squeeze(0).detach().cpu().numpy())
-        act_buf.append(action_np.astype(np.float32))
-        ep_start_buf.append(ep_start_flag)
-        choice_target_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
-        done_buf.append(False)
-        bandit_rewards_buf.append(bandit_reward_t)
-        choice_logp_buf.append(0)
-
-        # xy_pos_buf.append(xy_norm.astype(np.float32))   # (2,)
+        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
 
 
         if info.get("trial_ended"):
+            meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
+            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)  # (1,)
             
-            #Apply reward and logp correction for bandit choice
             if choice_target.argmax(dim=-1).item() != info.get("selected_target"):
                 reward = 0
             else:
-                done_buf[t] = True    
                 a_oh        = choice_target                                           # (1, 2) one-hot choice
                 r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-                value_rnn_out, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, h_rnn)           # update GRU memory
-                # rnn_outputs = torch.cat((rnn_outputs, rnn_out.detach()), dim=0)  # (T, H)
+                _, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
             
             pair_index_ep = info.get("pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
@@ -301,19 +271,20 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
             ep_start_flag = 1.0
             # print("Trial ended. t=", t, ", pair_index_ep=", pair_index_ep, ", pair_idx_t=", pair_idx_t,  ", choice_target:", choice_target, "reward:", reward, ", done_buf[t]=", done_buf[t])
 
+            feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
+            chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
+            bandit_rewards_buf.append(reward)  # scalar
+            if(meta_ep_len == 1):
+                meta_ep_start_buf.append(1.0)
+            else:
+                meta_ep_start_buf.append(0.0)    
+
             choice_target = None
-            # prev_action.zero_()
-            # prev_reward.zero_()
-            mask = np.zeros(ep_len, dtype=np.float32) if info.get("timeout") else np.ones(ep_len, dtype=np.float32)
-            episode_timeout = np.concatenate((episode_timeout, mask), axis=0)
-            ep_len = 0  
-            # ep = 0
- 
+
     
         else:
             ep_start_flag = 0.0
 
-        rew_buf.append(float(reward))
         
 
         obs = next_obs
@@ -322,7 +293,7 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
         # prev_reward = torch.as_tensor([[reward]], dtype=torch.float32, device=device)
 
     # print("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
-    log("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
+    # log("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
 
     high_reward_choice_count_on_left = info.get("high_reward_choice_count_on_left", -1)
     high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right",-1)
@@ -335,7 +306,6 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
         ", on right:", high_reward_choice_count_on_right,
         ", Total left choices:", total_left_choices,
         ", Total right choices:", total_right_choices,
-        ", Total trials in session:", len(rew_buf)
     )
 
     high_reward_choice_per_N = high_reward_choice_per_N.astype(float)
@@ -347,8 +317,7 @@ def meta_ep_rollout(env, agent, device, obs_buf, pretanh_buf, act_buf, rew_buf, 
     #       f"flip_consistency={np.mean(info['probe_flip_consistency']):.3g}")
 
     
-    return obs_buf, pretanh_buf, act_buf, rew_buf, bandit_rewards_buf, ep_start_buf, xy_pos_buf, goal_vec_buf, done_buf, choice_target_buf, choice_logp_buf, episode_timeout, info, high_reward_choice_per_N, info_buf, seen_before_buf, feats_buf
-
+    return xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N
 
 if __name__ == "__main__":
 
@@ -373,7 +342,8 @@ if __name__ == "__main__":
 
     hidden_size = 128
     feature_dim = 128
-    input_size = feature_dim + 2 + 1
+    input_size = feature_dim + 2 + 1 + 1
+
 
     agent = bl.BanditLearner(
         input_size=input_size,
@@ -415,12 +385,15 @@ if __name__ == "__main__":
         total_sessions_collected = 0
 
         # global buffers across all sessions in this update
-        batch_rew         = []
-        batch_choice_tgts = []
         batch_xy_pos      = []
         batch_goal_vec    = []
-        batch_done        = []
-        batch_feats       = []
+        batch_feats_motor = []
+        batch_chosen_bandits_motor = []
+        batch_feats_bandit = []
+        batch_chosen_bandits = []
+        batch_bandit_rewards = []
+        batch_meta_ep_start = []
+
 
         highR_perN_list   = []
         cum_rewards_list  = []
@@ -474,39 +447,43 @@ if __name__ == "__main__":
 
             # ---------- aggregate results ----------
             for res in rollout_results:
-                (obs_buf, pretanh_buf, act_buf, rew_buf, bandit_rewards_buf,
-                 ep_start_buf, xy_pos_buf, goal_vec_buf, done_buf,
-                 choice_target_buf, choice_logp_buf, episode_timeouts, info,
-                 high_reward_choice_per_N, info_buf, seen_before_buf, feats_buf) = res
+                (xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, 
+                 feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N) = res
 
-                batch_rew.extend(rew_buf)
-                batch_choice_tgts.extend(choice_target_buf)
+
                 batch_xy_pos.extend(xy_pos_buf)
                 batch_goal_vec.extend(goal_vec_buf)
-                batch_done.extend(done_buf)
-                batch_feats.extend(feats_buf)
+                batch_feats_motor.extend(feats_motor)
+                batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
+                batch_feats_bandit.extend(feats_bandit)
+                batch_chosen_bandits.extend(chosen_bandits_buf)
+                batch_bandit_rewards.extend(bandit_rewards_buf)
+                batch_meta_ep_start.extend(meta_ep_start_buf)
+
 
                 highR_perN_list.append(high_reward_choice_per_N)
-                cum_rewards_list.append(info["cum_session_rewards"])
+                cum_rewards_list.append(high_reward_choice_per_N.sum()*session_K)
 
                 total_sessions_collected += 1
                 if total_sessions_collected >= B:
                     break  # in case we overshoot slightly with num_launch
 
 
-        print(f"batch_rew len: {len(batch_rew)}, batch_choice_tgts len: {len(batch_choice_tgts)}")
+        print(f"batch_rew len: {len(batch_xy_pos)}, batch_choice_tgts len: {len(batch_meta_ep_start)}")
         # --------------------------------------------------
         #   Now we have ~B sessions worth of data -> one update
         # --------------------------------------------------
         loss, policy_loss = agent.update2(
             optim_bandit, optim_motor,
-            batch_rew,
-            batch_choice_tgts,
             batch_xy_pos,
             batch_goal_vec,
-            batch_done,
-            batch_feats,
-            device,
+            batch_feats_motor,
+            batch_chosen_bandits_motor,
+            batch_feats_bandit,
+            batch_chosen_bandits,
+            batch_bandit_rewards,
+            batch_meta_ep_start,
+            device
         )
 
         # logging

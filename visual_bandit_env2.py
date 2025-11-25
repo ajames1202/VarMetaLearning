@@ -426,7 +426,7 @@ class TwoChoiceReachingEnv(gym.Env):
             reached = True
             p = float(self.curr_probs[chose_side])
             reward = 1.0 if (self.rng.random() < p) else 0.0
-            print(f"[Env] Trial {self.trial_index}: reached side {'L' if chose_side==0 else 'R'} with p={p:.2f}, reward={reward}")
+            # print(f"[Env] Trial {self.trial_index}: reached side {'L' if chose_side==0 else 'R'} with p={p:.2f}, reward={reward}")
             selected_high = (chose_side == (0 if self.curr_probs[0] >= self.curr_probs[1] else 1))
             if selected_high:
                 self.high_reward_choice_count += 1

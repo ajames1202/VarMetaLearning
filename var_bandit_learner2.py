@@ -102,7 +102,7 @@ class BanditLearner(nn.Module):
         return self.enc(x)    
 
     
-    def rnn_fwd(self, features, action, reward, h):
+    def rnn_fwd(self, features, action, reward, meta_ep_start, h):
         """
         features: (T, D_f)      or (T, B, D_f)
         action:   (T, D_a)      or (T, B, D_a)
@@ -113,7 +113,7 @@ class BanditLearner(nn.Module):
             out:   (T, H)       or (T, B, H)   (same rank as features)
             new_h: (1, H)       or (1, B, H)
         """
-        x = torch.cat([features, action, reward], dim=-1).to(features.dtype).to(features.device)
+        x = torch.cat([features, action, reward, meta_ep_start], dim=-1).to(features.dtype).to(features.device)
 
         # Case 1: unbatched old-style input (T, D)
         if x.dim() == 2:
@@ -213,22 +213,20 @@ class BanditLearner(nn.Module):
             for p in m.parameters():
                 yield p
 
-    def update2(self, optim_bandit, optim_motor, rew_buf, choice_target_buf, xy_pos_buf, goal_vec_buf, done_buf, feats_buf, device):
+    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf,feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, device):
         
-        T = len(rew_buf)
-        rewards   = torch.as_tensor(rew_buf, dtype=torch.float32, device=device)
-
-        chosen_bandits = torch.as_tensor(np.stack(choice_target_buf), device=device, dtype=torch.float32)
-        # prev_bandit_rewards = torch.cat([torch.zeros(1, device=device), bandit_rewards_buf[:-1]], dim=0).unsqueeze(-1)
-
 
         xy_pos   = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
         goalvec  = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
+        feats_motor = torch.as_tensor(np.stack(feats_motor), device=device, dtype=torch.float32)
+        chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
-        feat_t = torch.as_tensor(np.stack(feats_buf), device=device, dtype=torch.float32)
+        feats_bandit = torch.as_tensor(np.stack(feats_bandit), device=device, dtype=torch.float32)
+        chosen_bandits = torch.as_tensor(np.stack(chosen_bandits_buf), device=device, dtype=torch.float32)
+        rewards_bandits = torch.as_tensor(np.stack(bandit_rewards_buf), device=device, dtype=torch.float32) 
+        meta_ep_start = torch.as_tensor(np.stack(meta_ep_start_buf), device=device, dtype=torch.float32)
 
         num_epochs = 4         
-        tbptt_len = 100
 
         var_loss_sum, var_slices = 0.0, 0
         motor_loss_sum, motor_slices   = 0.0, 0
@@ -241,102 +239,79 @@ class BanditLearner(nn.Module):
 
 
             h_rnn  = torch.zeros(1, self.rnn.hidden_size, device=device)
-            rnn_out = 
 
-            for t0 in range(0, T, tbptt_len):
-                t1 = min(t0 + tbptt_len, T)
-                # print("Processing chunk:", t0, "to", t1)
+            # --- RNN forward step --
+            rewards_rnn = rewards_bandits.unsqueeze(-1)   # (S,1)
+            start_rnn   = meta_ep_start.unsqueeze(-1)     # (S,1)
 
-                feats_chunk = feat_t[t0:t1]
-                # S_mask_chunk = start_mask[t0:t1]                # starts in this chunk
-                done_mask_chunk = torch.as_tensor(done_buf[t0:t1], device=device, dtype=torch.bool)
-                done_indices = torch.where(done_mask_chunk)
-                # print("done indices in chunk:", indices)
+            rnn_out, h_rnn = self.rnn_fwd(
+                feats_bandit, chosen_bandits, rewards_rnn, start_rnn, h_rnn)               # rnn_out: (1, H), h_rnn: (1, 1, H)
+            
 
-                done_mask_chunk = torch.as_tensor(done_buf[t0:t1], device=device, dtype=torch.bool)
+            h_seq_orig = torch.zeros_like(rnn_out)
+            h_seq_orig[1:] = rnn_out[:-1] # shift by 1
+            reward_logits = self.reward_compute(h_seq_orig)  # (S, 2)
+            left_logits  = reward_logits[:, 0]           # (S,)
+            right_logits = reward_logits[:, 1]           # (S,)
 
-                # print("done_mask_chunk:", torch.nonzero(done_mask_chunk, as_tuple=False).squeeze(1))
-                if done_mask_chunk.any():
-                    # --- Build START features from IDs (as before) ---
-                        # --- Build START features ---
-                    feats_S = feats_chunk[done_indices]  # (S, F)
+                        # 2) Bernoulli distributions over binary rewards
+            p_left_rwd  = torch.distributions.Bernoulli(logits=left_logits) #()
+            p_right_rwd = torch.distributions.Bernoulli(logits=right_logits)
 
-                    # --- Actions and rewards for those trials ---
-                    chosen_all = torch.as_tensor(
-                        np.stack(choice_target_buf), device=device, dtype=torch.float32
-                    )                                      # (T, 2)
-                    chosen_S = chosen_all[t0:t1][done_indices]   # (S, 2)
-                    r_S      = rewards[t0:t1][done_indices]      # (S,)
+            # r_S is in {0,1}, shape (S,)
+            logp_left  = p_left_rwd.log_prob(rewards_bandits)        # (B, session_N
+            logp_right = p_right_rwd.log_prob(rewards_bandits)       # (B, session_N)
 
+            # 3) Select log-prob for the chosen arm
+            logp_rewards = torch.where(
+                chosen_bandits[:, 0] == 1,    # left chosen?
+                logp_left,
+                logp_right
+            )
+            var_logp_loss = logp_rewards.mean()
 
-                    # 1) Get logits for reward probabilities
-                    reward_logits = self.reward_compute(rnn_out)  # (S, 2)
-                    left_logits  = reward_logits[:, 0]           # (S,)
-                    right_logits = reward_logits[:, 1]           # (S,)
+            
+            eps = 1e-8
+            probs = torch.sigmoid(reward_logits)  # (S, 2), left & right probabilities
+            prior_p = 0.5
 
-                    # 2) Bernoulli distributions over binary rewards
-                    p_left_rwd  = torch.distributions.Bernoulli(logits=left_logits)
-                    p_right_rwd = torch.distributions.Bernoulli(logits=right_logits)
-
-                    # r_S is in {0,1}, shape (S,)
-                    logp_left  = p_left_rwd.log_prob(r_S)        # (S,)
-                    logp_right = p_right_rwd.log_prob(r_S)       # (S,)
-
-                    # 3) Select log-prob for the chosen arm
-                    logp_rewards = torch.where(
-                        chosen_S[:, 0] == 1,    # left chosen?
-                        logp_left,
-                        logp_right
-                    )
-                    var_logp_loss = logp_rewards.mean()
-                    
-                     # 2) Run GRU over these S trials             
-                    rnn_out, h_rnn = self.rnn_fwd(
-                        feats_S, chosen_S, r_S.unsqueeze(1), h_rnn)
-
-                    eps = 1e-8
-                    probs = torch.sigmoid(reward_logits)  # (S, 2), left & right probabilities
-                    prior_p = 0.5
-
-                    # KL(Bernoulli(p) || Bernoulli(0.5)) per arm
-                    var_kl_loss = (
-                        probs * (torch.log(probs + eps) - math.log(prior_p)) +
-                        (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
-                    ).sum(dim=1).mean()  # sum over arms, mean over S
+            # KL(Bernoulli(p) || Bernoulli(0.5)) per arm
+            var_kl_loss = (
+                probs * (torch.log(probs + eps) - math.log(prior_p)) +
+                (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
+            ).sum(dim=1).mean()  # sum over arms, mean over S
 
 
-                    variational_loss = -var_logp_loss + 0.1 * var_kl_loss
+            variational_loss = -var_logp_loss + 0.1 * var_kl_loss
 
-                    variational_loss.backward()
+            variational_loss.backward()
 
-                    var_loss_sum += variational_loss.item()
-                    var_slices   += 1
-
-
-
-                # ---- MOTOR loss (supervised reach) on this slice ----
-                mu, log_std = self.motor_fwd(
-                    chosen_bandits[t0:t1].detach(),  # no credit to choice through motor
-                    xy_pos[t0:t1],
-                    goalvec[t0:t1]
-                )
-
-                dist   = goalvec[t0:t1].norm(dim=-1, keepdim=True) + 1e-6
-                g_hat  = goalvec[t0:t1] / dist
-                speed  = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
-                target = (g_hat * speed).clamp(-0.999, 0.999)
-                u_target = atanh(target)
-                L_reach  = F.mse_loss(mu, u_target)
-                motor_loss = L_reach
-                motor_loss_sum += motor_loss.item()
-                motor_slices   += 1
+            var_loss_sum = variational_loss.item()
+                
+                
 
 
-                motor_loss.backward()
+            # ---- MOTOR loss (supervised reach) on this slice ----
+            mu, log_std = self.motor_fwd(
+                chosen_bandits_motor,  # no credit to choice through motor
+                xy_pos,
+                goalvec
+            )
+
+            dist   = goalvec.norm(dim=-1, keepdim=True) + 1e-6
+            g_hat  = goalvec / dist
+            speed  = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
+            target = (g_hat * speed).clamp(-0.999, 0.999)
+            u_target = atanh(target)
+            L_reach  = F.mse_loss(mu, u_target)
+            motor_loss = L_reach
+            motor_loss_sum += motor_loss.item()
+            motor_slices   += 1
 
 
-                # <<< TBPTT: cut history here >>>
-                h_rnn = h_rnn.detach()
+            motor_loss.backward()
+
+
 
             # torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), 1.0)
