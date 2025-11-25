@@ -368,7 +368,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(log_dir)
 
 
-    session_K = 1
+    session_K = 3
     session_N = 20
 
     hidden_size = 128
@@ -533,10 +533,10 @@ if __name__ == "__main__":
         writer.add_scalar("Reward/MeanCumSession", mean_cum_rew, global_step)
 
         # per-N stats (either as histogram or individual scalars)
-        writer.add_histogram("Policy/HighRewardChoicePerN", mean_highR_perN, global_step)
+        # writer.add_histogram("Policy/HighRewardChoicePerN", mean_highR_perN, global_step)
         # or, if you want separate curves:
-        # for n, val in enumerate(mean_highR_perN):
-        #     writer.add_scalar(f"Policy/HighRewardChoicePerN_N{n}", val, global_step)
+        for n, val in enumerate(mean_highR_perN):
+            writer.add_scalar(f"Policy/HighRewardChoicePerN_N{n}", val, global_step)
 
         if (update_idx + 1) % 10 == 0:
             for name, param in agent.named_parameters():
