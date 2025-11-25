@@ -516,9 +516,9 @@ if __name__ == "__main__":
         for n, val in enumerate(mean_highR_perN):
             writer.add_scalar(f"Policy/HighRewardChoicePerN_N{n}", val, global_step)
 
-        if (update_idx + 1) % 10 == 0:
-            for name, param in agent.named_parameters():
-                writer.add_histogram(f"Params/{name}", param.detach().cpu().numpy(), global_step)
+        # if (update_idx + 1) % 10 == 0:
+        #     for name, param in agent.named_parameters():
+        #         writer.add_histogram(f"Params/{name}", param.detach().cpu().numpy(), global_step)
 
 
 
