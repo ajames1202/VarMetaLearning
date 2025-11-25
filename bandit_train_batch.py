@@ -443,8 +443,12 @@ if __name__ == "__main__":
                 #     probs_this_session = [(0.8, 0.2)] * session_K
                 # else:
                 #     probs_this_session = [(0.2, 0.8)] * session_K
-                L = np.random.uniform(0.1, 0.9, size=session_K)
-                R = 1.0 - L
+                # L = np.random.uniform(0.1, 0.9, size=session_K)
+                # L = [(0.8)]* session_K if np.random.rand() < 0.5 else [(0.2)]* session_K
+                # R = 1.0 - L
+                L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
+                R = [1.0 - x for x in L]
+
                 probs_this_session = [(L[i], R[i]) for i in range(session_K)]
                 probs_list.append(probs_this_session)
 
