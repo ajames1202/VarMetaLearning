@@ -316,8 +316,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     #     print(f"probe: fam_inv_err={np.mean(info['probe_fam_inv_err']):.3g}, "
     #       f"flip_consistency={np.mean(info['probe_flip_consistency']):.3g}")
 
+    cum_rewards = sum(bandit_rewards_buf)
     
-    return xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N
+    return xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards
 
 if __name__ == "__main__":
 
@@ -448,7 +449,7 @@ if __name__ == "__main__":
             # ---------- aggregate results ----------
             for res in rollout_results:
                 (xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, 
-                 feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N) = res
+                 feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards) = res
 
 
                 batch_xy_pos.extend(xy_pos_buf)
@@ -462,7 +463,7 @@ if __name__ == "__main__":
 
 
                 highR_perN_list.append(high_reward_choice_per_N)
-                cum_rewards_list.append(high_reward_choice_per_N.sum()*session_K)
+                cum_rewards_list.append(cum_rewards)
 
                 total_sessions_collected += 1
                 if total_sessions_collected >= B:
