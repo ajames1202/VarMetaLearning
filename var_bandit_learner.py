@@ -228,7 +228,7 @@ class BanditLearner(nn.Module):
         feat_t = torch.as_tensor(np.stack(feats_buf), device=device, dtype=torch.float32)
 
         num_epochs = 4         
-        tbptt_len = 5000
+        tbptt_len = 100
 
         var_loss_sum, var_slices = 0.0, 0
         motor_loss_sum, motor_slices   = 0.0, 0
