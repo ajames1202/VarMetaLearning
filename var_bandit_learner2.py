@@ -71,7 +71,12 @@ class BanditLearner(nn.Module):
         self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
 
         # choice_inp = rnn_hidden_size
-        self.rewards_head = nn.Sequential(nn.Linear(rnn_hidden_size,128), nn.ReLU(), nn.Linear(128,2))  # bernoulli params for 2-armed bandit
+        # bernoulli params for 2-armed bandit
+        self.rewards_head = nn.Sequential(
+            nn.Linear(rnn_hidden_size + feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2)
+        )
         # self.choice_v_head = nn.Sequential(nn.Linear(combined_dim,128), nn.ReLU(), nn.Linear(128,1))
 
         # NEW: critic for the bandit choice (value at trial start)
@@ -142,10 +147,12 @@ class BanditLearner(nn.Module):
 
     
     
-    def reward_compute(self, rnn_out):
-        # rnn_out: (T, H)
-        reward_logits = self.rewards_head(rnn_out)  # (S, 2)
-        return reward_logits
+    def reward_compute(self, rnn_out, curr_feat):
+        # rnn_out: (S,H) or (1,H)
+        # curr_feat: (S,F) or (1,F)
+        x = torch.cat([rnn_out, curr_feat], dim=-1)
+        return self.rewards_head(x)  # (S,2) or (1,2)
+
 
         
     def motor_fwd(self, choice_target, xy_pos=None, goal_vec=None):
@@ -250,7 +257,7 @@ class BanditLearner(nn.Module):
 
             h_seq_orig = torch.zeros_like(rnn_out)
             h_seq_orig[1:] = rnn_out[:-1] # shift by 1
-            reward_logits = self.reward_compute(h_seq_orig)  # (S, 2)
+            reward_logits = self.reward_compute(h_seq_orig, feats_bandit)  # (S, 2)
             left_logits  = reward_logits[:, 0]           # (S,)
             right_logits = reward_logits[:, 1]           # (S,)
 

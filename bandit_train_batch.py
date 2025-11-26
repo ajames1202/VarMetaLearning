@@ -169,7 +169,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # --- Bandit forward for choice (Thompson sampling with Bernoulli head) ---
 
             # 1) Get logits from the bandit head using current RNN state
-            reward_logits = agent.reward_compute(h_rnn).squeeze(0)  # (2,) -> [logit_left, logit_right]
+            reward_logits = agent.reward_compute(h_rnn, f1).squeeze(0)  # (2,) -> [logit_left, logit_right]
 
             # 2) Convert logits -> probabilities
             eps = 1e-4
@@ -244,12 +244,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
             meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)  # (1,)
             
-            if choice_target.argmax(dim=-1).item() != info.get("selected_target"):
-                reward = 0
-            else:
-                a_oh        = choice_target                                           # (1, 2) one-hot choice
-                r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-                _, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
+            # if choice_target.argmax(dim=-1).item() != info.get("selected_target"):
+            #     reward = 0
+            # else:
+            a_oh        = choice_target                                           # (1, 2) one-hot choice
+            r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
+            _, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
             
             pair_index_ep = info.get("pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
