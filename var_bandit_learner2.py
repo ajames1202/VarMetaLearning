@@ -49,29 +49,27 @@ def log_prob_tanh_gaussian(mu, log_std, pretahn_actions):
 class BanditLearner(nn.Module):
     def __init__(self, input_size, feature_dim, rnn_hidden_size, action_dim,
                  log_std_min=-5.0, log_std_max=-1.0,
-                 feature_source="vision", num_pairs=None, max_trials=None):
+                 num_pairs=None, max_trials=None):
         nn.Module.__init__(self)
 
         self.downsample = nn.AvgPool2d(kernel_size=4, stride=4)
-        self.feature_source = feature_source
 
         self.debug_gru_inputs = {"rollout": [], "update": []}
 
 
-        if feature_source == "vision":
-            self.enc = CNNEncoder(feature_dim)
-        else:
-            # build embeddings that together sum to feature_dim
-            self.pair_emb = nn.Embedding(num_pairs, feature_dim)  # Full feature_dim
-
-            self.enc = None  # no CNN
+        self.enc = CNNEncoder(feature_dim)
 
         # --- Bandit RNN + heads
         # input_size = feature_dim + 2 + 1  # features + prev_action(2) + prev_reward(1)
         self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
 
         # choice_inp = rnn_hidden_size
-        self.rewards_head = nn.Sequential(nn.Linear(rnn_hidden_size,128), nn.ReLU(), nn.Linear(128,2))  # bernoulli params for 2-armed bandit
+        self.rewards_head = nn.Sequential(
+            nn.Linear(rnn_hidden_size + feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2)
+        )
+
         # self.choice_v_head = nn.Sequential(nn.Linear(combined_dim,128), nn.ReLU(), nn.Linear(128,1))
 
         # NEW: critic for the bandit choice (value at trial start)
@@ -142,10 +140,12 @@ class BanditLearner(nn.Module):
 
     
     
-    def reward_compute(self, rnn_out):
-        # rnn_out: (T, H)
-        reward_logits = self.rewards_head(rnn_out)  # (S, 2)
-        return reward_logits
+    def reward_compute(self, rnn_out, curr_feat):
+        # rnn_out: (S,H) or (1,H)
+        # curr_feat: (S,F) or (1,F)
+        x = torch.cat([rnn_out, curr_feat], dim=-1)
+        return self.rewards_head(x)  # (S,2) or (1,2)
+
 
         
     def motor_fwd(self, choice_target, xy_pos=None, goal_vec=None):
@@ -169,27 +169,15 @@ class BanditLearner(nn.Module):
         # value   = self.value_head(critic_inp).squeeze(-1)
         return mu, log_std
     
-    def make_ctx_from_ids(self, pair_idx):
-        # pair_idx, trial_idx: (S,)
 
-        # print("pair.idx:", pair_idx, ", trial.idx:", trial_idx)
-        
-        e1 = self.pair_emb(pair_idx)      # (S, d1)
-        # e2 = self.trial_emb(trial_idx)    # (S, d2)
-        return e1 # (S, feature_dim)
-    
     def bandit_parameters(self):
         # everything that should be updated by bandit_loss
         modules = []
 
-        if self.feature_source == "vision" and self.enc is not None:
-            modules.append(self.enc)
-        elif self.feature_source == "ids":
-            modules.append(self.pair_emb)
-
         modules += [
             self.rnn,
             self.rewards_head,
+            self.enc
             # self.fam_head,   # if you use familiarity as bandit aux
         ]
 
@@ -213,15 +201,15 @@ class BanditLearner(nn.Module):
             for p in m.parameters():
                 yield p
 
-    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf,feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, device):
+    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, bandit_obs, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, device):
         
 
         xy_pos   = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
         goalvec  = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
-        feats_motor = torch.as_tensor(np.stack(feats_motor), device=device, dtype=torch.float32)
         chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
-        feats_bandit = torch.as_tensor(np.stack(feats_bandit), device=device, dtype=torch.float32)
+        bandit_obs = torch.as_tensor(np.stack(bandit_obs), device=device, dtype=torch.float32)
+        # feats_bandit = torch.as_tensor(np.stack(feats_bandit), device=device, dtype=torch.float32)
         chosen_bandits = torch.as_tensor(np.stack(chosen_bandits_buf), device=device, dtype=torch.float32)
         rewards_bandits = torch.as_tensor(np.stack(bandit_rewards_buf), device=device, dtype=torch.float32) 
         meta_ep_start = torch.as_tensor(np.stack(meta_ep_start_buf), device=device, dtype=torch.float32)
@@ -244,13 +232,15 @@ class BanditLearner(nn.Module):
             rewards_rnn = rewards_bandits.unsqueeze(-1)   # (S,1)
             start_rnn   = meta_ep_start.unsqueeze(-1)     # (S,1)
 
+            feats_bandit = self.encode(bandit_obs)
+
             rnn_out, h_rnn = self.rnn_fwd(
                 feats_bandit, chosen_bandits, rewards_rnn, start_rnn, h_rnn)               # rnn_out: (1, H), h_rnn: (1, 1, H)
             
 
             h_seq_orig = torch.zeros_like(rnn_out)
             h_seq_orig[1:] = rnn_out[:-1] # shift by 1
-            reward_logits = self.reward_compute(h_seq_orig)  # (S, 2)
+            reward_logits = self.reward_compute(h_seq_orig, feats_bandit)  # (S, 2)
             left_logits  = reward_logits[:, 0]           # (S,)
             right_logits = reward_logits[:, 1]           # (S,)
 
