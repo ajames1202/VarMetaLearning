@@ -80,11 +80,12 @@ class RolloutWorker:
 
 
 
-def save_checkpoint(path, agent, optimizer, extra):
+def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
 
     ckpt = {
         "model_state": agent.state_dict(),
-        "optim_state": optimizer.state_dict(),
+        "optim_bandit_state": optim_bandit.state_dict(),
+        "optim_motor_state": optim_motor.state_dict(),
         "extra": extra,
         "torch": torch.__version__,
     }
@@ -420,10 +421,10 @@ if __name__ == "__main__":
                 # L = np.random.uniform(0.1, 0.9, size=session_K)
                 # L = [(0.8)]* session_K if np.random.rand() < 0.5 else [(0.2)]* session_K
                 # R = 1.0 - L
-                L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
-                R = [1.0 - x for x in L]
+                # L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
+                # R = [1.0 - x for x in L]
 
-                probs_this_session = [(L[i], R[i]) for i in range(session_K)]
+                probs_this_session = [(0.8, 0.2) if np.random.rand() < 0.5 else (0.2, 0.8) for _ in range(session_K)]
                 probs_list.append(probs_this_session)
 
             # ---------- broadcast current weights (CPU) ----------
@@ -470,7 +471,7 @@ if __name__ == "__main__":
                     break  # in case we overshoot slightly with num_launch
 
 
-        print(f"batch_rew len: {len(batch_xy_pos)}, batch_choice_tgts len: {len(batch_meta_ep_start)}")
+        # print(f"batch_rew len: {len(batch_xy_pos)}, batch_choice_tgts len: {len(batch_meta_ep_start)}")
         # --------------------------------------------------
         #   Now we have ~B sessions worth of data -> one update
         # --------------------------------------------------
@@ -524,3 +525,16 @@ if __name__ == "__main__":
 
     ray.shutdown()
     writer.close()
+
+            # if (ses + 1) % 10 == 0:  # every 10 sessions
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_dir = getattr(args, "save_dir", "checkpoints")  # if you add CLI arg
+    ckpt_path = os.path.join(save_dir, f"var_bandit_{stamp}.pt")
+    extra = {
+        "feature_dim": feature_dim,
+        "hidden_size": hidden_size,
+        "action_dim": 2,
+    }
+    save_checkpoint(ckpt_path, agent, optim_bandit, optim_motor, extra)
+    print(f"Saved checkpoint to {ckpt_path}")
+
