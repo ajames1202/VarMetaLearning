@@ -207,7 +207,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         xy_pos_t  = torch.as_tensor(xy_norm).unsqueeze(0).to(device)  # (1,2)
         goal_vec_t= torch.as_tensor(g_norm ).unsqueeze(0).to(device)  # (1,2)
 
-        mu, log_std = agent.motor_fwd(choice_target, xy_pos = xy_pos_t, goal_vec=goal_vec_t)
+        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos = xy_pos_t, goal_vec=goal_vec_t)
 
         # store for training
         xy_pos_buf.append(xy_norm)     # (2,)
