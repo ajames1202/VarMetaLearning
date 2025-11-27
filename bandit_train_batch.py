@@ -125,12 +125,13 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     meta_ep_len = 0
     xy_pos_buf = []
     goal_vec_buf = []
-    feats_motor = []
     chosen_bandits_motor_buf = []
     feats_bandit = []
     chosen_bandits_buf = []
     bandit_rewards_buf = []
     meta_ep_start_buf = []
+    pair_idx_buf = []
+
 
     # rnn_outputs = torch.empty((0, agent.gru.hidden_size), dtype=torch.float32, device=device)
     t = 0
@@ -151,6 +152,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             if agent.feature_source == "ids":
                 # NB: make sure these are 0-based; if your env is 1-based, subtract 1.
                 pair_idx_now  = info.get("pair_index_in_session", -1)
+                assert pair_idx_now >= 0
                 trial_idx_now = int(info.get("trial_index", -1))  # make 0-based
 
                 pair_idx_t  = torch.tensor([pair_idx_now],  device=device, dtype=torch.long)
@@ -235,7 +237,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         pair_idx_now = info.get("pair_index_in_session", -1)
 
 
-        feats_motor.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
+        # feats_motor.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
         small_np = small.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
         chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
 
@@ -252,6 +254,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             _, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
             
             pair_index_ep = info.get("pair_index_in_session", -1)
+            assert pair_index_ep >= 0
             pair_index_counter[pair_index_ep] += 1    
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
             if(selected_high_reward):
@@ -275,6 +278,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
             bandit_rewards_buf.append(reward)  # scalar
+            pair_idx_buf.append(pair_index_ep)
             if(meta_ep_len == 1):
                 meta_ep_start_buf.append(1.0)
             else:
@@ -319,7 +323,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
 
     cum_rewards = sum(bandit_rewards_buf)
     
-    return xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards
+    return xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, pair_idx_buf, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards
 
 if __name__ == "__main__":
 
@@ -389,9 +393,8 @@ if __name__ == "__main__":
         # global buffers across all sessions in this update
         batch_xy_pos      = []
         batch_goal_vec    = []
-        batch_feats_motor = []
         batch_chosen_bandits_motor = []
-        batch_feats_bandit = []
+        batch_pair_idxs = []
         batch_chosen_bandits = []
         batch_bandit_rewards = []
         batch_meta_ep_start = []
@@ -449,14 +452,14 @@ if __name__ == "__main__":
 
             # ---------- aggregate results ----------
             for res in rollout_results:
-                (xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, 
-                 feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards) = res
+                (xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, 
+                 pair_idx_buf, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards) = res
 
 
                 batch_xy_pos.extend(xy_pos_buf)
                 batch_goal_vec.extend(goal_vec_buf)
                 batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
-                batch_feats_bandit.append(torch.as_tensor(np.stack(feats_bandit), dtype=torch.float32))
+                batch_pair_idxs.append(torch.as_tensor(np.stack(pair_idx_buf), dtype=torch.long))
                 batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
                 batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
                 batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
@@ -479,7 +482,7 @@ if __name__ == "__main__":
             batch_xy_pos,
             batch_goal_vec,
             batch_chosen_bandits_motor,
-            batch_feats_bandit,
+            batch_pair_idxs,
             batch_chosen_bandits,
             batch_bandit_rewards,
             batch_meta_ep_start,

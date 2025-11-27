@@ -220,19 +220,19 @@ class BanditLearner(nn.Module):
             for p in m.parameters():
                 yield p
 
-    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, batch_feats_bandit, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start, device):
+    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, batch_pair_idxs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start, device):
         
 
         xy_pos   = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
         goalvec  = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
         chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
-        feats_bandit = torch.stack(batch_feats_bandit).to(device)  # (B, S, F)
+        pair_idxs = torch.stack(batch_pair_idxs).to(device)  # (B, S), dtype long
         chosen_bandits = torch.stack(batch_chosen_bandits).to(device)  # (B, S, 2)
         rewards_bandits = torch.stack(batch_bandit_rewards).to(device)  # (B, S)
         meta_ep_start = torch.stack(batch_meta_ep_start).to(device)  # (B, S)
 
-        B, S = feats_bandit.shape[:2]
+        B, S = pair_idxs.shape
         num_epochs = 4         
 
         var_loss_sum, var_slices = 0.0, 0
@@ -250,7 +250,10 @@ class BanditLearner(nn.Module):
             # Transpose to (S, B, dim) for RNN
             rewards_rnn = rewards_bandits.unsqueeze(-1).permute(1, 0, 2)  # (S, B, 1)
             start_rnn = meta_ep_start.unsqueeze(-1).permute(1, 0, 2)  # (S, B, 1)
-            feats_bandit_t = feats_bandit.permute(1, 0, 2)  # (S, B, F)
+            # feats_bandit_t = feats_bandit.permute(1, 0, 2)  # (S, B, F)
+                # Embedding lookup happens *inside* the graph → gradients flow into pair_emb
+            feats_bandit_t = self.pair_emb(pair_idxs.permute(1, 0))   # (S, B, F)
+
             chosen_bandits_t = chosen_bandits.permute(1, 0, 2)  # (S, B, 2)
 
             # RNN forward (batched)
@@ -281,7 +284,7 @@ class BanditLearner(nn.Module):
             
             eps = 1e-8
             probs = torch.sigmoid(reward_logits)  # (S, B, 2)
-            prior_p = 0.01
+            prior_p = 0.5
             var_kl_loss = (
                 probs * (torch.log(probs + eps) - math.log(prior_p)) +
                 (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
