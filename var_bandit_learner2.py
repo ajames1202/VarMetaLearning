@@ -310,25 +310,39 @@ class BanditLearner(nn.Module):
             # -----------------------------
             # 4) MOTOR loss (unchanged, flat over all steps)
             # -----------------------------
-            mu, log_std = self.motor_fwd(
-                chosen_bandits_motor,  # (S_total, 2)
-                xy_pos,                # (S_total, 2)
-                goalvec                # (S_total, 2)
-            )
+            mini_batch_size = 16384  # Tune based on your GPU; smaller = less mem, but slower
+            total_steps = len(xy_pos_buf)
+            motor_loss_sum += 0.0  # Already in your code; keep for averaging
 
-            dist   = goalvec.norm(dim=-1, keepdim=True) + 1e-6
-            g_hat  = goalvec / dist
-            speed  = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
-            target = (g_hat * speed).clamp(-0.999, 0.999)
-            u_target = atanh(target)
-
-            L_reach  = F.mse_loss(mu, u_target)
-            motor_loss = L_reach
-
-            motor_loss.backward()
-
-            motor_loss_sum += motor_loss.item()
-            motor_slices   += 1
+            for start in range(0, total_steps, mini_batch_size):
+                end = min(start + mini_batch_size, total_steps)
+                
+                # Slice tensors
+                xy_slice = xy_pos[start:end]
+                goal_slice = goalvec[start:end]
+                chosen_slice = chosen_bandits_motor[start:end]
+                
+                # Forward on slice
+                mu, log_std = self.motor_fwd(
+                    chosen_slice,  # no credit to choice through motor
+                    xy_slice,
+                    goal_slice
+                )
+                
+                # Target computation (same as before, but on slice)
+                dist = goal_slice.norm(dim=-1, keepdim=True) + 1e-6
+                g_hat = goal_slice / dist
+                speed = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
+                target = (g_hat * speed).clamp(-0.999, 0.999)
+                u_target = atanh(target)
+                
+                L_reach = F.mse_loss(mu, u_target)
+                motor_loss_mini = L_reach
+                
+                # Backward on mini-loss (grads accumulate)
+                motor_loss_mini.backward()
+                
+                motor_loss_sum += motor_loss_mini.item() * ((end - start) / total_steps)  # Weighted avg for logging
 
             # -----------------------------
             # 5) Optim step
