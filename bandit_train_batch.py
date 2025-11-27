@@ -457,10 +457,10 @@ if __name__ == "__main__":
                 batch_goal_vec.extend(goal_vec_buf)
                 batch_feats_motor.extend(feats_motor)
                 batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
-                batch_feats_bandit.extend(feats_bandit)
-                batch_chosen_bandits.extend(chosen_bandits_buf)
-                batch_bandit_rewards.extend(bandit_rewards_buf)
-                batch_meta_ep_start.extend(meta_ep_start_buf)
+                batch_feats_bandit.append(torch.as_tensor(np.stack(feats_bandit), dtype=torch.float32))
+                batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
+                batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
+                batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
 
 
                 highR_perN_list.append(high_reward_choice_per_N)

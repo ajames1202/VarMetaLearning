@@ -220,7 +220,7 @@ class BanditLearner(nn.Module):
             for p in m.parameters():
                 yield p
 
-    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf,feats_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, device):
+    def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, feats_motor, chosen_bandits_motor_buf, batch_feats_bandit, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start, device):
         
 
         xy_pos   = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
@@ -228,11 +228,12 @@ class BanditLearner(nn.Module):
         feats_motor = torch.as_tensor(np.stack(feats_motor), device=device, dtype=torch.float32)
         chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
-        feats_bandit = torch.as_tensor(np.stack(feats_bandit), device=device, dtype=torch.float32)
-        chosen_bandits = torch.as_tensor(np.stack(chosen_bandits_buf), device=device, dtype=torch.float32)
-        rewards_bandits = torch.as_tensor(np.stack(bandit_rewards_buf), device=device, dtype=torch.float32) 
-        meta_ep_start = torch.as_tensor(np.stack(meta_ep_start_buf), device=device, dtype=torch.float32)
+        feats_bandit = torch.stack(batch_feats_bandit).to(device)  # (B, S, F)
+        chosen_bandits = torch.stack(batch_chosen_bandits).to(device)  # (B, S, 2)
+        rewards_bandits = torch.stack(batch_bandit_rewards).to(device)  # (B, S)
+        meta_ep_start = torch.stack(batch_meta_ep_start).to(device)  # (B, S)
 
+        B, S = feats_bandit.shape[:2]
         num_epochs = 4         
 
         var_loss_sum, var_slices = 0.0, 0
@@ -245,55 +246,52 @@ class BanditLearner(nn.Module):
             optim_bandit.zero_grad(set_to_none=True) 
 
 
-            h_rnn  = torch.zeros(1, self.rnn.hidden_size, device=device)
+            h_rnn = torch.zeros(1, B, self.rnn.hidden_size, device=device)  # (1, B, H)
 
-            # --- RNN forward step --
-            rewards_rnn = rewards_bandits.unsqueeze(-1)   # (S,1)
-            start_rnn   = meta_ep_start.unsqueeze(-1)     # (S,1)
+            # Transpose to (S, B, dim) for RNN
+            rewards_rnn = rewards_bandits.unsqueeze(-1).permute(1, 0, 2)  # (S, B, 1)
+            start_rnn = meta_ep_start.unsqueeze(-1).permute(1, 0, 2)  # (S, B, 1)
+            feats_bandit_t = feats_bandit.permute(1, 0, 2)  # (S, B, F)
+            chosen_bandits_t = chosen_bandits.permute(1, 0, 2)  # (S, B, 2)
 
+            # RNN forward (batched)
             rnn_out, h_rnn = self.rnn_fwd(
-                feats_bandit, chosen_bandits, rewards_rnn, start_rnn, h_rnn)               # rnn_out: (1, H), h_rnn: (1, 1, H)
-            
+                feats_bandit_t, chosen_bandits_t, rewards_rnn, start_rnn, h_rnn)  # rnn_out: (S, B, H)
 
-            h_seq_orig = torch.zeros_like(rnn_out)
-            h_seq_orig[1:] = rnn_out[:-1] # shift by 1
-            reward_logits = self.reward_compute(h_seq_orig, feats_bandit)  # (S, 2)
-            left_logits  = reward_logits[:, 0]           # (S,)
-            right_logits = reward_logits[:, 1]           # (S,)
+            # Shift h: h_seq_orig[t] should be h before x_t
+            h_seq_orig = torch.zeros_like(rnn_out)  # (S, B, H)
+            h_seq_orig[1:] = rnn_out[:-1]
 
+            # Reward compute (concat h and feats)
+            reward_logits = self.reward_compute(h_seq_orig, feats_bandit_t)  # (S, B, 2)
+
+            left_logits = reward_logits[..., 0]  # (S, B)
+            right_logits = reward_logits[..., 1]  # (S, B)
                         # 2) Bernoulli distributions over binary rewards
-            p_left_rwd  = torch.distributions.Bernoulli(logits=left_logits) #()
+            p_left_rwd = torch.distributions.Bernoulli(logits=left_logits)
             p_right_rwd = torch.distributions.Bernoulli(logits=right_logits)
 
-            # r_S is in {0,1}, shape (S,)
-            logp_left  = p_left_rwd.log_prob(rewards_bandits)        # (B, session_N
-            logp_right = p_right_rwd.log_prob(rewards_bandits)       # (B, session_N)
+            rewards_bandits_t = rewards_bandits.permute(1, 0)  # (S, B)
+            logp_left = p_left_rwd.log_prob(rewards_bandits_t)  # (S, B)
+            logp_right = p_right_rwd.log_prob(rewards_bandits_t)  # (S, B)
 
-            # 3) Select log-prob for the chosen arm
-            logp_rewards = torch.where(
-                chosen_bandits[:, 0] == 1,    # left chosen?
-                logp_left,
-                logp_right
-            )
-            var_logp_loss = logp_rewards.mean()
+            chosen_bandits_t0 = chosen_bandits_t[..., 0]  # (S, B) left chosen?
+            logp_rewards = torch.where(chosen_bandits_t0 == 1, logp_left, logp_right)  # (S, B)
+            var_logp_loss = logp_rewards.mean()  # scalar mean over all
 
             
             eps = 1e-8
-            probs = torch.sigmoid(reward_logits)  # (S, 2), left & right probabilities
+            probs = torch.sigmoid(reward_logits)  # (S, B, 2)
             prior_p = 0.5
-
-            # KL(Bernoulli(p) || Bernoulli(0.5)) per arm
             var_kl_loss = (
                 probs * (torch.log(probs + eps) - math.log(prior_p)) +
                 (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
-            ).sum(dim=1).mean()  # sum over arms, mean over S
-
+            ).sum(dim=-1).mean()  # mean over S,B
 
             variational_loss = -var_logp_loss + 0.1 * var_kl_loss
-
             variational_loss.backward()
-
-            var_loss_sum = variational_loss.item()
+            var_loss_sum += variational_loss.item()
+            var_slices   += 1
                 
                 
 
