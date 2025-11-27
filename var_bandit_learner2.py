@@ -281,13 +281,13 @@ class BanditLearner(nn.Module):
             
             eps = 1e-8
             probs = torch.sigmoid(reward_logits)  # (S, B, 2)
-            prior_p = 0.5
+            prior_p = 0.01
             var_kl_loss = (
                 probs * (torch.log(probs + eps) - math.log(prior_p)) +
                 (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
             ).sum(dim=-1).mean()  # mean over S,B
 
-            variational_loss = -var_logp_loss + 0.1 * var_kl_loss
+            variational_loss = -var_logp_loss + 0.01 * var_kl_loss
             variational_loss.backward()
             var_loss_sum += variational_loss.item()
             var_slices   += 1
