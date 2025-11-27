@@ -137,7 +137,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     ep_start_flag = 1.0  # first step of episode
     while not done:
         obs_tensor = (
-            torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
+            torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0) #(H,W,C)->(1,C,H,W)
         )
         small = agent.downsample(obs_tensor)
         features = agent.encode(small).squeeze(0)
@@ -218,7 +218,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         action = torch.tanh(y)
         action_np = action.squeeze(0).detach().cpu().numpy()
 
-        next_obs, reward, term, _, info = env.step(action_np)
+        next_obs, reward, term, _, info = env.step(action_np) # (H,W,3), scalar, bool, _, dict
         done = term
         
         pair_idx_now = info.get("pair_index_in_session", -1)
@@ -443,7 +443,7 @@ if __name__ == "__main__":
                 batch_xy_pos.extend(xy_pos_buf)
                 batch_goal_vec.extend(goal_vec_buf)
                 batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
-                batch_bandit_obs.append(torch.as_tensor(np.stack(obs_bandit), dtype=torch.float32).permute(0,3,1,2).div_(255.0))
+                batch_bandit_obs.append(torch.as_tensor(np.stack(obs_bandit), dtype=torch.float32))
                 batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
                 batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
                 batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
