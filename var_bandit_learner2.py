@@ -238,10 +238,6 @@ class BanditLearner(nn.Module):
 
         # Encode CNN features: flatten (T, B) -> (T*B, C, H, W)
         bandit_obs_flat = bandit_obs.reshape(T * B, C, H, W)       # (T*B, C, H, W)
-        feats_flat = self.encode(bandit_obs_flat)                  # (T*B, F)
-        F_dim = feats_flat.shape[-1]
-        feats_bandit = feats_flat.view(T, B, F_dim)                # (T, B, F)
-
         # For GRU:
         rewards_rnn = rewards_bandits.unsqueeze(-1)    # (T, B, 1)
         start_rnn   = meta_ep_start.unsqueeze(-1)      # (T, B, 1)
@@ -260,6 +256,10 @@ class BanditLearner(nn.Module):
             # 3) BANDIT loss
             # -----------------------------
             h_rnn = torch.zeros(1, B, self.rnn.hidden_size, device=device)
+
+            feats_flat = self.encode(bandit_obs_flat)    # (T*B, F)
+            feats_bandit = feats_flat.view(T, B, -1)  # (T, B, F)
+
 
             rnn_out, h_rnn = self.rnn_fwd(
                 feats_bandit,       # (T, B, F)
