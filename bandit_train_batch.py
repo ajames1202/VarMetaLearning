@@ -455,7 +455,6 @@ if __name__ == "__main__":
 
                 batch_xy_pos.extend(xy_pos_buf)
                 batch_goal_vec.extend(goal_vec_buf)
-                batch_feats_motor.extend(feats_motor)
                 batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
                 batch_feats_bandit.append(torch.as_tensor(np.stack(feats_bandit), dtype=torch.float32))
                 batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
@@ -479,7 +478,6 @@ if __name__ == "__main__":
             optim_bandit, optim_motor,
             batch_xy_pos,
             batch_goal_vec,
-            batch_feats_motor,
             batch_chosen_bandits_motor,
             batch_feats_bandit,
             batch_chosen_bandits,
