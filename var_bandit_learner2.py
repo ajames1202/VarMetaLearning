@@ -302,7 +302,7 @@ class BanditLearner(nn.Module):
             ).sum(dim=-1).mean()  # sum over arms, mean over T,B
 
             variational_loss = -var_logp_loss + 0.1 * var_kl_loss
-            variational_loss.backward(retain_graph=True)
+            variational_loss.backward()
 
             var_loss_sum += variational_loss.item()
             var_slices += 1
