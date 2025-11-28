@@ -28,7 +28,7 @@ import math, contextlib
 torch.backends.cudnn.enabled = True
 # torch.autograd.set_detect_anomaly(True)
 
-@ray.remote
+@ray.remote(num_cpus=1, num_gpus=0)
 class RolloutWorker:
     def __init__(self, session_K, session_N, seed=0, worker_id=0):
         self.session_K = session_K
