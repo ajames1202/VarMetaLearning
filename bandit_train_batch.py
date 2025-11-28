@@ -328,8 +328,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(log_dir)
 
 
-    session_K = 3
-    session_N = 15
+    session_K = 1
+    session_N = 10
 
     hidden_size = 128
     feature_dim = 128
