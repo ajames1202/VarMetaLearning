@@ -242,7 +242,7 @@ class BanditLearner(nn.Module):
         rewards_rnn = rewards_bandits.unsqueeze(-1)    # (T, B, 1)
         start_rnn   = meta_ep_start.unsqueeze(-1)      # (T, B, 1)
 
-        num_epochs = 4
+        num_epochs = 1
 
         var_loss_sum, var_slices = 0.0, 0
         motor_loss_sum, motor_slices = 0.0, 0
