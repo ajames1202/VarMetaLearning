@@ -26,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 import math, contextlib
 
 torch.backends.cudnn.enabled = True
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 
 @ray.remote
 class RolloutWorker:

@@ -233,7 +233,7 @@ class BanditLearner(nn.Module):
         meta_ep_start = torch.stack(batch_meta_ep_start).to(device)  # (B, S)
 
         B, S = pair_idxs.shape
-        num_epochs = 4         
+        num_epochs = 1         
 
         var_loss_sum, var_slices = 0.0, 0
         motor_loss_sum, motor_slices   = 0.0, 0
