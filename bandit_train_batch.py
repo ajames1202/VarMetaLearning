@@ -25,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import math, contextlib
 
-torch.backends.cudnn.enabled = True
+# torch.backends.cudnn.enabled = True
 # torch.autograd.set_detect_anomaly(True)
 
 @ray.remote(num_cpus=1, num_gpus=0)
@@ -105,7 +105,7 @@ def load_checkpoint(path, agent, optimizer=None, map_location="cpu"):
 def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print_this_session=False):
 
     def log(*args, **kwargs):
-        if worker_id == 0:
+        if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
     
@@ -329,7 +329,7 @@ if __name__ == "__main__":
 
 
     session_K = 3
-    session_N = 20
+    session_N = 15
 
     hidden_size = 128
     feature_dim = 128
@@ -421,7 +421,7 @@ if __name__ == "__main__":
             rollout_futures = []
             for w_id in range(num_launch):
 
-                print_flag = (w_id == 0) and (total_sessions_collected == 0)
+                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (num_updates%20 == 0)
                 # meaning: only worker 0, only the first session of this update
 
                 rollout_futures.append(
