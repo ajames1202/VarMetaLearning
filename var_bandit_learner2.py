@@ -65,6 +65,8 @@ class BanditLearner(nn.Module):
                  num_pairs=None, max_trials=None):
         nn.Module.__init__(self)
 
+        self.input_size = input_size
+
         self.downsample = nn.AvgPool2d(kernel_size=4, stride=4)
 
         self.debug_gru_inputs = {"rollout": [], "update": []}
