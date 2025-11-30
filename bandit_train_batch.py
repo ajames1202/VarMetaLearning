@@ -1,3 +1,4 @@
+# Modified bandit_train_batch.py (only relevant sections changed; full file for completeness)
 # at top of bandit_train.py
 import ray
 
@@ -109,7 +110,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             print(*args, **kwargs)
 
     
-    h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # initial hidden state
+    history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)  # NEW: history buffer instead of h_rnn
+    h_rnn = torch.zeros(1, agent.hidden_size, device=device)  # initial hidden state
     # for episode in range(session_K*session_N):
     obs,info = env.reset()
     # print("Total episodes in session:", info.get("total_trials_in_session", -1))
@@ -237,7 +239,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # else:
             a_oh        = choice_target                                           # (1, 2) one-hot choice
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-            _, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
+            dummy_out, h_rnn, history = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
             
             pair_index_ep = info.get("pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
@@ -328,8 +330,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(log_dir)
 
 
-    session_K = 1
-    session_N = 10
+    session_K = 3
+    session_N = 15
 
     hidden_size = 128
     feature_dim = 128
@@ -521,4 +523,3 @@ if __name__ == "__main__":
     }
     save_checkpoint(ckpt_path, agent, optim_bandit, optim_motor, extra)
     print(f"Saved checkpoint to {ckpt_path}")
-

@@ -1,3 +1,4 @@
+# Modified var_bandit_learner2.py
 import numpy as np
 import torch
 from torch import nn
@@ -45,6 +46,18 @@ def log_prob_tanh_gaussian(mu, log_std, pretahn_actions):
     # print("log_prob.shape:", log_prob.shape, "corr.shape:", corr.shape, "pretanh_actions.shape:", pretahn_actions.shape)
     return log_prob - corr  # (B,)
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0)]
 
 class BanditLearner(nn.Module):
     def __init__(self, input_size, feature_dim, rnn_hidden_size, action_dim,
@@ -59,13 +72,18 @@ class BanditLearner(nn.Module):
 
         self.enc = CNNEncoder(feature_dim)
 
-        # --- Bandit RNN + heads
-        # input_size = feature_dim + 2 + 1  # features + prev_action(2) + prev_reward(1)
-        self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
+        # --- Bandit RNN + heads replaced with Transformer
+        self.hidden_size = rnn_hidden_size
+        self.input_proj = nn.Linear(input_size, self.hidden_size)
+        self.pos_enc = PositionalEncoding(self.hidden_size)
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=self.hidden_size, nhead=4, dim_feedforward=256, dropout=0.0),
+            num_layers=2
+        )
 
         # choice_inp = rnn_hidden_size
         self.rewards_head = nn.Sequential(
-            nn.Linear(rnn_hidden_size + feature_dim, 128),
+            nn.Linear(self.hidden_size + feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 2)
         )
@@ -99,45 +117,42 @@ class BanditLearner(nn.Module):
         # x = self.downsample(x)  # (T, C, H, W)
         return self.enc(x)    
 
+    def generate_square_subsequent_mask(self, sz: int, device) -> torch.Tensor:
+        return torch.triu(torch.full((sz, sz), float('-inf'), device=device), diagonal=1)
     
-    def rnn_fwd(self, features, action, reward, meta_ep_start, h):
-        """
-        features: (T, D_f)      or (T, B, D_f)
-        action:   (T, D_a)      or (T, B, D_a)
-        reward:   (T, 1)        or (T, B, 1)
-        h:        (1, H)        or (1, B, H)
-
-        Returns:
-            out:   (T, H)       or (T, B, H)   (same rank as features)
-            new_h: (1, H)       or (1, B, H)
-        """
+    def rnn_fwd(self, features, action, reward, meta_ep_start, h=None, history=None):
         x = torch.cat([features, action, reward, meta_ep_start], dim=-1).to(features.dtype).to(features.device)
 
-        # Case 1: unbatched old-style input (T, D)
-        if x.dim() == 2:
-            # add batch dimension B = 1 so GRU sees (T, 1, D)
-            x = x.unsqueeze(1)  # (T, 1, D)
-
-            if h is not None and h.dim() == 2:
-                # (1, H) -> (1, 1, H)
-                h = h.unsqueeze(1)
-
-            out, new_h = self.rnn(x, h)  # out: (T, 1, H), new_h: (1, 1, H)
-
-            # squeeze batch dim back out for compatibility with old code
-            out = out.squeeze(1)         # (T, H)
-            new_h = new_h.squeeze(1)     # (1, H)
-            return out, new_h
-
-        # Case 2: batched input (T, B, D)
-        elif x.dim() == 3:
-            # h is expected to already be (1, B, H)
-            out, new_h = self.rnn(x, h)  # out: (T, B, H)
-            return out, new_h
+        if history is not None:
+            # unbatched rollout update mode
+            # x is (1, D)
+            history = torch.cat([history, x.squeeze(0)], dim=0)  # (t+1, D)
+            seq_len = history.size(0)
+            seq = history.unsqueeze(1)  # (seq_len, 1, D)
+            seq = self.input_proj(seq)
+            seq = self.pos_enc(seq)
+            mask = self.generate_square_subsequent_mask(seq_len, seq.device)
+            out = self.transformer(seq, mask=mask)  # (seq_len, 1, hidden)
+            new_h = out[-1]  # (1, hidden)
+            new_history = history
+            # return dummy out for this step, new_h, new_history
+            return out[-1].squeeze(0), new_h, new_history
 
         else:
-            raise ValueError(f"Unexpected input rank {x.dim()} for rnn_fwd")
-
+            # batched full sequence mode
+            batched = x.dim() == 3
+            if not batched:
+                x = x.unsqueeze(1)
+            seq = self.input_proj(x)
+            seq = self.pos_enc(seq)
+            seq_len = seq.size(0)
+            mask = self.generate_square_subsequent_mask(seq_len, seq.device)
+            out = self.transformer(seq, mask=mask)  # (T, B, H)
+            new_h = out[-1].unsqueeze(0)  # (1, B, H)
+            if not batched:
+                out = out.squeeze(1)
+                new_h = new_h.squeeze(1)
+            return out, new_h
     
     
     def reward_compute(self, rnn_out, curr_feat):
@@ -175,7 +190,8 @@ class BanditLearner(nn.Module):
         modules = []
 
         modules += [
-            self.rnn,
+            self.transformer,
+            self.input_proj,
             self.rewards_head,
             self.enc
             # self.fam_head,   # if you use familiarity as bandit aux
@@ -255,18 +271,15 @@ class BanditLearner(nn.Module):
             # -----------------------------
             # 3) BANDIT loss
             # -----------------------------
-            h_rnn = torch.zeros(1, B, self.rnn.hidden_size, device=device)
-
             feats_flat = self.encode(bandit_obs_flat)    # (T*B, F)
             feats_bandit = feats_flat.view(T, B, -1)  # (T, B, F)
 
 
-            rnn_out, h_rnn = self.rnn_fwd(
+            rnn_out, _ = self.rnn_fwd(
                 feats_bandit,       # (T, B, F)
                 chosen_bandits,     # (T, B, 2)
                 rewards_rnn,        # (T, B, 1)
                 start_rnn,          # (T, B, 1)
-                h_rnn               # (1, B, H)
             )                       # rnn_out: (T, B, H)
 
             # history one step back
