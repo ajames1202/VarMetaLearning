@@ -126,9 +126,12 @@ class BanditLearner(nn.Module):
         x = torch.cat([features, action, reward, meta_ep_start], dim=-1).to(features.dtype).to(features.device)
 
         if history is not None:
-            # unbatched rollout update mode
-            # x is (1, D)
-            history = torch.cat([history, x.squeeze(0)], dim=0)  # (t+1, D)
+            # x should be (1, D). Keep it 2D so it matches history (t, D).
+            if x.dim() == 1:
+                x = x.unsqueeze(0)  # safety
+
+            history = torch.cat([history, x], dim=0)  # (t+1, D)
+
             seq_len = history.size(0)
             seq = history.unsqueeze(1)  # (seq_len, 1, D)
             seq = self.input_proj(seq)
@@ -136,9 +139,8 @@ class BanditLearner(nn.Module):
             mask = self.generate_square_subsequent_mask(seq_len, seq.device)
             out = self.transformer(seq, mask=mask)  # (seq_len, 1, hidden)
             new_h = out[-1]  # (1, hidden)
-            new_history = history
-            # return dummy out for this step, new_h, new_history
-            return out[-1].squeeze(0), new_h, new_history
+            return out[-1].squeeze(0), new_h, history
+
 
         else:
             # batched full sequence mode
