@@ -187,7 +187,7 @@ class BanditLearner(nn.Module):
         x = torch.cat([rnn_out, curr_feat], dim=-1)
         return self.rewards_head(x)  # (S,2) or (1,2)
 
-
+    
         
     def motor_fwd(self, choice_target, xy_pos=None, goal_vec=None):
         # device = choice_target.device

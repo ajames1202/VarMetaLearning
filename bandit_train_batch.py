@@ -246,6 +246,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             dummy_out, h_rnn, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
             
             feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
+            trial_feat = agent.encode(small).detach().squeeze(0).cpu().numpy()  # (F,)
             trial_feats.append(trial_feat)
             trial_pair_ids.append(pair_idx_now)
             pair_features[pair_idx_now].append(trial_feat)
