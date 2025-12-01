@@ -243,11 +243,10 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
             dummy_out, h_rnn, history = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
             
-            if print_this_session:
-                feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
-                trial_feats.append(feat_np)
-                trial_pair_ids.append(pair_idx_now)
-                pair_features[pair_idx_now].append(feat_np)
+            feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
+            trial_feats.append(feat_np)
+            trial_pair_ids.append(pair_idx_now)
+            pair_features[pair_idx_now].append(feat_np)
 
 
 
