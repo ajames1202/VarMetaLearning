@@ -1,201 +1,133 @@
-# Modified bandit_train_batch.py (only relevant sections changed; full file for completeness)
-# at top of bandit_train.py
-import ray
-
-from typing import Any, Tuple, Dict
+import os
+import argparse
 import time
+from datetime import datetime
+from typing import Dict, Any, List
+
 import numpy as np
 import torch
-from torch import nn
-from torchvision import transforms as T
 import torch.nn.functional as F
-import argparse
+from torch.utils.tensorboard import SummaryWriter
 
+import ray
 
 import visual_bandit_env2 as vbe
 import var_bandit_learner2 as bl
-from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
-import math
-import pygame
-import os
-from datetime import datetime
-
-from gymnasium.wrappers import RecordVideo
-from torch.utils.tensorboard import SummaryWriter
 
 
-import math, contextlib
-
-# torch.backends.cudnn.enabled = True
-# torch.autograd.set_detect_anomaly(True)
-
-@ray.remote(num_cpus=1, num_gpus=0)
-class RolloutWorker:
-    def __init__(self, session_K, session_N, seed=0, worker_id=0):
-        self.session_K = session_K
-        self.session_N = session_N
-        self.device = torch.device("cpu")  # usually run envs on CPU
-        self.worker_id = worker_id
-
-        # each worker has its own env instance
-        self.env = vbe.TwoChoiceReachingEnv(
-            W=384,
-            H=400,
-            render_mode="rgb_array",
-            seed=seed,
-            session_K=session_K,
-            session_N=session_N,
-            trial_ms=3000,
-            randomize_sides=False,
-        )
-
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session=False):
-        # rebuild a fresh agent with same hyperparams as in main
-        hidden_size = 128
-        feature_dim = 128
-        input_size = feature_dim + 2 + 1 + 1
-
-        agent = bl.BanditLearner(
-            input_size=input_size,
-            feature_dim=feature_dim,
-            rnn_hidden_size=hidden_size,
-            action_dim=2,
-            num_pairs=self.session_K,
-            max_trials=self.session_N * self.session_K,
-        ).to(self.device)
-
-        agent.load_state_dict(agent_state_dict)
-        agent.eval()
-
-        # set pair probabilities for this worker's env
-        self.env.unwrapped.pair_probs = probs_this_session
-
-        with torch.no_grad():
-            return meta_ep_rollout(
-                self.env, agent, self.device,
-                self.session_K, self.session_N,
-                worker_id=self.worker_id,
-                print_this_session=print_this_session
-            )
-
-
-
-def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
-
-    ckpt = {
-        "model_state": agent.state_dict(),
-        "optim_bandit_state": optim_bandit.state_dict(),
-        "optim_motor_state": optim_motor.state_dict(),
-        "extra": extra,
-        "torch": torch.__version__,
-    }
+# -------------------------
+# Utilities
+# -------------------------
+def save_checkpoint(path: str, agent: torch.nn.Module, optim_bandit, optim_motor, extra: Dict[str, Any] | None = None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    ckpt = {
+        "model_state": {k: v.detach().cpu() for k, v in agent.state_dict().items()},
+        "optim_bandit": optim_bandit.state_dict() if optim_bandit is not None else None,
+        "optim_motor": optim_motor.state_dict() if optim_motor is not None else None,
+        "extra": extra or {},
+    }
     torch.save(ckpt, path)
 
-def load_checkpoint(path, agent, optimizer=None, map_location="cpu"):
+
+def load_checkpoint(path: str, agent: torch.nn.Module, optim_bandit=None, optim_motor=None, map_location="cpu") -> Dict[str, Any]:
     ckpt = torch.load(path, map_location=map_location)
-    agent.load_state_dict(ckpt["model_state"])
-    if optimizer is not None and "optim_state" in ckpt:
-        optimizer.load_state_dict(ckpt["optim_state"])
+    agent.load_state_dict(ckpt["model_state"], strict=True)
+    if optim_bandit is not None and ckpt.get("optim_bandit") is not None:
+        optim_bandit.load_state_dict(ckpt["optim_bandit"])
+    if optim_motor is not None and ckpt.get("optim_motor") is not None:
+        optim_motor.load_state_dict(ckpt["optim_motor"])
     return ckpt.get("extra", {})
 
 
-
-
-                    
-def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print_this_session=False):
-
+# -------------------------
+# Rollout with Query + Memory tokens
+# -------------------------
+@torch.no_grad()
+def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False):
+    """
+    Returns a dict:
+      buffers needed for update2()
+    plus metrics.
+    """
     def log(*args, **kwargs):
         if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
-    history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)  # history buffer
-    h_rnn = torch.zeros(1, agent.hidden_size, device=device)  # initial hidden state
+    agent.eval()
+
+    # History stores tokens of size agent.input_size
+    history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)
 
     obs, info = env.reset()
     done = False
-    ep = 0
 
-    pair_index_counter = np.ones(session_K, dtype=np.int32) * -1
-    high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32)
+    # Buffers for training
+    xy_pos_buf: List[np.ndarray] = []
+    goal_vec_buf: List[np.ndarray] = []
+    chosen_bandits_motor_buf: List[np.ndarray] = []
 
-    meta_ep_len = 0
-    xy_pos_buf = []
-    goal_vec_buf = []
-    feats_motor = []
-    chosen_bandits_motor_buf = []
-    obs_bandit = []
-    feats_bandit = []
-    chosen_bandits_buf = []
-    bandit_rewards_buf = []
-    meta_ep_start_buf = []
+    obs_bandit: List[np.ndarray] = []          # list of (C,H,W) downsampled images per finished trial
+    chosen_bandits_buf: List[np.ndarray] = []  # list of (2,) one-hot per finished trial
+    bandit_rewards_buf: List[float] = []       # list of scalar rewards per finished trial
+    meta_ep_start_buf: List[float] = []        # list of 0/1 per finished trial
 
-    trial_feats = []
-    trial_pair_ids = []
+    # Metrics
+    high_reward_choice_per_N = np.zeros(session_N, dtype=np.float32)
+    cum_rewards = 0.0
 
-    pair_features = [[] for _ in range(session_K)]
+    # Episode/trial bookkeeping
+    meta_trial_idx = 0
+    ep_start_flag = 1.0
 
-    t = 0
-    ep_start_flag = 1.0  # first step of session
+    # Store context + action for the current trial so we can write the Memory token at trial end
+    trial_feat = None       # (1,F)
+    trial_action = None     # (1,2)
+    trial_meta_start = 0.0  # float
 
     while not done:
-        obs_tensor = (
-            torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
-        )
-        small = agent.downsample(obs_tensor)
-        features = agent.encode(small).squeeze(0)
+        obs_tensor = torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+        small = agent.downsample(obs_tensor)      # (1,C,h,w)
+        f1 = agent.encode(small)                  # (1,F)
 
-        # CHOICE at trial start
+        # -----------------------
+        # TRIAL START: choose arm using QUERY token
+        # -----------------------
         if ep_start_flag == 1.0:
-            small = agent.downsample(obs_tensor)
-            f1 = agent.encode(small)  # (1, F)
-            obs_bandit.append(small.squeeze(0).detach().cpu().numpy())  # (C,H,W)
-            trial_feat = agent.encode(small).detach()  # (1,F) cache THIS
-
-            # --- Bandit forward for choice (Thompson sampling with Bernoulli head) ---
-
-            # --- Query token: append (context, 0_action, 0_reward) at trial start ---
-            meta_ep_start = 1.0 if meta_ep_len == 0 else 0.0
-            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
+            trial_meta_start = 1.0 if meta_trial_idx == 0 else 0.0
+            meta_ep_start_torch = torch.tensor([[trial_meta_start]], device=device, dtype=torch.float32)
 
             zero_act = torch.zeros((1, 2), device=device, dtype=torch.float32)
             zero_r = torch.zeros((1, 1), device=device, dtype=torch.float32)
 
-            q_out, h_rnn, history = agent.rnn_fwd(
-                f1,  # (1,F) current context feature
-                zero_act,  # (1,2) no action yet
-                zero_r,  # (1,1) no reward yet
-                meta_ep_start_torch,
-                history=history,
+            # Append QUERY token to history; get query-state
+            q_out, _, history = agent.rnn_fwd(
+                f1, zero_act, zero_r, meta_ep_start_torch, history=history
             )  # q_out: (H,)
 
-            # Use the *query-state* (not the previous memory-state) to predict this trial's reward probs
-            reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)  # (2,) [logit_left, logit_right]
-
-            eps = 1e-4
-            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)
+            reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)  # (2,)
+            probs = torch.sigmoid(reward_logits).clamp(1e-4, 1.0 - 1e-4)
             p_left, p_right = probs[0], probs[1]
 
+            # Thompson sampling via Beta centered at p
             concentration = 5.0
             alpha_left = p_left * concentration + 1.0
             beta_left = (1.0 - p_left) * concentration + 1.0
             alpha_right = p_right * concentration + 1.0
             beta_right = (1.0 - p_right) * concentration + 1.0
 
-            dist_left = torch.distributions.Beta(alpha_left, beta_left)
-            dist_right = torch.distributions.Beta(alpha_right, beta_right)
+            u_left = torch.distributions.Beta(alpha_left, beta_left).rsample()
+            u_right = torch.distributions.Beta(alpha_right, beta_right).rsample()
+            a_t = torch.argmax(torch.stack([u_left, u_right]))
 
-            u_left = dist_left.rsample()
-            u_right = dist_right.rsample()
+            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
 
-            samples = torch.stack([u_left, u_right])
-            a_t = torch.argmax(samples)
-            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
-            trial_action = choice_target
+            # Cache for trial end
+            trial_feat = f1.detach()
+            trial_action = choice_target.detach()
 
-            meta_ep_len += 1
-
-        # --- Motor forward (now we have choice_target) ---
+        # -----------------------
+        # MOTOR step (continuous control)
+        # -----------------------
         W, H = env.unwrapped.W, env.unwrapped.H
         x_pix, y_pix = env.unwrapped.cursor
         xy_norm = np.array([(x_pix / (W - 1)) * 2 - 1, (y_pix / (H - 1)) * 2 - 1], dtype=np.float32)
@@ -205,311 +137,261 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         left_c_norm = np.array([(left_c[0] / (W - 1)) * 2 - 1, (left_c[1] / (H - 1)) * 2 - 1], np.float32)
         right_c_norm = np.array([(right_c[0] / (W - 1)) * 2 - 1, (right_c[1] / (H - 1)) * 2 - 1], np.float32)
 
-        goal_center = left_c_norm if choice_target.argmax(dim=-1).item() == 0 else right_c_norm
+        goal_center = left_c_norm if trial_action.argmax(dim=-1).item() == 0 else right_c_norm
         g_norm = goal_center - xy_norm
 
-        xy_pos_t = torch.as_tensor(xy_norm).unsqueeze(0).to(device)  # (1,2)
-        goal_vec_t = torch.as_tensor(g_norm).unsqueeze(0).to(device)  # (1,2)
+        xy_pos_t = torch.as_tensor(xy_norm, device=device).unsqueeze(0)     # (1,2)
+        goal_vec_t = torch.as_tensor(g_norm, device=device).unsqueeze(0)    # (1,2)
 
-        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos=xy_pos_t, goal_vec=goal_vec_t)
-
-        xy_pos_buf.append(xy_norm)
-        goal_vec_buf.append(g_norm)
-
+        mu, log_std = agent.motor_fwd(trial_action, xy_pos=xy_pos_t, goal_vec=goal_vec_t)
         std = torch.exp(log_std)
         y = mu + std * torch.randn_like(std)
         action = torch.tanh(y)
-        action_np = action.squeeze(0).detach().cpu().numpy()
+        action_np = action.squeeze(0).cpu().numpy()
 
-        next_obs, reward, term, _, info = env.step(action_np)
-        done = term
+        next_obs, reward, term, trunc, info = env.step(action_np)
+        done = bool(term) or bool(trunc)
 
-        pair_idx_now = info.get("pair_index_in_session", -1)
+        # Save motor buffers every step
+        xy_pos_buf.append(xy_norm)
+        goal_vec_buf.append(g_norm)
+        chosen_bandits_motor_buf.append(trial_action.squeeze(0).cpu().numpy())
 
-        feats_motor.append(f1.squeeze(0).detach().cpu().numpy())
-        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
+        # -----------------------
+        # TRIAL END: append MEMORY token + store bandit training buffers
+        # -----------------------
+        if info.get("trial_ended", False):
+            r_t = torch.tensor([[float(reward)]], device=device, dtype=torch.float32)
+            meta_ep_start_torch = torch.tensor([[trial_meta_start]], device=device, dtype=torch.float32)
 
-        if info.get("trial_ended"):
-            meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
-            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
+            # Append MEMORY token (context + action + reward)
+            _, _, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)
 
-            r_t = torch.tensor([[float(reward)]], device=device)
+            # Store per-trial buffers for update2()
+            obs_bandit.append(small.squeeze(0).detach().cpu().numpy())           # (C,h,w) for THIS trial
+            chosen_bandits_buf.append(trial_action.squeeze(0).cpu().numpy())     # (2,)
+            bandit_rewards_buf.append(float(reward))
+            meta_ep_start_buf.append(float(trial_meta_start))
 
-            # Memory token at trial end: append (context, action, reward)
-            dummy_out, h_rnn, history = agent.rnn_fwd(
-                trial_feat, trial_action, r_t, meta_ep_start_torch, history=history
-            )  # update history and h_rnn
+            cum_rewards += float(reward)
 
-            trial_feat_np = agent.encode(small).detach().squeeze(0).cpu().numpy()
-            trial_feats.append(trial_feat_np)
-            trial_pair_ids.append(pair_idx_now)
-            pair_features[pair_idx_now].append(trial_feat_np)
-
-            pair_index_ep = info.get("pair_index_in_session", -1)
-            pair_index_counter[pair_index_ep] += 1
-            selected_high_reward = info.get("selected_high_reward_this_trial", False)
-            if selected_high_reward:
-                high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
+            # Optional metric from env
+            if info.get("selected_high_reward_this_trial", False):
+                # if you have "trial_index_in_pair" you can do better; this is a safe default
+                idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
+                high_reward_choice_per_N[idxN] += 1.0
 
             log(
-                "Ep: ", info.get("trial_index"),
-                ", idx = ", pair_idx_now,
-                ", choice target:", choice_target.argmax(dim=-1).item(),
-                ", Reached Target:", info.get("selected_target"),
-                ", reward:", reward,
-                ", selected_high_reward = ", selected_high_reward,
-                ", p_left =", round(p_left.item(), 2),
-                ", p_right =", round(p_right.item(), 2),
+                f"[W{worker_id}] trial={meta_trial_idx} reward={reward} "
+                f"choice={int(trial_action.argmax(dim=-1).item())}"
             )
 
+            meta_trial_idx += 1
             ep_start_flag = 1.0
-
-            feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())
-            chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
-            bandit_rewards_buf.append(reward)
-
-            if meta_ep_len == 1:
-                meta_ep_start_buf.append(1.0)
-            else:
-                meta_ep_start_buf.append(0.0)
-
         else:
             ep_start_flag = 0.0
 
         obs = next_obs
-        t += 1
 
-    high_reward_choice_count_on_left = info.get("high_reward_choice_count_on_left", -1)
-    high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right", -1)
-    total_left_choices = info.get("total_left_choices", -1)
-    total_right_choices = info.get("total_right_choices", -1)
+    # Normalize metric if you want (optional)
+    # high_reward_choice_per_N /= float(session_K)
 
-    return (
-        xy_pos_buf,
-        goal_vec_buf,
-        feats_motor,
-        chosen_bandits_motor_buf,
-        obs_bandit,
-        feats_bandit,
-        chosen_bandits_buf,
-        bandit_rewards_buf,
-        meta_ep_start_buf,
-        high_reward_choice_per_N,
-        high_reward_choice_count_on_left,
-        high_reward_choice_count_on_right,
-        total_left_choices,
-        total_right_choices,
-    )
+    return {
+        "xy_pos_buf": xy_pos_buf,
+        "goal_vec_buf": goal_vec_buf,
+        "chosen_bandits_motor_buf": chosen_bandits_motor_buf,
+        "obs_bandit": obs_bandit,
+        "chosen_bandits_buf": chosen_bandits_buf,
+        "bandit_rewards_buf": bandit_rewards_buf,
+        "meta_ep_start_buf": meta_ep_start_buf,
+        "metrics": {
+            "cum_rewards": float(cum_rewards),
+            "high_reward_choice_per_N": high_reward_choice_per_N,
+            "num_trials": int(len(bandit_rewards_buf)),
+        }
+    }
 
 
-if __name__ == "__main__":
+# -------------------------
+# Ray worker
+# -------------------------
+@ray.remote(num_cpus=1, num_gpus=0)
+class RolloutWorker:
+    def __init__(self, session_K: int, session_N: int, seed: int = 0, worker_id: int = 0):
+        self.session_K = session_K
+        self.session_N = session_N
+        self.worker_id = worker_id
+        self.device = torch.device("cpu")
 
+        self.env = vbe.TwoChoiceReachingEnv(
+            W=384,
+            H=400,
+            render_mode="rgb_array",
+            seed=seed + 1000 * worker_id,
+            session_K=session_K,
+            session_N=session_N,
+        )
+
+        # Agent copy (CPU). Must match driver hyperparams.
+        feature_dim = 64
+        input_size = feature_dim + 2 + 1 + 1
+        hidden = 128
+        action_dim = 2
+
+        self.agent = bl.BanditLearner(
+            input_size=input_size,
+            feature_dim=feature_dim,
+            rnn_hidden_size=hidden,
+            action_dim=action_dim,
+        ).to(self.device)
+
+    def rollout(self, agent_state_cpu: Dict[str, torch.Tensor], print_this_session: bool = False) -> Dict[str, Any]:
+        # Load params from driver
+        self.agent.load_state_dict(agent_state_cpu, strict=True)
+        return meta_ep_rollout(
+            env=self.env,
+            agent=self.agent,
+            device=self.device,
+            session_K=self.session_K,
+            session_N=self.session_N,
+            worker_id=self.worker_id,
+            print_this_session=print_this_session,
+        )
+
+
+# -------------------------
+# Main training loop
+# -------------------------
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--save-dir', type=str, default='checkpoints')
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--episodes-per-update', type=int, default=8)  # <-- B
-    parser.add_argument('--num-updates', type=int, default=500)        # <-- 500
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--episodes-per-update", type=int, default=8)  # B
+    parser.add_argument("--num-updates", type=int, default=500)
+    parser.add_argument("--save-dir", type=str, default="checkpoints")
+    parser.add_argument("--save-every", type=int, default=50)
+
+    # env/session params
+    parser.add_argument("--session-K", type=int, default=3)
+    parser.add_argument("--session-N", type=int, default=12)
+
+    # model params (keep consistent with worker)
+    parser.add_argument("--feature-dim", type=int, default=64)
+    parser.add_argument("--hidden", type=int, default=128)
+
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # --- TensorBoard writer ---
-    log_dir = os.path.join("runs", f"bandit_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
-    writer = SummaryWriter(log_dir)
+    # Ray init
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
 
+    # Device for training
+    train_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    session_K = 3
-    session_N = 15
-
-    hidden_size = 128
-    feature_dim = 128
-    input_size = feature_dim + 2 + 1 + 1
-
+    # Build train agent
+    input_size = args.feature_dim + 2 + 1 + 1
+    action_dim = 2
 
     agent = bl.BanditLearner(
         input_size=input_size,
-        feature_dim=feature_dim,
-        rnn_hidden_size=hidden_size,
-        action_dim=2,
-        num_pairs=session_K,
-        max_trials=session_N * session_K,
-    )
+        feature_dim=args.feature_dim,
+        rnn_hidden_size=args.hidden,
+        action_dim=action_dim,
+    ).to(train_device)
 
-    optim_bandit = torch.optim.Adam(agent.bandit_parameters(), lr=1e-3)
-    optim_motor  = torch.optim.Adam(agent.motor_parameters(),  lr=1e-3)
+    optim_bandit = torch.optim.Adam(agent.bandit_parameters(), lr=3e-4)
+    optim_motor = torch.optim.Adam(agent.motor_parameters(), lr=3e-4)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent.to(device)
-
-    # ---------- Ray init ----------
-    # local: ray.init()
-    # cluster: ray.init(address="auto")
-    ray.init(ignore_reinit_error=True)
-
-    # ---------- rollout workers ----------
+    # Workers
     workers = [
-        RolloutWorker.remote(session_K, session_N, seed=args.seed + 1000 * i, worker_id=i)
+        RolloutWorker.remote(args.session_K, args.session_N, seed=args.seed, worker_id=i)
         for i in range(args.num_workers)
     ]
 
+    # TensorBoard
+    log_dir = os.path.join("runs", f"bandit_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    writer = SummaryWriter(log_dir)
 
-    num_updates = args.num_updates
-    B = args.episodes_per_update
-    W = args.num_workers
+    global_step = 0
 
-    for update_idx in range(num_updates):
+    for upd in range(args.num_updates):
+        # Broadcast state dict (CPU tensors) to workers
+        agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
+        state_ref = ray.put(agent_state_cpu)
 
-        # --------------------------------------------------
-        # Collect at least B sessions (episodes) for this update
-        # --------------------------------------------------
-        total_sessions_collected = 0
+        # Launch rollouts
+        num_rollouts = args.episodes_per_update
+        futures = []
+        for i in range(num_rollouts):
+            w = workers[i % len(workers)]
+            futures.append(w.rollout.remote(state_ref, print_this_session=False))
 
-        # global buffers across all sessions in this update
-        batch_xy_pos      = []
-        batch_goal_vec    = []
-        batch_chosen_bandits_motor = []
-        batch_bandit_obs = []
-        batch_chosen_bandits = []
-        batch_bandit_rewards = []
-        batch_meta_ep_start = []
+        results: List[Dict[str, Any]] = ray.get(futures)
 
+        # Aggregate buffers
+        xy_pos_buf = []
+        goal_vec_buf = []
+        chosen_bandits_motor_buf = []
+        obs_bandit = []
+        chosen_bandits_buf = []
+        bandit_rewards_buf = []
+        meta_ep_start_buf = []
 
-        highR_perN_list   = []
-        cum_rewards_list  = []
+        cum_rewards = 0.0
+        total_trials = 0
 
-        while total_sessions_collected < B:
+        for r in results:
+            xy_pos_buf.extend(r["xy_pos_buf"])
+            goal_vec_buf.extend(r["goal_vec_buf"])
+            chosen_bandits_motor_buf.extend(r["chosen_bandits_motor_buf"])
 
-            # how many sessions still needed
-            remaining = B - total_sessions_collected
+            obs_bandit.extend(r["obs_bandit"])
+            chosen_bandits_buf.extend(r["chosen_bandits_buf"])
+            bandit_rewards_buf.extend(r["bandit_rewards_buf"])
+            meta_ep_start_buf.extend(r["meta_ep_start_buf"])
 
-            # use as many workers as needed, but not more than remaining
-            num_launch = min(W, remaining)
+            cum_rewards += r["metrics"]["cum_rewards"]
+            total_trials += r["metrics"]["num_trials"]
 
-            # ----- choose probs for each launched worker -----
-            probs_list = []
-            for w_id in range(num_launch):
-                # (example: alternate high/low like before)
-                # You can use any schedule you like here.
-                global_ses = update_idx * B + total_sessions_collected + w_id
-                # if global_ses % 2 == 0:
-                #     probs_this_session = [(0.8, 0.2)] * session_K
-                # else:
-                #     probs_this_session = [(0.2, 0.8)] * session_K
-                # L = np.random.uniform(0.1, 0.9, size=session_K)
-                # L = [(0.8)]* session_K if np.random.rand() < 0.5 else [(0.2)]* session_K
-                # R = 1.0 - L
-                # L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
-                # R = [1.0 - x for x in L]
-
-                probs_this_session = [(0.8, 0.2) if np.random.rand() < 0.5 else (0.2, 0.8) for _ in range(session_K)]
-                probs_list.append(probs_this_session)
-
-            # ---------- broadcast current weights (CPU) ----------
-            agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
-
-            # ---------- launch rollouts in parallel ----------
-            rollout_futures = []
-            for w_id in range(num_launch):
-
-                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx%5 == 0)
-                # meaning: only worker 0, only the first session of this update
-
-                rollout_futures.append(
-                    workers[w_id].run_session.remote(
-                        agent_state_cpu,
-                        probs_list[w_id],
-                        print_this_session=print_flag
-                    )
-                )
-
-            rollout_results = ray.get(rollout_futures)
-
-            # ---------- aggregate results ----------
-            for res in rollout_results:
-                (xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, 
-                 obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards) = res
-
-
-                batch_xy_pos.extend(xy_pos_buf)
-                batch_goal_vec.extend(goal_vec_buf)
-                batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
-                batch_bandit_obs.append(torch.as_tensor(np.stack(obs_bandit), dtype=torch.float32))
-                batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
-                batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
-                batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
-
-                highR_perN_list.append(high_reward_choice_per_N)
-                cum_rewards_list.append(cum_rewards)
-
-                total_sessions_collected += 1
-                if total_sessions_collected >= B:
-                    break  # in case we overshoot slightly with num_launch
-
-
-        # print(f"batch_rew len: {len(batch_xy_pos)}, batch_choice_tgts len: {len(batch_meta_ep_start)}")
-        # --------------------------------------------------
-        #   Now we have ~B sessions worth of data -> one update
-        # --------------------------------------------------
-        loss, policy_loss = agent.update2(
-            optim_bandit, optim_motor,
-            batch_xy_pos,
-            batch_goal_vec,
-            batch_chosen_bandits_motor,
-            batch_bandit_obs,
-            batch_chosen_bandits,
-            batch_bandit_rewards,
-            batch_meta_ep_start,
-            device
+        # Train update
+        agent.train()
+        var_loss, motor_loss = agent.update2(
+            optim_bandit=optim_bandit,
+            optim_motor=optim_motor,
+            xy_pos_buf=xy_pos_buf,
+            goal_vec_buf=goal_vec_buf,
+            chosen_bandits_motor_buf=chosen_bandits_motor_buf,
+            bandit_obs=obs_bandit,
+            chosen_bandits_buf=chosen_bandits_buf,
+            bandit_rewards_buf=bandit_rewards_buf,
+            meta_ep_start_buf=meta_ep_start_buf,
+            device=train_device,
         )
 
-        # logging
-        highR_perN_arr = np.stack(highR_perN_list)   # shape (B, N)
-        mean_highR_perN = highR_perN_arr.mean(axis=0)
-        mean_cum_rew = np.mean(cum_rewards_list)
+        # Logs
+        writer.add_scalar("loss/variational", float(var_loss), upd)
+        writer.add_scalar("loss/motor", float(motor_loss), upd)
+        writer.add_scalar("rollout/cum_rewards", float(cum_rewards), upd)
+        writer.add_scalar("rollout/total_trials", int(total_trials), upd)
 
-        print(
-            f"[Update {update_idx+1}/{num_updates}] "
-            f"sessions_in_batch={total_sessions_collected}, "
-            f"mean_cum_session_rewards={mean_cum_rew:.2f}, "
-            f"ChoiceLoss={loss:.4f}, MotorLoss={policy_loss:.4f}, "
-            f"mean_high_reward_choice_perN={mean_highR_perN}"
-        )
+        if upd % 10 == 0:
+            print(f"[upd {upd:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
+                  f"cum_rewards={cum_rewards:.1f} trials={total_trials}")
 
-                # ---- TensorBoard logging ----
-        global_step = update_idx  # one step per update
+        # Checkpoint
+        if (upd + 1) % args.save_every == 0:
+            ckpt_path = os.path.join(args.save_dir, f"ckpt_{upd+1:06d}.pt")
+            save_checkpoint(ckpt_path, agent, optim_bandit, optim_motor, extra={"update": upd + 1})
+            print(f"Saved checkpoint: {ckpt_path}")
 
-        # scalar losses
-        writer.add_scalar("Loss/ChoiceLoss", loss, global_step)
-        writer.add_scalar("Loss/MotorLoss", policy_loss, global_step)
+        global_step += 1
 
-        # rewards
-        writer.add_scalar("Reward/MeanCumSession", mean_cum_rew, global_step)
-
-        # per-N stats (either as histogram or individual scalars)
-        # writer.add_histogram("Policy/HighRewardChoicePerN", mean_highR_perN, global_step)
-        # or, if you want separate curves:
-        for n, val in enumerate(mean_highR_perN):
-            writer.add_scalar(f"Policy/HighRewardChoicePerN_N{n}", val, global_step)
-
-        # if (update_idx + 1) % 10 == 0:
-        #     for name, param in agent.named_parameters():
-        #         writer.add_histogram(f"Params/{name}", param.detach().cpu().numpy(), global_step)
-
-
-
-    ray.shutdown()
     writer.close()
+    ray.shutdown()
 
-            # if (ses + 1) % 10 == 0:  # every 10 sessions
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_dir = getattr(args, "save_dir", "checkpoints")  # if you add CLI arg
-    ckpt_path = os.path.join(save_dir, f"var_bandit_{stamp}.pt")
-    extra = {
-        "feature_dim": feature_dim,
-        "hidden_size": hidden_size,
-        "action_dim": 2,
-    }
-    save_checkpoint(ckpt_path, agent, optim_bandit, optim_motor, extra)
-    print(f"Saved checkpoint to {ckpt_path}")
+
+if __name__ == "__main__":
+    main()
