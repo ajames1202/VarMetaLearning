@@ -124,6 +124,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             # Cache for trial end
             trial_feat = f1.detach()
             trial_action = choice_target.detach()
+            trial_small = small.detach()
 
         # -----------------------
         # MOTOR step (continuous control)
@@ -168,7 +169,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             _, _, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)
 
             # Store per-trial buffers for update2()
-            obs_bandit.append(small.squeeze(0).detach().cpu().numpy())           # (C,h,w) for THIS trial
+            obs_bandit.append(trial_small.squeeze(0).detach().cpu().numpy())            # (C,h,w) for THIS trial
             chosen_bandits_buf.append(trial_action.squeeze(0).cpu().numpy())     # (2,)
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(trial_meta_start))
@@ -335,26 +336,48 @@ def main():
         xy_pos_buf = []
         goal_vec_buf = []
         chosen_bandits_motor_buf = []
-        obs_bandit = []
-        chosen_bandits_buf = []
-        bandit_rewards_buf = []
-        meta_ep_start_buf = []
+
+        # IMPORTANT: keep EPISODES as batch items
+        obs_bandit_batch = []          # list of (T,C,H,W)
+        chosen_bandits_batch = []      # list of (T,2)
+        bandit_rewards_batch = []      # list of (T,)
+        meta_ep_start_batch = []       # list of (T,)
 
         cum_rewards = 0.0
         total_trials = 0
 
+
+
         for r in results:
+            # motor buffers can stay flattened
             xy_pos_buf.extend(r["xy_pos_buf"])
             goal_vec_buf.extend(r["goal_vec_buf"])
             chosen_bandits_motor_buf.extend(r["chosen_bandits_motor_buf"])
 
-            obs_bandit.extend(r["obs_bandit"])
-            chosen_bandits_buf.extend(r["chosen_bandits_buf"])
-            bandit_rewards_buf.extend(r["bandit_rewards_buf"])
-            meta_ep_start_buf.extend(r["meta_ep_start_buf"])
+            # bandit buffers: make each rollout an episode entry
+            T = len(r["bandit_rewards_buf"])
+            if T == 0:
+                continue
+
+            obs_ep = np.stack(r["obs_bandit"], axis=0)                 # (T,C,H,W)
+            a_ep   = np.stack(r["chosen_bandits_buf"], axis=0)         # (T,2)
+            r_ep   = np.asarray(r["bandit_rewards_buf"], dtype=np.float32)  # (T,)
+            s_ep   = np.asarray(r["meta_ep_start_buf"], dtype=np.float32)   # (T,)
+
+            obs_bandit_batch.append(obs_ep)
+            chosen_bandits_batch.append(a_ep)
+            bandit_rewards_batch.append(r_ep)
+            meta_ep_start_batch.append(s_ep)
 
             cum_rewards += r["metrics"]["cum_rewards"]
             total_trials += r["metrics"]["num_trials"]
+
+        # OPTIONAL safety: ensure all episodes same T (update2 assumes this)
+        T0 = obs_bandit_batch[0].shape[0]
+        obs_bandit_batch = [x for x in obs_bandit_batch if x.shape[0] == T0]
+        chosen_bandits_batch = chosen_bandits_batch[:len(obs_bandit_batch)]
+        bandit_rewards_batch = bandit_rewards_batch[:len(obs_bandit_batch)]
+        meta_ep_start_batch = meta_ep_start_batch[:len(obs_bandit_batch)]
 
         # Train update
         agent.train()
@@ -364,10 +387,10 @@ def main():
             xy_pos_buf=xy_pos_buf,
             goal_vec_buf=goal_vec_buf,
             chosen_bandits_motor_buf=chosen_bandits_motor_buf,
-            bandit_obs=obs_bandit,
-            chosen_bandits_buf=chosen_bandits_buf,
-            bandit_rewards_buf=bandit_rewards_buf,
-            meta_ep_start_buf=meta_ep_start_buf,
+            bandit_obs=obs_bandit_batch,                 # <-- changed
+            chosen_bandits_buf=chosen_bandits_batch,     # <-- changed
+            bandit_rewards_buf=bandit_rewards_batch,     # <-- changed
+            meta_ep_start_buf=meta_ep_start_batch,       # <-- changed
             device=train_device,
         )
 
