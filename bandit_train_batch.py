@@ -109,20 +109,16 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
-    
-    history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)  # NEW: history buffer instead of h_rnn
+    history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)  # history buffer
     h_rnn = torch.zeros(1, agent.hidden_size, device=device)  # initial hidden state
-    # for episode in range(session_K*session_N):
-    obs,info = env.reset()
-    # print("Total episodes in session:", info.get("total_trials_in_session", -1))
+
+    obs, info = env.reset()
     done = False
     ep = 0
-    
 
-    pair_index_counter = np.ones(session_K, dtype=np.int32)*-1 # counts per pair
-    high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32) # counts per N
+    pair_index_counter = np.ones(session_K, dtype=np.int32) * -1
+    high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32)
 
-    # prev_action = torch.zeros((1, agent.action_dim), dtype=torch.float32, device=device)  # assuming action_dim=2
     meta_ep_len = 0
     xy_pos_buf = []
     goal_vec_buf = []
@@ -134,132 +130,127 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     bandit_rewards_buf = []
     meta_ep_start_buf = []
 
-    trial_feats = []      # one CNN feature per finished trial
-    trial_pair_ids = []   # the true context id for that trial
+    trial_feats = []
+    trial_pair_ids = []
 
-    pair_features = [[] for _ in range(session_K)]  # NEW: List to collect features per pair
+    pair_features = [[] for _ in range(session_K)]
 
-    # rnn_outputs = torch.empty((0, agent.gru.hidden_size), dtype=torch.float32, device=device)
     t = 0
-    ep_start_flag = 1.0  # first step of episode
+    ep_start_flag = 1.0  # first step of session
+
     while not done:
         obs_tensor = (
-            torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0) #(H,W,C)->(1,C,H,W)
+            torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
         )
         small = agent.downsample(obs_tensor)
         features = agent.encode(small).squeeze(0)
-                 # (F,) for this step
 
-        # CHOICE at episode start
+        # CHOICE at trial start
         if ep_start_flag == 1.0:
-                # build single-step tensors as (1, D)
-            # f1  = features.unsqueeze(0)        # (1, F)
             small = agent.downsample(obs_tensor)
-            f1 = agent.encode(small)                                # (1, F)
+            f1 = agent.encode(small)  # (1, F)
             obs_bandit.append(small.squeeze(0).detach().cpu().numpy())  # (C,H,W)
-            trial_feat = agent.encode(small).detach()     # (1,F) cache THIS
+            trial_feat = agent.encode(small).detach()  # (1,F) cache THIS
 
-            
-            # --- Bandit forward for choice ---
-            
-            # rnn_out, h = agent.(f1, prev_bandit_act, prev_bandit_reward, es1, h)  # rnn_out: (1, H)
             # --- Bandit forward for choice (Thompson sampling with Bernoulli head) ---
 
-            # 1) Get logits from the bandit head using current RNN state
-            reward_logits = agent.reward_compute(h_rnn, f1).squeeze(0) # (2,) -> [logit_left, logit_right]
+            # --- Query token: append (context, 0_action, 0_reward) at trial start ---
+            meta_ep_start = 1.0 if meta_ep_len == 0 else 0.0
+            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
 
-            # 2) Convert logits -> probabilities
+            zero_act = torch.zeros((1, 2), device=device, dtype=torch.float32)
+            zero_r = torch.zeros((1, 1), device=device, dtype=torch.float32)
+
+            q_out, h_rnn, history = agent.rnn_fwd(
+                f1,  # (1,F) current context feature
+                zero_act,  # (1,2) no action yet
+                zero_r,  # (1,1) no reward yet
+                meta_ep_start_torch,
+                history=history,
+            )  # q_out: (H,)
+
+            # Use the *query-state* (not the previous memory-state) to predict this trial's reward probs
+            reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)  # (2,) [logit_left, logit_right]
+
             eps = 1e-4
-            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)  # (2,)  # (2,), in (0,1)
+            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)
             p_left, p_right = probs[0], probs[1]
 
-            # 3) Build an approximate Beta posterior around each p
-            #    concentration controls how "confident" the posterior is.
-            concentration = 5.0  # hyper-parameter, tune if needed
-            alpha_left  = p_left  * concentration + 1.0 # add 1.0 prior
-            beta_left   = (1.0 - p_left)  * concentration + 1.0 # add 1.0 prior
-            alpha_right = p_right * concentration + 1.0 # add 1.0 prior
-            beta_right  = (1.0 - p_right) * concentration + 1.0 # add 1.0 prior
+            concentration = 5.0
+            alpha_left = p_left * concentration + 1.0
+            beta_left = (1.0 - p_left) * concentration + 1.0
+            alpha_right = p_right * concentration + 1.0
+            beta_right = (1.0 - p_right) * concentration + 1.0
 
-            dist_left  = torch.distributions.Beta(alpha_left,  beta_left)
+            dist_left = torch.distributions.Beta(alpha_left, beta_left)
             dist_right = torch.distributions.Beta(alpha_right, beta_right)
 
-            # 4) Thompson sample & pick the best arm
-            u_left  = dist_left.rsample()
+            u_left = dist_left.rsample()
             u_right = dist_right.rsample()
 
-            samples = torch.stack([u_left, u_right])           # (2,)
-            a_t = torch.argmax(samples)                        # index of chosen arm
-            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
+            samples = torch.stack([u_left, u_right])
+            a_t = torch.argmax(samples)
+            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
             trial_action = choice_target
-
 
             meta_ep_len += 1
 
-
         # --- Motor forward (now we have choice_target) ---
-        # Build (x,y) in [-1,1]
         W, H = env.unwrapped.W, env.unwrapped.H
         x_pix, y_pix = env.unwrapped.cursor
-        xy_norm = np.array([(x_pix/(W-1))*2-1, (y_pix/(H-1))*2-1], dtype=np.float32)
+        xy_norm = np.array([(x_pix / (W - 1)) * 2 - 1, (y_pix / (H - 1)) * 2 - 1], dtype=np.float32)
 
-        # Panel centers in pixels → normalize to [-1,1]
-        left_c  = np.array([env.unwrapped.left_rect.centerx,  env.unwrapped.left_rect.centery],  np.float32)
+        left_c = np.array([env.unwrapped.left_rect.centerx, env.unwrapped.left_rect.centery], np.float32)
         right_c = np.array([env.unwrapped.right_rect.centerx, env.unwrapped.right_rect.centery], np.float32)
-        left_c_norm  = np.array([(left_c[0]/(W-1))*2-1,  (left_c[1]/(H-1))*2-1],  np.float32)
-        right_c_norm = np.array([(right_c[0]/(W-1))*2-1, (right_c[1]/(H-1))*2-1], np.float32)
+        left_c_norm = np.array([(left_c[0] / (W - 1)) * 2 - 1, (left_c[1] / (H - 1)) * 2 - 1], np.float32)
+        right_c_norm = np.array([(right_c[0] / (W - 1)) * 2 - 1, (right_c[1] / (H - 1)) * 2 - 1], np.float32)
 
-        # Chosen center based on one-hot
-        chosen_center = left_c_norm if choice_target.argmax(dim=-1).item() == 0 else right_c_norm
-        g_norm = chosen_center - xy_norm  # vector *to* goal
+        goal_center = left_c_norm if choice_target.argmax(dim=-1).item() == 0 else right_c_norm
+        g_norm = goal_center - xy_norm
 
-        xy_pos_t  = torch.as_tensor(xy_norm).unsqueeze(0).to(device)  # (1,2)
-        goal_vec_t= torch.as_tensor(g_norm ).unsqueeze(0).to(device)  # (1,2)
+        xy_pos_t = torch.as_tensor(xy_norm).unsqueeze(0).to(device)  # (1,2)
+        goal_vec_t = torch.as_tensor(g_norm).unsqueeze(0).to(device)  # (1,2)
 
-        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos = xy_pos_t, goal_vec=goal_vec_t)
+        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos=xy_pos_t, goal_vec=goal_vec_t)
 
-        # store for training
-        xy_pos_buf.append(xy_norm)     # (2,)
-        goal_vec_buf.append(g_norm)    # (2,)
-    
+        xy_pos_buf.append(xy_norm)
+        goal_vec_buf.append(g_norm)
+
         std = torch.exp(log_std)
-        y = mu + std * torch.randn_like(std)     # pre-tanh noise
+        y = mu + std * torch.randn_like(std)
         action = torch.tanh(y)
         action_np = action.squeeze(0).detach().cpu().numpy()
 
-        next_obs, reward, term, _, info = env.step(action_np) # (H,W,3), scalar, bool, _, dict
+        next_obs, reward, term, _, info = env.step(action_np)
         done = term
-        
+
         pair_idx_now = info.get("pair_index_in_session", -1)
 
-
-        feats_motor.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
-        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
-
+        feats_motor.append(f1.squeeze(0).detach().cpu().numpy())
+        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
 
         if info.get("trial_ended"):
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
-            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)  # (1,)
-            
-            a_oh        = choice_target                                           # (1, 2) one-hot choice
-            r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-            dummy_out, h_rnn, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
-            
-            feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
-            trial_feat = agent.encode(small).detach().squeeze(0).cpu().numpy()  # (F,)
-            trial_feats.append(trial_feat)
+            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
+
+            r_t = torch.tensor([[float(reward)]], device=device)
+
+            # Memory token at trial end: append (context, action, reward)
+            dummy_out, h_rnn, history = agent.rnn_fwd(
+                trial_feat, trial_action, r_t, meta_ep_start_torch, history=history
+            )  # update history and h_rnn
+
+            trial_feat_np = agent.encode(small).detach().squeeze(0).cpu().numpy()
+            trial_feats.append(trial_feat_np)
             trial_pair_ids.append(pair_idx_now)
-            pair_features[pair_idx_now].append(trial_feat)
-
-
+            pair_features[pair_idx_now].append(trial_feat_np)
 
             pair_index_ep = info.get("pair_index_in_session", -1)
-            pair_index_counter[pair_index_ep] += 1    
+            pair_index_counter[pair_index_ep] += 1
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
-            if(selected_high_reward):
-                    # print("High reward choice made for pair index", pair_index_ep, "at count", pair_index_counter[pair_index_ep])
-                    high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
-            # print("Ep: ", info.get("trial_index") , ", idx = ", pair_idx_now, ", choice target:", choice_target.argmax(dim=-1).item(), ", Reached Target:", info.get("selected_target"), ", reward:", reward, ", selected_high_reward = ", selected_high_reward, ", p_left =", p_left.item(), ", p_right =", p_right.item())    
+            if selected_high_reward:
+                high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
+
             log(
                 "Ep: ", info.get("trial_index"),
                 ", idx = ", pair_idx_now,
@@ -267,99 +258,49 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 ", Reached Target:", info.get("selected_target"),
                 ", reward:", reward,
                 ", selected_high_reward = ", selected_high_reward,
-                ", p_left =", round(p_left.item(),2),
-                ", p_right =", round(p_right.item(),2)
+                ", p_left =", round(p_left.item(), 2),
+                ", p_right =", round(p_right.item(), 2),
             )
 
             ep_start_flag = 1.0
-            # print("Trial ended. t=", t, ", pair_index_ep=", pair_index_ep, ", pair_idx_t=", pair_idx_t,  ", choice_target:", choice_target, "reward:", reward, ", done_buf[t]=", done_buf[t])
 
-            feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
-            chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
-            bandit_rewards_buf.append(reward)  # scalar
+            feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())
+            chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
+            bandit_rewards_buf.append(reward)
 
-            if(meta_ep_len == 1):
+            if meta_ep_len == 1:
                 meta_ep_start_buf.append(1.0)
             else:
-                meta_ep_start_buf.append(0.0)    
+                meta_ep_start_buf.append(0.0)
 
-            choice_target = None
-
-    
         else:
             ep_start_flag = 0.0
 
-        
-
         obs = next_obs
         t += 1
-        # prev_action = action
-        # prev_reward = torch.as_tensor([[reward]], dtype=torch.float32, device=device)
-
-    # print("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
-    # log("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
 
     high_reward_choice_count_on_left = info.get("high_reward_choice_count_on_left", -1)
-    high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right",-1)
-    total_left_choices = info.get("total_left_choices",-1)
-    total_right_choices = info.get("total_right_choices",-1)
-    # print("Session finished. High-reward choices per N:", high_reward_choice_per_N, ", High-reward choices on left:", high_reward_choice_count_on_left, ", on right:", high_reward_choice_count_on_right, ", Total left choices:", total_left_choices, ", Total right choices:", total_right_choices, ", Total trials in session:", len(rew_buf))
-    
-    ctx_stats = {}
-    if len(trial_feats) > 0:
-        X = np.stack(trial_feats)                        # (T_trials, F)
-        y = np.array(trial_pair_ids, dtype=np.int32)     # (T_trials,)
+    high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right", -1)
+    total_left_choices = info.get("total_left_choices", -1)
+    total_right_choices = info.get("total_right_choices", -1)
 
-        present = np.unique(y)
-        ctx_stats["num_contexts_present"] = int(len(present))
-
-        # centroids per true context
-        C = np.stack([X[y == k].mean(axis=0) for k in present])  # (K_present, F)
-
-        # cosine-sim matrix between centroids (off-diagonal should be low if contexts differ)
-        Cn = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-8)
-        cos_centroid = Cn @ Cn.T
-        ctx_stats["centroid_cosine_matrix"] = cos_centroid  # keep for debugging/printing
-
-        # nearest-centroid classification accuracy (simple “linear probe”-ish sanity check)
-        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
-        sims = Xn @ Cn.T                                   # (T_trials, K_present)
-        pred_cluster = sims.argmax(axis=1)                 # 0..K_present-1
-        y_hat = present[pred_cluster]
-        ctx_stats["nearest_centroid_acc"] = float((y_hat == y).mean())
-
-        # intra vs inter distance ratio (bigger is better separation)
-        intra = np.mean([np.linalg.norm(X[y == k] - C[i], axis=1).mean()
-                        for i, k in enumerate(present)])
-        inter = np.mean([np.linalg.norm(C[i] - C[j])
-                        for i in range(len(present)) for j in range(i+1, len(present))]) if len(present) > 1 else 0.0
-        ctx_stats["intra_dist"] = float(intra)
-        ctx_stats["inter_dist"] = float(inter)
-        ctx_stats["inter_over_intra"] = float(inter / (intra + 1e-8))
-
-    
-    log(
-        "Session finished. High-reward choices per N:", high_reward_choice_per_N,
-        ", High-reward choices on left:", high_reward_choice_count_on_left,
-        ", on right:", high_reward_choice_count_on_right,
-        ", Total left choices:", total_left_choices,
-        ", Total right choices:", total_right_choices,
-        ", nearest_centroid_acc:", ctx_stats["nearest_centroid_acc"],
-        ", inter_over_intra:", ctx_stats["inter_over_intra"],
-        ", cos_centroid:", cos_centroid
+    return (
+        xy_pos_buf,
+        goal_vec_buf,
+        feats_motor,
+        chosen_bandits_motor_buf,
+        obs_bandit,
+        feats_bandit,
+        chosen_bandits_buf,
+        bandit_rewards_buf,
+        meta_ep_start_buf,
+        high_reward_choice_per_N,
+        high_reward_choice_count_on_left,
+        high_reward_choice_count_on_right,
+        total_left_choices,
+        total_right_choices,
     )
 
-    high_reward_choice_per_N = high_reward_choice_per_N.astype(float)
-    high_reward_choice_per_N /= float(session_K)  # normalize by K
-    high_reward_choice_per_N = high_reward_choice_per_N.round(2)
-
-    # if info.get('probe_fam_inv_err'):
-    #     print(f"probe: fam_inv_err={np.mean(info['probe_fam_inv_err']):.3g}, "
-    #       f"flip_consistency={np.mean(info['probe_flip_consistency']):.3g}")
-
-    cum_rewards = sum(bandit_rewards_buf)
-    
-    return xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards
 
 if __name__ == "__main__":
 
