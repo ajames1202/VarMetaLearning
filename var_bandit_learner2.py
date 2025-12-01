@@ -26,10 +26,18 @@ class CNNEncoder(nn.Module):
         self.normalize = normalize
 
         if normalize:
-            mean = torch.tensor(weights.meta["mean"]).view(1, 3, 1, 1)
-            std  = torch.tensor(weights.meta["std"]).view(1, 3, 1, 1)
+            try:
+                t = weights.transforms()
+                mean = torch.tensor(t.mean, dtype=torch.float32).view(1, 3, 1, 1)
+                std  = torch.tensor(t.std,  dtype=torch.float32).view(1, 3, 1, 1)
+            except Exception:
+                # ImageNet defaults
+                mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+                std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
             self.register_buffer("mean", mean)
             self.register_buffer("std", std)
+
 
         if not train_backbone:
             for p in self.backbone.parameters():
