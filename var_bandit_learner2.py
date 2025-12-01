@@ -2,34 +2,48 @@
 import numpy as np
 import torch
 from torch import nn
-from torchvision import transforms as T
+from torchvision.models import resnet18, ResNet18_Weights
 import torch.nn.functional as F
+
 import math
 
 class CNNEncoder(nn.Module):
-    """A small CNN for processing visual inputs (expects NCHW)."""
-    def __init__(self, feature_dim):
+    """
+    Pretrained CNN feature extractor -> projects to feature_dim.
+    Expects NCHW images in [0,1] (like your current code).
+    """
+    def __init__(self, feature_dim: int, train_backbone: bool = False, normalize: bool = True):
         super().__init__()
-        # build the CNN feature extractor
-        self.cnn = self.__build_cnn(3, feature_dim)
 
-    def __build_cnn(self, in_channels, feature_dim):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((9, 9)),  # ensure output size is (9,9)
-            nn.Flatten(),
-            nn.Linear(64 * 9 * 9, feature_dim), 
-            nn.ReLU()
-        )
-    
-    def forward(self, x):
+        weights = ResNet18_Weights.DEFAULT
+        m = resnet18(weights=weights)
+
+        # Everything except the final FC layer
+        self.backbone = nn.Sequential(*list(m.children())[:-1])  # -> (B, 512, 1, 1)
+        backbone_dim = m.fc.in_features  # 512 for resnet18
+
+        self.proj = nn.Linear(backbone_dim, feature_dim)
+        self.normalize = normalize
+
+        if normalize:
+            mean = torch.tensor(weights.meta["mean"]).view(1, 3, 1, 1)
+            std  = torch.tensor(weights.meta["std"]).view(1, 3, 1, 1)
+            self.register_buffer("mean", mean)
+            self.register_buffer("std", std)
+
+        if not train_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float()
-        return self.cnn(x)
+        if self.normalize:
+            x = (x - self.mean) / self.std
+
+        z = self.backbone(x).flatten(1)      # (B, 512)
+        z = self.proj(z)                     # (B, feature_dim)
+        return F.relu(z)
+
 
 def atanh(x):
     return 0.5 * torch.log((1 + x) / (1 - x))
@@ -71,8 +85,8 @@ class BanditLearner(nn.Module):
 
         self.debug_gru_inputs = {"rollout": [], "update": []}
 
-
-        self.enc = CNNEncoder(feature_dim)
+        self.enc = CNNEncoder(feature_dim, train_backbone=True)
+        # self.enc = CNNEncoder(feature_dim)
 
         # --- Bandit RNN + heads replaced with Transformer
         self.hidden_size = rnn_hidden_size
