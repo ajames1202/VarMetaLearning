@@ -157,6 +157,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             small = agent.downsample(obs_tensor)
             f1 = agent.encode(small)                                # (1, F)
             obs_bandit.append(small.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+            trial_feat = agent.encode(small).detach()     # (1,F) cache THIS
+            trial_action = choice_target                 # cache action too
+
 
             
             # --- Bandit forward for choice ---
@@ -241,12 +244,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             
             a_oh        = choice_target                                           # (1, 2) one-hot choice
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-            dummy_out, h_rnn, history = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
+            dummy_out, h_rnn, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
             
-            feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
-            trial_feats.append(feat_np)
+            # feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
+            trial_feats.append(trial_feat)
             trial_pair_ids.append(pair_idx_now)
-            pair_features[pair_idx_now].append(feat_np)
+            pair_features[pair_idx_now].append(trial_feat)
 
 
 
