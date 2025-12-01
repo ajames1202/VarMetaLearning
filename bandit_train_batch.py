@@ -469,7 +469,7 @@ if __name__ == "__main__":
             rollout_futures = []
             for w_id in range(num_launch):
 
-                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx%20 == 0)
+                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx%5 == 0)
                 # meaning: only worker 0, only the first session of this update
 
                 rollout_futures.append(
