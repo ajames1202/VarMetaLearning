@@ -158,8 +158,6 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             f1 = agent.encode(small)                                # (1, F)
             obs_bandit.append(small.squeeze(0).detach().cpu().numpy())  # (C,H,W)
             trial_feat = agent.encode(small).detach()     # (1,F) cache THIS
-            trial_action = choice_target                 # cache action too
-
 
             
             # --- Bandit forward for choice ---
@@ -193,6 +191,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             samples = torch.stack([u_left, u_right])           # (2,)
             a_t = torch.argmax(samples)                        # index of chosen arm
             choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
+            trial_action = choice_target
 
 
             meta_ep_len += 1
