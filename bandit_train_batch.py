@@ -134,6 +134,11 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     bandit_rewards_buf = []
     meta_ep_start_buf = []
 
+    trial_feats = []      # one CNN feature per finished trial
+    trial_pair_ids = []   # the true context id for that trial
+
+    pair_features = [[] for _ in range(session_K)]  # NEW: List to collect features per pair
+
     # rnn_outputs = torch.empty((0, agent.gru.hidden_size), dtype=torch.float32, device=device)
     t = 0
     ep_start_flag = 1.0  # first step of episode
@@ -234,13 +239,18 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
             meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)  # (1,)
             
-            # if choice_target.argmax(dim=-1).item() != info.get("selected_target"):
-            #     reward = 0
-            # else:
             a_oh        = choice_target                                           # (1, 2) one-hot choice
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
             dummy_out, h_rnn, history = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
             
+            if print_this_session:
+                feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
+                trial_feats.append(feat_np)
+                trial_pair_ids.append(pair_idx_now)
+                pair_features[pair_idx_now].append(feat_np)
+
+
+
             pair_index_ep = info.get("pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
@@ -292,12 +302,49 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     total_left_choices = info.get("total_left_choices",-1)
     total_right_choices = info.get("total_right_choices",-1)
     # print("Session finished. High-reward choices per N:", high_reward_choice_per_N, ", High-reward choices on left:", high_reward_choice_count_on_left, ", on right:", high_reward_choice_count_on_right, ", Total left choices:", total_left_choices, ", Total right choices:", total_right_choices, ", Total trials in session:", len(rew_buf))
+    
+    ctx_stats = {}
+    if len(trial_feats) > 0:
+        X = np.stack(trial_feats)                        # (T_trials, F)
+        y = np.array(trial_pair_ids, dtype=np.int32)     # (T_trials,)
+
+        present = np.unique(y)
+        ctx_stats["num_contexts_present"] = int(len(present))
+
+        # centroids per true context
+        C = np.stack([X[y == k].mean(axis=0) for k in present])  # (K_present, F)
+
+        # cosine-sim matrix between centroids (off-diagonal should be low if contexts differ)
+        Cn = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-8)
+        cos_centroid = Cn @ Cn.T
+        ctx_stats["centroid_cosine_matrix"] = cos_centroid  # keep for debugging/printing
+
+        # nearest-centroid classification accuracy (simple “linear probe”-ish sanity check)
+        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+        sims = Xn @ Cn.T                                   # (T_trials, K_present)
+        pred_cluster = sims.argmax(axis=1)                 # 0..K_present-1
+        y_hat = present[pred_cluster]
+        ctx_stats["nearest_centroid_acc"] = float((y_hat == y).mean())
+
+        # intra vs inter distance ratio (bigger is better separation)
+        intra = np.mean([np.linalg.norm(X[y == k] - C[i], axis=1).mean()
+                        for i, k in enumerate(present)])
+        inter = np.mean([np.linalg.norm(C[i] - C[j])
+                        for i in range(len(present)) for j in range(i+1, len(present))]) if len(present) > 1 else 0.0
+        ctx_stats["intra_dist"] = float(intra)
+        ctx_stats["inter_dist"] = float(inter)
+        ctx_stats["inter_over_intra"] = float(inter / (intra + 1e-8))
+
+    
     log(
         "Session finished. High-reward choices per N:", high_reward_choice_per_N,
         ", High-reward choices on left:", high_reward_choice_count_on_left,
         ", on right:", high_reward_choice_count_on_right,
         ", Total left choices:", total_left_choices,
         ", Total right choices:", total_right_choices,
+        ", nearest_centroid_acc:", ctx_stats["nearest_centroid_acc"],
+        ", inter_over_intra:", ctx_stats["inter_over_intra"],
+        ", cos_centroid:", cos_centroid
     )
 
     high_reward_choice_per_N = high_reward_choice_per_N.astype(float)
