@@ -44,6 +44,12 @@ def load_checkpoint(path: str, agent: torch.nn.Module, optim_bandit=None, optim_
 # -------------------------
 @torch.inference_mode()
 def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False):
+    
+    def log(*args, **kwargs):
+        if print_this_session and worker_id == 0:
+            print(*args, **kwargs)
+
+    
     agent.eval()
 
     history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)
@@ -179,6 +185,11 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 high_reward_choice_per_N[idxN] += 1.0
 
 
+            log(
+                f"[W{worker_id}] trial={meta_trial_idx} reward={reward} "
+                f"choice={int(trial_action.argmax(dim=-1).item())}"
+                f"probs={probs}"
+            )
 
             meta_trial_idx += 1
             ep_start_flag = 1.0
@@ -316,7 +327,11 @@ def main():
         futures = []
         for i in range(num_rollouts):
             w = workers[i % len(workers)]
-            futures.append(w.rollout.remote(state_ref, print_this_session=False))
+            if(upd % 10 == 0 & w == 0):
+                print_this_session = True
+            else:
+                print_this_session = False    
+            futures.append(w.rollout.remote(state_ref, print_this_session=print_this_session))
 
         results: List[Dict[str, Any]] = ray.get(futures)
 
