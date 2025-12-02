@@ -327,12 +327,12 @@ def main():
         futures = []
         for i in range(num_rollouts):
             w = workers[i % len(workers)]
-            if(upd % 10 == 0 and w == 0):
+            if(upd % 10 == 0 and i % len(workers) == 0):
                 print_this_session = True
             else:
                 print_this_session = False 
 
-            print("upd=",upd, ", w=", w, ", print_this_session=", print_this_session)       
+            # print("upd=",upd, ", w=", i % len(workers), ", print_this_session=", print_this_session)       
             futures.append(w.rollout.remote(state_ref, print_this_session=print_this_session))
 
         results: List[Dict[str, Any]] = ray.get(futures)
