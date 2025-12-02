@@ -327,7 +327,7 @@ def main():
         futures = []
         for i in range(num_rollouts):
             w = workers[i % len(workers)]
-            if(upd % 10 == 0 & w == 0):
+            if(upd % 10 == 0 and w == 0):
                 print_this_session = True
             else:
                 print_this_session = False    
