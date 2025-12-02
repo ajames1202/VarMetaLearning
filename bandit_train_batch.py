@@ -187,8 +187,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
             log(
                 f"[W{worker_id}] trial={meta_trial_idx} reward={reward} "
-                f"choice={int(trial_action.argmax(dim=-1).item())}"
-                f"probs={probs}"
+                f"choice={int(trial_action.argmax(dim=-1).item())} "
+                f"reached_target={info.get("selected_target")}"
+                f"probs={probs} "
             )
 
             meta_trial_idx += 1
