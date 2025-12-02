@@ -135,10 +135,11 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         g1 = goal_center[1] - y_norm
 
         # write into preallocated tensors
-        xy_pos_t[0, 0] = x_norm
-        xy_pos_t[0, 1] = y_norm
-        goal_vec_t[0, 0] = g0
-        goal_vec_t[0, 1] = g1
+        xy_pos_t[0, 0] = float(x_norm)
+        xy_pos_t[0, 1] = float(y_norm)
+        goal_vec_t[0, 0] = float(g0)
+        goal_vec_t[0, 1] = float(g1)
+
 
         mu, log_std = agent.motor_fwd(trial_action, xy_pos=xy_pos_t, goal_vec=goal_vec_t)
         std = torch.exp(log_std)
