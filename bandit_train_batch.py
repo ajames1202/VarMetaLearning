@@ -330,7 +330,9 @@ def main():
             if(upd % 10 == 0 and w == 0):
                 print_this_session = True
             else:
-                print_this_session = False    
+                print_this_session = False 
+
+            print("upd=",upd, ", w=", w, ", print_this_session=", print_this_session)       
             futures.append(w.rollout.remote(state_ref, print_this_session=print_this_session))
 
         results: List[Dict[str, Any]] = ray.get(futures)
