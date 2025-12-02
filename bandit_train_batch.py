@@ -42,107 +42,103 @@ def load_checkpoint(path: str, agent: torch.nn.Module, optim_bandit=None, optim_
 # -------------------------
 # Rollout with Query + Memory tokens
 # -------------------------
-@torch.no_grad()
+@torch.inference_mode()
 def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False):
-    """
-    Returns a dict:
-      buffers needed for update2()
-    plus metrics.
-    """
-    def log(*args, **kwargs):
-        if print_this_session and worker_id == 0:
-            print(*args, **kwargs)
-
     agent.eval()
 
-    # History stores tokens of size agent.input_size
     history = torch.empty((0, agent.input_size), dtype=torch.float32, device=device)
 
     obs, info = env.reset()
     done = False
 
-    # Buffers for training
-    xy_pos_buf: List[np.ndarray] = []
-    goal_vec_buf: List[np.ndarray] = []
-    chosen_bandits_motor_buf: List[np.ndarray] = []
+    # ---------- precompute constants ----------
+    W, H = env.unwrapped.W, env.unwrapped.H
+    sx = 2.0 / (W - 1)
+    sy = 2.0 / (H - 1)
+    ox = -1.0
+    oy = -1.0
 
-    obs_bandit: List[np.ndarray] = []          # list of (C,H,W) downsampled images per finished trial
-    chosen_bandits_buf: List[np.ndarray] = []  # list of (2,) one-hot per finished trial
-    bandit_rewards_buf: List[float] = []       # list of scalar rewards per finished trial
-    meta_ep_start_buf: List[float] = []        # list of 0/1 per finished trial
+    left_c = np.array([env.unwrapped.left_rect.centerx,  env.unwrapped.left_rect.centery],  np.float32)
+    right_c= np.array([env.unwrapped.right_rect.centerx, env.unwrapped.right_rect.centery], np.float32)
+    left_c_norm  = np.array([left_c[0]  * sx + ox, left_c[1]  * sy + oy], np.float32)
+    right_c_norm = np.array([right_c[0] * sx + ox, right_c[1] * sy + oy], np.float32)
 
-    # Metrics
-    high_reward_choice_per_N = np.zeros(session_N, dtype=np.float32)
-    cum_rewards = 0.0
+    # ---------- reusable tensors (avoid allocs) ----------
+    zero_act = torch.zeros((1, 2), device=device, dtype=torch.float32)
+    zero_r   = torch.zeros((1, 1), device=device, dtype=torch.float32)
+    meta_ep_start_torch = torch.zeros((1, 1), device=device, dtype=torch.float32)
 
-    # Episode/trial bookkeeping
+    xy_pos_t  = torch.empty((1, 2), device=device, dtype=torch.float32)
+    goal_vec_t= torch.empty((1, 2), device=device, dtype=torch.float32)
+
+    # Buffers
+    xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf = [], [], []
+    obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf = [], [], [], []
+
     meta_trial_idx = 0
     ep_start_flag = 1.0
 
-    # Store context + action for the current trial so we can write the Memory token at trial end
-    trial_feat = None       # (1,F)
-    trial_action = None     # (1,2)
-    trial_meta_start = 0.0  # float
+    trial_feat = None
+    trial_action = None
+    trial_action_np = None
+    trial_action_idx = 0
+    trial_small_np = None
+    trial_meta_start = 0.0
 
     while not done:
-        obs_tensor = torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-        small = agent.downsample(obs_tensor)      # (1,C,h,w)
-        f1 = agent.encode(small)                  # (1,F)
 
         # -----------------------
-        # TRIAL START: choose arm using QUERY token
+        # TRIAL START: compute vision ONCE + choose arm
         # -----------------------
         if ep_start_flag == 1.0:
             trial_meta_start = 1.0 if meta_trial_idx == 0 else 0.0
-            meta_ep_start_torch = torch.tensor([[trial_meta_start]], device=device, dtype=torch.float32)
+            meta_ep_start_torch.fill_(trial_meta_start)
 
-            zero_act = torch.zeros((1, 2), device=device, dtype=torch.float32)
-            zero_r = torch.zeros((1, 1), device=device, dtype=torch.float32)
+            # only now convert obs -> torch and run CNN
+            obs_tensor = torch.from_numpy(obs).to(device).permute(2, 0, 1).unsqueeze(0).float()
+            obs_tensor.mul_(1.0 / 255.0)
 
-            # Append QUERY token to history; get query-state
-            q_out, _, history = agent.rnn_fwd(
-                f1, zero_act, zero_r, meta_ep_start_torch, history=history
-            )  # q_out: (H,)
+            small = agent.downsample(obs_tensor)     # (1,C,h,w)
+            f1 = agent.encode(small)                 # (1,F)
 
-            reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)  # (2,)
+            q_out, _, history = agent.rnn_fwd(f1, zero_act, zero_r, meta_ep_start_torch, history=history)
+            reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)
             probs = torch.sigmoid(reward_logits).clamp(1e-4, 1.0 - 1e-4)
-            p_left, p_right = probs[0], probs[1]
 
-            # Thompson sampling via Beta centered at p
+            # Thompson sampling (same logic)
             concentration = 5.0
-            alpha_left = p_left * concentration + 1.0
-            beta_left = (1.0 - p_left) * concentration + 1.0
-            alpha_right = p_right * concentration + 1.0
-            beta_right = (1.0 - p_right) * concentration + 1.0
+            alpha = probs * concentration + 1.0
+            beta  = (1.0 - probs) * concentration + 1.0
+            u = torch.stack([
+                torch.distributions.Beta(alpha[0], beta[0]).rsample(),
+                torch.distributions.Beta(alpha[1], beta[1]).rsample()
+            ])
+            a_t = torch.argmax(u)
 
-            u_left = torch.distributions.Beta(alpha_left, beta_left).rsample()
-            u_right = torch.distributions.Beta(alpha_right, beta_right).rsample()
-            a_t = torch.argmax(torch.stack([u_left, u_right]))
+            trial_action_idx = int(a_t.item())
+            trial_action = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
 
-            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
-
-            # Cache for trial end
-            trial_feat = f1.detach()
-            trial_action = choice_target.detach()
-            trial_small = small.detach()
+            # cache for trial end + motor loop
+            trial_feat = f1
+            trial_action_np = trial_action.squeeze(0).cpu().numpy()  # one time per trial
+            trial_small_np = small.squeeze(0).cpu().numpy()          # one time per trial
 
         # -----------------------
-        # MOTOR step (continuous control)
+        # MOTOR step
         # -----------------------
-        W, H = env.unwrapped.W, env.unwrapped.H
         x_pix, y_pix = env.unwrapped.cursor
-        xy_norm = np.array([(x_pix / (W - 1)) * 2 - 1, (y_pix / (H - 1)) * 2 - 1], dtype=np.float32)
+        x_norm = x_pix * sx + ox
+        y_norm = y_pix * sy + oy
 
-        left_c = np.array([env.unwrapped.left_rect.centerx, env.unwrapped.left_rect.centery], np.float32)
-        right_c = np.array([env.unwrapped.right_rect.centerx, env.unwrapped.right_rect.centery], np.float32)
-        left_c_norm = np.array([(left_c[0] / (W - 1)) * 2 - 1, (left_c[1] / (H - 1)) * 2 - 1], np.float32)
-        right_c_norm = np.array([(right_c[0] / (W - 1)) * 2 - 1, (right_c[1] / (H - 1)) * 2 - 1], np.float32)
+        goal_center = left_c_norm if trial_action_idx == 0 else right_c_norm
+        g0 = goal_center[0] - x_norm
+        g1 = goal_center[1] - y_norm
 
-        goal_center = left_c_norm if trial_action.argmax(dim=-1).item() == 0 else right_c_norm
-        g_norm = goal_center - xy_norm
-
-        xy_pos_t = torch.as_tensor(xy_norm, device=device).unsqueeze(0)     # (1,2)
-        goal_vec_t = torch.as_tensor(g_norm, device=device).unsqueeze(0)    # (1,2)
+        # write into preallocated tensors
+        xy_pos_t[0, 0] = x_norm
+        xy_pos_t[0, 1] = y_norm
+        goal_vec_t[0, 0] = g0
+        goal_vec_t[0, 1] = g1
 
         mu, log_std = agent.motor_fwd(trial_action, xy_pos=xy_pos_t, goal_vec=goal_vec_t)
         std = torch.exp(log_std)
@@ -153,39 +149,24 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         next_obs, reward, term, trunc, info = env.step(action_np)
         done = bool(term) or bool(trunc)
 
-        # Save motor buffers every step
-        xy_pos_buf.append(xy_norm)
-        goal_vec_buf.append(g_norm)
-        chosen_bandits_motor_buf.append(trial_action.squeeze(0).cpu().numpy())
+        # save motor buffers (already in numpy)
+        xy_pos_buf.append(np.array([x_norm, y_norm], np.float32))
+        goal_vec_buf.append(np.array([g0, g1], np.float32))
+        chosen_bandits_motor_buf.append(trial_action_np)
 
         # -----------------------
-        # TRIAL END: append MEMORY token + store bandit training buffers
+        # TRIAL END
         # -----------------------
         if info.get("trial_ended", False):
             r_t = torch.tensor([[float(reward)]], device=device, dtype=torch.float32)
-            meta_ep_start_torch = torch.tensor([[trial_meta_start]], device=device, dtype=torch.float32)
+            meta_ep_start_torch.fill_(trial_meta_start)
 
-            # Append MEMORY token (context + action + reward)
             _, _, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)
 
-            # Store per-trial buffers for update2()
-            obs_bandit.append(trial_small.squeeze(0).detach().cpu().numpy())            # (C,h,w) for THIS trial
-            chosen_bandits_buf.append(trial_action.squeeze(0).cpu().numpy())     # (2,)
+            obs_bandit.append(trial_small_np)
+            chosen_bandits_buf.append(trial_action_np)
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(trial_meta_start))
-
-            cum_rewards += float(reward)
-
-            # Optional metric from env
-            if info.get("selected_high_reward_this_trial", False):
-                # if you have "trial_index_in_pair" you can do better; this is a safe default
-                idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
-                high_reward_choice_per_N[idxN] += 1.0
-
-            log(
-                f"[W{worker_id}] trial={meta_trial_idx} reward={reward} "
-                f"choice={int(trial_action.argmax(dim=-1).item())}"
-            )
 
             meta_trial_idx += 1
             ep_start_flag = 1.0
@@ -193,9 +174,6 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             ep_start_flag = 0.0
 
         obs = next_obs
-
-    # Normalize metric if you want (optional)
-    # high_reward_choice_per_N /= float(session_K)
 
     return {
         "xy_pos_buf": xy_pos_buf,
@@ -205,13 +183,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         "chosen_bandits_buf": chosen_bandits_buf,
         "bandit_rewards_buf": bandit_rewards_buf,
         "meta_ep_start_buf": meta_ep_start_buf,
-        "metrics": {
-            "cum_rewards": float(cum_rewards),
-            "high_reward_choice_per_N": high_reward_choice_per_N,
-            "num_trials": int(len(bandit_rewards_buf)),
-        }
+        "metrics": {"num_trials": int(len(bandit_rewards_buf))}
     }
-
 
 # -------------------------
 # Ray worker

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import math
 import numpy as np
+import os
+os.environ["SDL_AUDIODRIVER"] = "dummy"
+os.environ["AUDIODEV"] = "null"
+
 import pygame
 from typing import Optional, List, Tuple
 
