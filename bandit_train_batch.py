@@ -51,6 +51,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     obs, info = env.reset()
     done = False
 
+    high_reward_choice_per_N = np.zeros(session_N, dtype=np.float32)
+    cum_rewards = 0.0
+
+
     # ---------- precompute constants ----------
     W, H = env.unwrapped.W, env.unwrapped.H
     sx = 2.0 / (W - 1)
@@ -168,6 +172,13 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             chosen_bandits_buf.append(trial_action_np)
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(trial_meta_start))
+            cum_rewards += float(reward)
+
+            if info.get("selected_high_reward_this_trial", False):
+                idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
+                high_reward_choice_per_N[idxN] += 1.0
+
+
 
             meta_trial_idx += 1
             ep_start_flag = 1.0
@@ -184,7 +195,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         "chosen_bandits_buf": chosen_bandits_buf,
         "bandit_rewards_buf": bandit_rewards_buf,
         "meta_ep_start_buf": meta_ep_start_buf,
-        "metrics": {"num_trials": int(len(bandit_rewards_buf))}
+        "metrics": {    "cum_rewards": float(cum_rewards),
+            "high_reward_choice_per_N": high_reward_choice_per_N,
+            "num_trials": int(len(bandit_rewards_buf)),
+        }
     }
 
 # -------------------------
