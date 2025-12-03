@@ -179,7 +179,6 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(trial_meta_start))
             # cum_high_reward_choice += float(reward)
-
             selected_high_reward = info.get("selected_high_reward_this_trial", -1)
             if selected_high_reward:
                 idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
@@ -236,6 +235,7 @@ class RolloutWorker:
             seed=seed + 1000 * worker_id,
             session_K=session_K,
             session_N=session_N,
+            randomize_sides=False
         )
 
         # Agent copy (CPU). Must match driver hyperparams.
