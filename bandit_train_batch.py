@@ -376,6 +376,7 @@ def main():
             meta_ep_start_batch.append(s_ep)
 
             cum_rewards += r["metrics"]["cum_rewards"]
+            cum_rewards /= args.episodes_per_update
             total_trials += r["metrics"]["num_trials"]
 
         # OPTIONAL safety: ensure all episodes same T (update2 assumes this)
