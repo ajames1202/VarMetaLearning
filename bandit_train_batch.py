@@ -180,7 +180,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             meta_ep_start_buf.append(float(trial_meta_start))
             # cum_high_reward_choice += float(reward)
 
-            selected_high_reward = info.get("selected_high_reward_this_trial", False)
+            selected_high_reward = info.get("selected_high_reward_this_trial", -1)
             if selected_high_reward:
                 idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
                 high_reward_choice_per_N[idxN] += 1.0
@@ -381,8 +381,9 @@ def main():
             meta_ep_start_batch.append(s_ep)
 
             cum_high_reward_choice += r["metrics"]["cum_high_reward_choice"]
-            cum_high_reward_choice /= args.episodes_per_update
             total_trials += r["metrics"]["num_trials"]
+
+        cum_high_reward_choice /= args.episodes_per_update
 
         # OPTIONAL safety: ensure all episodes same T (update2 assumes this)
         T0 = obs_bandit_batch[0].shape[0]
