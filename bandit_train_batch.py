@@ -58,7 +58,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     done = False
 
     high_reward_choice_per_N = np.zeros(session_N, dtype=np.float32)
-    cum_rewards = 0.0
+    cum_high_reward_choice = 0.0
 
 
     # ---------- precompute constants ----------
@@ -178,12 +178,13 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             chosen_bandits_buf.append(trial_action_np)
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(trial_meta_start))
-            cum_rewards += float(reward)
+            # cum_high_reward_choice += float(reward)
 
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
             if selected_high_reward:
                 idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
                 high_reward_choice_per_N[idxN] += 1.0
+                cum_high_reward_choice += 1
 
             reached_target = info.get("selected_target")
             curr_pair_index = info.get("pair_index_in_session", -1)
@@ -211,7 +212,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         "chosen_bandits_buf": chosen_bandits_buf,
         "bandit_rewards_buf": bandit_rewards_buf,
         "meta_ep_start_buf": meta_ep_start_buf,
-        "metrics": {    "cum_rewards": float(cum_rewards),
+        "metrics": {    "cum_high_reward_choice": float(cum_high_reward_choice),
             "high_reward_choice_per_N": high_reward_choice_per_N,
             "num_trials": int(len(bandit_rewards_buf)),
         }
@@ -353,7 +354,7 @@ def main():
         bandit_rewards_batch = []      # list of (T,)
         meta_ep_start_batch = []       # list of (T,)
 
-        cum_rewards = 0.0
+        cum_high_reward_choice = 0.0
         total_trials = 0
 
 
@@ -379,8 +380,8 @@ def main():
             bandit_rewards_batch.append(r_ep)
             meta_ep_start_batch.append(s_ep)
 
-            cum_rewards += r["metrics"]["cum_rewards"]
-            cum_rewards /= args.episodes_per_update
+            cum_high_reward_choice += r["metrics"]["cum_high_reward_choice"]
+            cum_high_reward_choice /= args.episodes_per_update
             total_trials += r["metrics"]["num_trials"]
 
         # OPTIONAL safety: ensure all episodes same T (update2 assumes this)
@@ -408,12 +409,12 @@ def main():
         # Logs
         writer.add_scalar("loss/variational", float(var_loss), upd)
         writer.add_scalar("loss/motor", float(motor_loss), upd)
-        writer.add_scalar("rollout/cum_rewards", float(cum_rewards), upd)
+        writer.add_scalar("rollout/cum_high_reward_choice", float(cum_high_reward_choice), upd)
         writer.add_scalar("rollout/total_trials", int(total_trials), upd)
 
         if upd % 10 == 0:
             print(f"[upd {upd:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
-                  f"cum_rewards={cum_rewards:.1f} trials={total_trials}")
+                  f"cum_high_reward_choice={cum_high_reward_choice:.1f} trials={total_trials}")
 
         # Checkpoint
         if (upd + 1) % args.save_every == 0:
