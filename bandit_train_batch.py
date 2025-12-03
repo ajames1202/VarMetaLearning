@@ -180,7 +180,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             meta_ep_start_buf.append(float(trial_meta_start))
             cum_rewards += float(reward)
 
-            if info.get("selected_high_reward_this_trial", False):
+            selected_high_reward = info.get("selected_high_reward_this_trial", False)
+            if selected_high_reward:
                 idxN = min(int(info.get("trial_index_in_pair", 0)), session_N - 1)
                 high_reward_choice_per_N[idxN] += 1.0
 
@@ -191,6 +192,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 f"pair_idx={curr_pair_index}, "
                 f"choice={int(trial_action.argmax(dim=-1).item())}, "
                 f"reached_target={reached_target}, "
+                f"selected_high_reward={selected_high_reward}, "
                 f"probs={probs} "
             )
 
