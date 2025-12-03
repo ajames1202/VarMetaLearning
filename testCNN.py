@@ -90,8 +90,6 @@ agent = BanditLearner(
     rnn_hidden_size=hidden,
     action_dim=action_dim,
 )
-checkpoint = torch.load("path/to/your_checkpoint.pt", map_location="cpu")
-agent.load_state_dict(checkpoint["model"])
 agent.eval()
 
 encoder_state = agent.state_dict()   # or agent.enc.state_dict() if you prefer
