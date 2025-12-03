@@ -12,7 +12,7 @@ class CNNEncoder(nn.Module):
     Pretrained CNN feature extractor -> projects to feature_dim.
     Expects NCHW images in [0,1] (like your current code).
     """
-    def __init__(self, feature_dim: int, train_backbone: bool = False, normalize: bool = True):
+    def __init__(self, feature_dim: int, train_backbone: bool = False, normalize: bool = False):
         super().__init__()
         self.normalize = normalize
 
@@ -113,7 +113,7 @@ class BanditLearner(nn.Module):
 
         self.debug_gru_inputs = {"rollout": [], "update": []}
 
-        self.enc = CNNEncoder(feature_dim, train_backbone=True)
+        self.enc = CNNEncoder(feature_dim, train_backbone=False)
         # self.enc = CNNEncoder(feature_dim)
 
         # --- Bandit RNN + heads replaced with Transformer
@@ -361,7 +361,8 @@ class BanditLearner(nn.Module):
                 (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
             ).mean()
 
-            variational_loss = -(var_logp_loss - 0.1 * var_kl_loss)
+            # variational_loss = -(var_logp_loss - 0.1 * var_kl_loss)
+            variational_loss = -var_logp_loss
 
             # -----------------------------
             # 4) MOTOR loss (unchanged, flat over all steps)
