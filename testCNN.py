@@ -1,73 +1,136 @@
+import ray
 import numpy as np
 import torch
+import visual_bandit_env2 as vbe
+from bandit_train_batch import extract_pair_view
+from var_bandit_learner2 import BanditLearner
+
 import torch.nn.functional as F
 from torch import nn
 
-import visual_bandit_env2 as vbe
 import var_bandit_learner2 as bl
-from bandit_train_batch import extract_pair_view
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- build env & agent (same hyperparams as training) ---
-env = vbe.TwoChoiceReachingEnv(
-    W=384,
-    H=400,
-    render_mode="rgb_array",
-    seed=0,
-    session_K=3,
-    session_N=12,
-    randomize_sides=False,
-)
 
+@ray.remote
+class FeatureWorker:
+    def __init__(self, encoder_state_dict, env_kwargs, feature_dim, device="cpu", seed=0):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        self.device = torch.device(device)
+
+        # build env
+        self.env = vbe.TwoChoiceReachingEnv(**env_kwargs)
+
+        # build agent but we only care about enc
+        input_size = feature_dim + 2 + 1 + 1   # same as training
+        hidden = 128
+        action_dim = 2
+
+        self.agent = BanditLearner(
+            input_size=input_size,
+            feature_dim=feature_dim,
+            rnn_hidden_size=hidden,
+            action_dim=action_dim,
+        ).to(self.device)
+        self.agent.load_state_dict(encoder_state_dict, strict=False)
+        self.agent.eval()
+
+    def collect(self, num_episodes):
+        X_list = []
+        y_list = []
+
+        for _ in range(num_episodes):
+            obs, info = self.env.reset()
+            done = False
+
+            while not done:
+                # --- same preprocessing as your rollout code ---
+                obs_tensor = torch.from_numpy(obs).permute(2, 0, 1).unsqueeze(0).float()
+                obs_tensor.mul_(1.0 / 255.0)
+                obs_tensor = obs_tensor.to(self.device)
+
+                pair_view = extract_pair_view(obs_tensor, self.env,
+                                              crop_size=112, pad=6)
+                feat = self.agent.encode(pair_view).squeeze(0).detach().cpu().numpy()
+
+                pair_idx = info.get("pair_index_in_session", -1)
+
+                X_list.append(feat)
+                y_list.append(pair_idx)
+
+                # policy can be random; for feature probing it doesn't matter
+                action = np.zeros(2, np.float32)
+                obs, reward, term, trunc, info = self.env.step(action)
+                done = bool(term) or bool(trunc)
+
+        X = np.stack(X_list).astype(np.float32)
+        y = np.array(y_list, dtype=np.int64)
+        return X, y
+
+
+import ray
+import torch
+import numpy as np
+from var_bandit_learner2 import BanditLearner
+
+ray.init()
+
+# --- load trained agent once on the driver ---
 feature_dim = 64
 input_size = feature_dim + 2 + 1 + 1
 hidden = 128
 action_dim = 2
 
-agent = bl.BanditLearner(
+agent = BanditLearner(
     input_size=input_size,
     feature_dim=feature_dim,
     rnn_hidden_size=hidden,
     action_dim=action_dim,
-).to(device)
-agent.eval()    # we only use encoder
+)
+checkpoint = torch.load("path/to/your_checkpoint.pt", map_location="cpu")
+agent.load_state_dict(checkpoint["model"])
+agent.eval()
 
-# optionally: load trained checkpoint
-# load_checkpoint("your_ckpt.pt", agent, map_location=device)
+encoder_state = agent.state_dict()   # or agent.enc.state_dict() if you prefer
 
-X = []
-y = []
+env_kwargs = dict(
+    W=384,
+    H=400,
+    render_mode="rgb_array",
+    seed=0,                # base seed, workers will offset this
+    session_K=3,
+    session_N=12,
+    randomize_sides=False,
+)
 
-num_episodes = 100   # enough to see the pattern
+num_workers = 8
+episodes_per_worker = 50
 
-for ep in range(num_episodes):
-    obs, info = env.reset()
-    done = False
+workers = [
+    FeatureWorker.remote(
+        encoder_state_dict=encoder_state,
+        env_kwargs=env_kwargs,
+        feature_dim=feature_dim,
+        device="cpu",
+        seed=1000 + i,
+    )
+    for i in range(num_workers)
+]
 
-    while not done:
-        # same preprocessing as in rollout
-        obs_tensor = torch.from_numpy(obs).to(device).permute(2, 0, 1).unsqueeze(0).float()
-        obs_tensor.mul_(1.0 / 255.0)
+futures = [w.collect.remote(episodes_per_worker) for w in workers]
+results = ray.get(futures)
 
-        pair_view = extract_pair_view(obs_tensor, env, crop_size=112, pad=6)  # (1,3,112,224)
-        feat = agent.encode(pair_view).squeeze(0).detach().cpu().numpy()      # (F,)
+X_parts = [r[0] for r in results]
+y_parts = [r[1] for r in results]
 
-        pair_idx = info.get("pair_index_in_session", -1)
-
-        X.append(feat)
-        y.append(pair_idx)
-
-        # take any action; here just stand still
-        action = np.zeros(2, np.float32)
-        obs, reward, term, trunc, info = env.step(action)
-        done = bool(term) or bool(trunc)
-
-X = torch.tensor(np.stack(X), dtype=torch.float32)
-y = torch.tensor(np.array(y), dtype=torch.long)
+X = np.concatenate(X_parts, axis=0)
+y = np.concatenate(y_parts, axis=0)
 
 num_pairs = int(y.max().item()) + 1
-print("Feature dataset:", X.shape, "num_pairs:", num_pairs)
+print("Feature dataset shape:", X.shape, "labels shape:", y.shape)
 
 
 perm = torch.randperm(len(X))
@@ -92,3 +155,31 @@ with torch.no_grad():
     test_acc  = (clf(X_test.to(device)).argmax(dim=1)  == y_test.to(device)).float().mean().item()
 
 print(f"train acc={train_acc:.3f}, test acc={test_acc:.3f}")
+
+
+# mean feature per pair
+mu = []
+for k in range(num_pairs):
+    mu_k = X[y == k].mean(dim=0)
+    mu.append(mu_k)
+mu = torch.stack(mu)   # (num_pairs, F)
+
+# within-pair variance
+within = 0.0
+count = 0
+for k in range(num_pairs):
+    diffs = X[y == k] - mu[k]
+    within += (diffs.norm(dim=1) ** 2).sum()
+    count  += diffs.size(0)
+within = (within / count).sqrt().item()
+
+# between-pair distances
+M = mu.size(0)
+between = []
+for i in range(M):
+    for j in range(i+1, M):
+        between.append((mu[i] - mu[j]).norm().item())
+between = float(np.mean(between))
+
+print(f"within={within:.3f}, between={between:.3f}")
+
