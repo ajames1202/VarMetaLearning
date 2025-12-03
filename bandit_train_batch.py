@@ -14,6 +14,40 @@ import ray
 import visual_bandit_env2 as vbe
 import var_bandit_learner2 as bl
 
+def extract_pair_view(obs_tensor, env, crop_size=112, pad=6, mask_cursor=False):
+    """
+    obs_tensor: (1,3,H,W) in [0,1]
+    returns: (1,3,crop_size, 2*crop_size) = [left_crop | right_crop]
+    """
+    lr = env.unwrapped.left_rect
+    rr = env.unwrapped.right_rect
+    _, _, H, W = obs_tensor.shape
+
+    # Shared vertical crop to keep left/right same height
+    y1 = max(min(lr.top, rr.top) - pad, 0)
+    y2 = min(max(lr.bottom, rr.bottom) + pad, H)
+
+    def crop_resize(rect):
+        x1 = max(rect.left - pad, 0)
+        x2 = min(rect.right + pad, W)
+        patch = obs_tensor[:, :, y1:y2, x1:x2]  # (1,3,h,w)
+        patch = F.interpolate(patch, size=(crop_size, crop_size),
+                              mode="bilinear", align_corners=False)
+        return patch
+
+    left  = crop_resize(lr)
+    right = crop_resize(rr)
+
+    pair = torch.cat([left, right], dim=-1)  # width concat
+
+    if mask_cursor:
+        cx, cy = env.unwrapped.cursor
+        cx, cy = int(cx), int(cy)
+        # cursor mask in ORIGINAL coords → skip (cursor is usually outside crops at trial start),
+        # but you can instead mask inside 'pair' if you know it can overlap the stimuli.
+        pass
+
+    return pair
 
 # -------------------------
 # Utilities
@@ -108,8 +142,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             obs_tensor = torch.from_numpy(obs).to(device).permute(2, 0, 1).unsqueeze(0).float()
             obs_tensor.mul_(1.0 / 255.0)
 
-            small = agent.downsample(obs_tensor)     # (1,C,h,w)
-            f1 = agent.encode(small)                 # (1,F)
+            # small = agent.downsample(obs_tensor)     # (1,C,h,w)
+            pair_view = extract_pair_view(obs_tensor, env, crop_size=112, pad=6)  # (1,3,112,224)
+            f1 = agent.encode(pair_view)                 # (1,F)
 
             q_out, _, history = agent.rnn_fwd(f1, zero_act, zero_r, meta_ep_start_torch, history=history)
             reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)
