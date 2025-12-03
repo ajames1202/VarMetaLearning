@@ -164,9 +164,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             trial_action = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
 
             # cache for trial end + motor loop
-            trial_feat = f1
             trial_action_np = trial_action.squeeze(0).cpu().numpy()  # one time per trial
-            trial_small_np = small.squeeze(0).cpu().numpy()          # one time per trial
+            trial_feat_np = f1.squeeze(0).cpu().numpy()          # one time per trial
 
         # -----------------------
         # MOTOR step
@@ -209,7 +208,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
             _, _, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)
 
-            obs_bandit.append(trial_small_np)
+            obs_bandit.append(trial_feat_np)
             chosen_bandits_buf.append(trial_action_np)
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(trial_meta_start))
