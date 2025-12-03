@@ -71,6 +71,22 @@ def gaussian_log_prob_with_tanh_correction(actions, mean, log_std, pretahn_actio
     return log_prob - corr  # (B,)
 
 
+def atanh(x):
+    return 0.5 * torch.log((1 + x) / (1 - x))
+
+def log_prob_tanh_gaussian(mu, log_std, pretahn_actions):
+    # u = atanh(torch.clamp(actions, -1 + 1e-6, 1 - 1e-6))
+    std = torch.exp(log_std)
+    z = (pretahn_actions - mu) / (std + 1e-6)
+
+    log_prob = -0.5 * (z.pow(2) + 2 * log_std + math.log(2 * math.pi))
+    log_prob = log_prob.sum(dim=-1)  # sum over action dimensions
+
+    corr = torch.log(1 - torch.tanh(pretahn_actions).pow(2) + 1e-6).sum(dim=-1)  # correction term
+    # print("log_prob.shape:", log_prob.shape, "corr.shape:", corr.shape, "pretanh_actions.shape:", pretahn_actions.shape)
+    return log_prob - corr  # (B,)
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -344,28 +360,41 @@ class BanditLearner(nn.Module):
             variational_loss = -(var_logp_loss - 0.1 * var_kl_loss)
 
             # -----------------------------
-            # 4) MOTOR loss (unchanged)
+            # 4) MOTOR loss (unchanged, flat over all steps)
             # -----------------------------
-            mini_batch_size = 16384
+            mini_batch_size = 16384  # Tune based on your GPU; smaller = less mem, but slower
             total_steps = len(xy_pos_buf)
-            motor_loss_sum += 0.0  # keep for averaging
+            motor_loss_sum += 0.0  # Already in your code; keep for averaging
 
             for start in range(0, total_steps, mini_batch_size):
                 end = min(start + mini_batch_size, total_steps)
-
+                
+                # Slice tensors
                 xy_slice = xy_pos[start:end]
                 goal_slice = goal_vec[start:end]
-                choice_slice = chosen_bandits_motor[start:end]
-
-                mu, log_std = self.motor_fwd(choice_slice, xy_pos=xy_slice, goal_vec=goal_slice)
-                std = torch.exp(log_std)
-                pretanh = mu + std * torch.randn_like(std)
-                act = torch.tanh(pretanh)
-
-                # Dummy motor loss term (you likely have your own; leaving original structure)
-                motor_loss = (act.pow(2).mean()) * 0.0
-
-                motor_loss.backward(retain_graph=True)
+                chosen_slice = chosen_bandits_motor[start:end]
+                
+                # Forward on slice
+                mu, log_std = self.motor_fwd(
+                    chosen_slice,  # no credit to choice through motor
+                    xy_slice,
+                    goal_slice
+                )
+                
+                # Target computation (same as before, but on slice)
+                dist = goal_slice.norm(dim=-1, keepdim=True) + 1e-6
+                g_hat = goal_slice / dist
+                speed = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
+                target = (g_hat * speed).clamp(-0.999, 0.999)
+                u_target = atanh(target)
+                
+                L_reach = F.mse_loss(mu, u_target)
+                motor_loss_mini = L_reach
+                
+                # Backward on mini-loss (grads accumulate)
+                motor_loss_mini.backward()
+                
+                motor_loss_sum += motor_loss_mini.item() * ((end - start) / total_steps)  # Weighted avg for logging
 
             variational_loss.backward()
 
