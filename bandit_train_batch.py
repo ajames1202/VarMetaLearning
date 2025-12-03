@@ -145,6 +145,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             # small = agent.downsample(obs_tensor)     # (1,C,h,w)
             pair_view = extract_pair_view(obs_tensor, env, crop_size=112, pad=6)  # (1,3,112,224)
             f1 = agent.encode(pair_view)                 # (1,F)
+            trial_feat = f1
 
             q_out, _, history = agent.rnn_fwd(f1, zero_act, zero_r, meta_ep_start_torch, history=history)
             reward_logits = agent.reward_compute(q_out.unsqueeze(0), f1).squeeze(0)
@@ -404,7 +405,7 @@ def main():
             if T == 0:
                 continue
 
-            obs_ep = np.stack(r["obs_bandit"], axis=0)                 # (T,C,H,W)
+            obs_ep = np.stack(r["obs_bandit"], axis=0)                 # (T,F)
             a_ep   = np.stack(r["chosen_bandits_buf"], axis=0)         # (T,2)
             r_ep   = np.asarray(r["bandit_rewards_buf"], dtype=np.float32)  # (T,)
             s_ep   = np.asarray(r["meta_ep_start_buf"], dtype=np.float32)   # (T,)

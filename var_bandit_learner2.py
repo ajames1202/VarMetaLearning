@@ -279,17 +279,21 @@ class BanditLearner(nn.Module):
         rewards_bandits = torch.as_tensor(np.stack(bandit_rewards_buf), device=device, dtype=torch.float32)
         meta_ep_start = torch.as_tensor(np.stack(meta_ep_start_buf), device=device, dtype=torch.float32)
 
-        B, T = bandit_obs.shape[:2]
-        C, H, W = bandit_obs.shape[2:]
+        # bandit_obs is already features: (B, T, F)
+        B, T, Fdim = bandit_obs.shape
+
+        # C, H, W = bandit_obs.shape[2:]
 
         # Reorder to time-major (T, B, ...)
-        bandit_obs     = bandit_obs.permute(1, 0, 2, 3, 4)         # (T, B, C, H, W)
+        bandit_obs = bandit_obs.permute(1, 0, 2)         # (T, B, F)
+        feats_bandit = bandit_obs
         chosen_bandits = chosen_bandits.permute(1, 0, 2)           # (T, B, 2)
         rewards_bandits = rewards_bandits.permute(1, 0)            # (T, B)
         meta_ep_start   = meta_ep_start.permute(1, 0)              # (T, B)
 
         # Encode CNN features: flatten (T, B) -> (T*B, C, H, W)
-        bandit_obs_flat = bandit_obs.reshape(T * B, C, H, W)       # (T*B, C, H, W)
+        # bandit_obs_flat = bandit_obs.reshape(T * B, C, H, W)       # (T*B, C, H, W)
+                                 # (T, B, F)
 
         rewards_rnn = rewards_bandits.unsqueeze(-1)    # (T, B, 1)
         start_rnn   = meta_ep_start.unsqueeze(-1)      # (T, B, 1)
@@ -307,8 +311,8 @@ class BanditLearner(nn.Module):
             # -----------------------------
             # 3) BANDIT loss (Query token attention)
             # -----------------------------
-            feats_flat = self.encode(bandit_obs_flat)         # (T*B, F)
-            feats_bandit = feats_flat.view(T, B, -1)          # (T, B, F)
+            # feats_flat = self.encode(bandit_obs_flat)         # (T*B, F)
+            # feats_bandit = feats_flat.view(T, B, -1)          # (T, B, F)
 
             # Build interleaved [Q0,M0,Q1,M1,...] tokens so the query token attends to past,
             # but cannot see the current trial's (action,reward) memory token (causal mask).
