@@ -68,8 +68,6 @@ class FeatureWorker:
                     img = (img * 255).clamp(0, 255).byte()
                     img = img.permute(1, 2, 0).numpy()
 
-                    pair_idx = info.get("pair_index_in_session", -1)
-                    trial_idx = info.get("trial_index", -1)
                     filename = save_dir / f"ep0_step{int(trial_idx):02d}_pair{int(pair_idx):02d}.png"
                     print(f"Trial={trial_idx}, Pair_idx={pair_idx}")
                     Image.fromarray(img).save(filename)
@@ -83,6 +81,9 @@ class FeatureWorker:
 
                 action = np.zeros(2, np.float32)
                 obs, reward, term, trunc, info = self.env.step(action)
+                pair_idx = info.get("pair_index_in_session", -1)
+                trial_idx = info.get("trial_index", -1)
+
                 if info.get("trial_ended", False):
                     print(f"Trial{trial_idx} ended.")
                     ep_start_flag = 1.0
