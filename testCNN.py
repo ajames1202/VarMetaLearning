@@ -51,6 +51,9 @@ class FeatureWorker:
 
         for _ in range(num_episodes):
             obs, info = self.env.reset()
+            pair_idx = info.get("pair_index_in_session", -1)
+            trial_idx = info.get("trial_index", -1)
+
             done = False
             ep_start_flag = 1.0
 
