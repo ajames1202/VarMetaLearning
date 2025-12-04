@@ -270,7 +270,7 @@ class RolloutWorker:
             seed=seed + 1000 * worker_id,
             session_K=session_K,
             session_N=session_N,
-            randomize_sides=False
+            randomize_sides=True
         )
 
         # Agent copy (CPU). Must match driver hyperparams.

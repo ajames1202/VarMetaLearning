@@ -84,7 +84,6 @@ class FeatureWorker:
 
                 action = np.zeros(2, np.float32)
                 obs, reward, term, trunc, info = self.env.step(action)
-                pair_idx = info.get("pair_index_in_session", -1)
                 trial_idx = info.get("trial_index", -1)
 
                 if info.get("trial_ended", False):
