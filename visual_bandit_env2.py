@@ -276,7 +276,7 @@ class TwoChoiceReachingEnv(gym.Env):
 
         # Pick which pair this trial uses
         self.curr_pair_idx = int(self.episode_pair_schedule[self.trial_index])
-        print("Current pair index:", self.curr_pair_idx, ", self.pair_probs=", self.pair_probs)
+        # print("Current pair index:", self.curr_pair_idx, ", self.pair_probs=", self.pair_probs)
 
         # Determine probabilities for this pair
         if self.pair_probs is None:
@@ -450,7 +450,7 @@ class TwoChoiceReachingEnv(gym.Env):
         terminated = False
         if trial_ended:
             old_pair_idx = self.curr_pair_idx
-            print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
+            # print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
 
             # --- NEW: update per-session aggregates once per trial ---
             self.session_reward_sum += float(reward)
