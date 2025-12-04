@@ -275,7 +275,7 @@ class RolloutWorker:
             randomize_sides=True
         )
 
-        feature_dim = 176
+        feature_dim = 192
         input_size = feature_dim + 2 + 1 + 1
         hidden = 128
         action_dim = 2
@@ -318,7 +318,7 @@ def main():
     parser.add_argument("--session-N", type=int, default=12)
 
     # model params (keep consistent with worker)
-    parser.add_argument("--feature-dim", type=int, default=176)
+    parser.add_argument("--feature-dim", type=int, default=192)
     parser.add_argument("--hidden", type=int, default=128)
 
     args = parser.parse_args()
