@@ -276,7 +276,7 @@ class TwoChoiceReachingEnv(gym.Env):
 
         # Pick which pair this trial uses
         self.curr_pair_idx = int(self.episode_pair_schedule[self.trial_index])
-        # print("Current pair index:", self.curr_pair_idx)
+        print("Current pair index:", self.curr_pair_idx, ", self.pair_probs=", self.pair_probs)
 
         # Determine probabilities for this pair
         if self.pair_probs is None:
@@ -444,10 +444,14 @@ class TwoChoiceReachingEnv(gym.Env):
             timeout = True
 
         # If the trial ended, advance schedule or end episode
-        # pair_index_in_session = self.curr_pair_idx
+        prev_pair_idx = int(self.curr_pair_idx)
+        prev_trial_idx = int(self.trial_index)
+
         terminated = False
         if trial_ended:
             old_pair_idx = self.curr_pair_idx
+            print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
+
             # --- NEW: update per-session aggregates once per trial ---
             self.session_reward_sum += float(reward)
             if timeout:
@@ -465,14 +469,16 @@ class TwoChoiceReachingEnv(gym.Env):
         dxy = self.cursor - self.prev_cursor
         self.prev_cursor = self.cursor.copy()
 
-        pair_index_in_session = self.curr_pair_idx
+        curr_pair_idx = int(self.curr_pair_idx)
 
         info = {
             "reached_target": reached,
             "hit_boundary": bool(hit_boundary),   # <--- NEW, for debugging/analysis
             "total_trials_in_session": len(self.episode_pair_schedule),
             "trial_index": self.trial_index,
-            "pair_index_in_session": pair_index_in_session,
+            "pair_index_in_session": curr_pair_idx,               # current pair (for returned frame)
+            "prev_trial_index": prev_trial_idx,                   # previous (the one that just ended)
+            "prev_pair_index_in_session": prev_pair_idx,          # previous (the one that just ended)
             "trial_ended": trial_ended,
             "timeout": timeout,
             "selected_target" : chose_side,

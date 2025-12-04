@@ -221,12 +221,14 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 cum_high_reward_choice += 1
 
             reached_target = info.get("selected_target")
-            curr_pair_index = info.get("pair_index_in_session", -1)
+            curr_pair_index = info.get("prev_pair_index_in_session", -1)
+            flipped = info.get("side_is_flipped", -1)
             log(
                 f"[W{worker_id}] trial={meta_trial_idx} reward={reward}, "
                 f"pair_idx={curr_pair_index}, "
                 f"choice={int(trial_action.argmax(dim=-1).item())}, "
                 f"reached_target={reached_target}, "
+                f"flipped={flipped}"
                 f"selected_high_reward={selected_high_reward}, "
                 f"probs={probs} "
             )
@@ -273,8 +275,7 @@ class RolloutWorker:
             randomize_sides=True
         )
 
-        # Agent copy (CPU). Must match driver hyperparams.
-        feature_dim = 64
+        feature_dim = 128
         input_size = feature_dim + 2 + 1 + 1
         hidden = 128
         action_dim = 2
