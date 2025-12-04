@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from torch import nn
 
 import var_bandit_learner2 as bl
+from pathlib import Path
+from PIL import Image
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,7 +41,7 @@ class FeatureWorker:
         self.agent.load_state_dict(encoder_state_dict, strict=False)
         self.agent.eval()
 
-    def collect(self, num_episodes):
+    def collect(self, num_episodes, save_pair_views=False, save_dir="pair_views"):
         X_list = []
         y_list = []
 
@@ -49,11 +52,25 @@ class FeatureWorker:
             while not done:
                 # --- same preprocessing as your rollout code ---
                 obs_tensor = torch.from_numpy(obs).permute(2, 0, 1).unsqueeze(0).float()
-                obs_tensor.mul_(1.0 / 255.0)
+                # obs_tensor.mul_(1.0 / 255.0)
                 obs_tensor = obs_tensor.to(self.device)
 
                 pair_view = extract_pair_view(obs_tensor, self.env,
                                               crop_size=112, pad=6)
+                pair_view.mul_(1.0/ 255.0)
+
+                # ====== SAVE IMAGE(S) HERE ======
+                if save_pair_views:  # "one iteration" = first episode, 12 frames
+                    # pair_view: (1, C, H, W)
+                    img = pair_view[0].detach().cpu()            # (C, H, W)
+                    img = (img * 255).clamp(0, 255).byte()       # back to [0,255]
+                    img = img.permute(1, 2, 0).numpy()           # (H, W, C)
+
+                    pair_idx = info.get("pair_index_in_session", -1)
+                    filename = save_dir / f"ep0_step{t:02d}_pair{pair_idx:02d}.png"
+                    Image.fromarray(img.numpy() if hasattr(img, 'numpy') else img).save(filename)
+                # =================================
+
                 feat = self.agent.encode(pair_view).squeeze(0).detach().cpu().numpy()
 
                 pair_idx = info.get("pair_index_in_session", -1)
@@ -105,7 +122,7 @@ env_kwargs = dict(
 )
 
 num_workers = 8
-episodes_per_worker = 50
+episodes_per_worker = 10
 
 workers = [
     FeatureWorker.remote(
@@ -118,8 +135,13 @@ workers = [
     for i in range(num_workers)
 ]
 
-futures = [w.collect.remote(episodes_per_worker) for w in workers]
-results = ray.get(futures)
+# futures = [w.collect.remote(episodes_per_worker, save_pair_views =  ) for w in workers]
+rollout_futures = []
+for w in workers:
+    save_pair_views = True if w == 0 else False
+    rollout_futures.append(w.collect.remote(episodes_per_worker, save_pair_views = save_pair_views , save_dir="pair_views"))
+
+results = ray.get(rollout_futures)
 
 X_parts = [r[0] for r in results]
 y_parts = [r[1] for r in results]
