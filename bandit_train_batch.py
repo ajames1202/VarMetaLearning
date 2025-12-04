@@ -73,6 +73,55 @@ def load_checkpoint(path: str, agent: torch.nn.Module, optim_bandit=None, optim_
     return ckpt.get("extra", {})
 
 
+def run_pair_idx_probe(obs_bandit_batch, pair_idx_batch, device="cuda",
+                       steps=400, lr=2e-2, wd=1e-4, test_frac=0.2, batch=2048):
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    X = torch.as_tensor(np.concatenate(obs_bandit_batch, axis=0), device=device, dtype=torch.float32)  # (N,F)
+    y = torch.as_tensor(np.concatenate(pair_idx_batch, axis=0), device=device, dtype=torch.long)      # (N,)
+
+    # drop unknown labels if any
+    m = y >= 0
+    X, y = X[m], y[m]
+    if X.numel() == 0:
+        print("[pair_idx probe] no data")
+        return None
+
+    K = int(y.max().item()) + 1
+    N = X.size(0)
+
+    # split
+    perm = torch.randperm(N, device=device)
+    n_test = max(1, int(N * test_frac))
+    te = perm[:n_test]
+    tr = perm[n_test:]
+
+    # standardize for stability
+    mean = X[tr].mean(0, keepdim=True)
+    std  = X[tr].std(0, keepdim=True).clamp_min(1e-6)
+    Xs = (X - mean) / std
+
+    probe = nn.Linear(Xs.size(1), K).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=wd)
+    loss_fn = nn.CrossEntropyLoss()
+
+    for _ in range(steps):
+        idx = tr[torch.randint(0, tr.numel(), (min(batch, tr.numel()),), device=device)]
+        loss = loss_fn(probe(Xs[idx]), y[idx])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        acc_tr = (probe(Xs[tr]).argmax(-1) == y[tr]).float().mean().item()
+        acc_te = (probe(Xs[te]).argmax(-1) == y[te]).float().mean().item()
+
+    print(f"[pair_idx probe] K={K} N={N} train_acc={acc_tr:.3f} test_acc={acc_te:.3f} chance={1.0/K:.3f}")
+    return acc_te
+
+
 # -------------------------
 # Rollout with Query + Memory tokens
 # -------------------------
@@ -118,6 +167,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     # Buffers
     xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf = [], [], []
     obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf = [], [], [], []
+    pair_idx_buf = []
+
 
     meta_trial_idx = 0
     ep_start_flag = 1.0
@@ -222,6 +273,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
             reached_target = info.get("selected_target")
             curr_pair_index = info.get("prev_pair_index_in_session", -1)
+            pair_idx_buf.append(int(curr_pair_index))
             flipped = info.get("side_is_flipped", -1)
             log(
                 f"[W{worker_id}] trial={meta_trial_idx} reward={reward}, "
@@ -248,6 +300,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         "chosen_bandits_buf": chosen_bandits_buf,
         "bandit_rewards_buf": bandit_rewards_buf,
         "meta_ep_start_buf": meta_ep_start_buf,
+        "pair_idx_buf": pair_idx_buf,
         "metrics": {    "cum_high_reward_choice": float(cum_high_reward_choice),
             "high_reward_choice_per_N": high_reward_choice_per_N,
             "num_trials": int(len(bandit_rewards_buf)),
@@ -389,6 +442,8 @@ def main():
         chosen_bandits_batch = []      # list of (T,2)
         bandit_rewards_batch = []      # list of (T,)
         meta_ep_start_batch = []       # list of (T,)
+        pair_idx_batch = []   # list of (T,)
+
 
         cum_high_reward_choice = 0.0
         total_trials = 0
@@ -410,11 +465,17 @@ def main():
             a_ep   = np.stack(r["chosen_bandits_buf"], axis=0)         # (T,2)
             r_ep   = np.asarray(r["bandit_rewards_buf"], dtype=np.float32)  # (T,)
             s_ep   = np.asarray(r["meta_ep_start_buf"], dtype=np.float32)   # (T,)
+            p_ep = np.asarray(r["pair_idx_buf"], dtype=np.int64)   # (T,)
 
             obs_bandit_batch.append(obs_ep)
             chosen_bandits_batch.append(a_ep)
             bandit_rewards_batch.append(r_ep)
             meta_ep_start_batch.append(s_ep)
+            pair_idx_batch.append(p_ep)
+
+            
+
+
 
             cum_high_reward_choice += r["metrics"]["cum_high_reward_choice"]
             total_trials += r["metrics"]["num_trials"]
@@ -452,6 +513,10 @@ def main():
         if upd % 10 == 0:
             print(f"[upd {upd:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"cum_high_reward_choice={cum_high_reward_choice:.1f} trials={total_trials}")
+
+        if upd == 10:
+            run_pair_idx_probe(obs_bandit_batch, pair_idx_batch, device=train_device)
+
 
         # Checkpoint
         if (upd + 1) % args.save_every == 0:
