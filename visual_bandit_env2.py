@@ -444,9 +444,10 @@ class TwoChoiceReachingEnv(gym.Env):
             timeout = True
 
         # If the trial ended, advance schedule or end episode
-        pair_index_in_session = self.curr_pair_idx
+        # pair_index_in_session = self.curr_pair_idx
         terminated = False
         if trial_ended:
+            old_pair_idx = self.curr_pair_idx
             # --- NEW: update per-session aggregates once per trial ---
             self.session_reward_sum += float(reward)
             if timeout:
@@ -464,6 +465,7 @@ class TwoChoiceReachingEnv(gym.Env):
         dxy = self.cursor - self.prev_cursor
         self.prev_cursor = self.cursor.copy()
 
+        pair_index_in_session = self.curr_pair_idx
 
         info = {
             "reached_target": reached,

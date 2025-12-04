@@ -42,34 +42,37 @@ class FeatureWorker:
         self.agent.eval()
 
     def collect(self, num_episodes, save_pair_views=False, save_dir="pair_views"):
+        save_dir = Path(save_dir)
+        if save_pair_views:
+            save_dir.mkdir(parents=True, exist_ok=True)
+
         X_list = []
         y_list = []
 
         for _ in range(num_episodes):
             obs, info = self.env.reset()
             done = False
+            ep_start_flag = 1.0
 
             while not done:
-                # --- same preprocessing as your rollout code ---
                 obs_tensor = torch.from_numpy(obs).permute(2, 0, 1).unsqueeze(0).float()
-                # obs_tensor.mul_(1.0 / 255.0)
                 obs_tensor = obs_tensor.to(self.device)
 
                 pair_view = extract_pair_view(obs_tensor, self.env,
-                                              crop_size=112, pad=6)
-                pair_view.mul_(1.0/ 255.0)
+                                            crop_size=112, pad=6)
+                pair_view.mul_(1.0 / 255.0)
 
-                # ====== SAVE IMAGE(S) HERE ======
-                if save_pair_views:  # "one iteration" = first episode, 12 frames
+                if save_pair_views and ep_start_flag == 1.0:
                     # pair_view: (1, C, H, W)
-                    img = pair_view[0].detach().cpu()            # (C, H, W)
-                    img = (img * 255).clamp(0, 255).byte()       # back to [0,255]
-                    img = img.permute(1, 2, 0).numpy()           # (H, W, C)
+                    img = pair_view[0].detach().cpu()
+                    img = (img * 255).clamp(0, 255).byte()
+                    img = img.permute(1, 2, 0).numpy()
 
                     pair_idx = info.get("pair_index_in_session", -1)
-                    filename = save_dir / f"ep0_step{t:02d}_pair{pair_idx:02d}.png"
-                    Image.fromarray(img.numpy() if hasattr(img, 'numpy') else img).save(filename)
-                # =================================
+                    trial_idx = info.get("trial_index", -1)
+                    filename = save_dir / f"ep0_step{int(trial_idx):02d}_pair{int(pair_idx):02d}.png"
+                    print(f"Trial={trial_idx}, Pair_idx={pair_idx}")
+                    Image.fromarray(img).save(filename)
 
                 feat = self.agent.encode(pair_view).squeeze(0).detach().cpu().numpy()
 
@@ -78,14 +81,19 @@ class FeatureWorker:
                 X_list.append(feat)
                 y_list.append(pair_idx)
 
-                # policy can be random; for feature probing it doesn't matter
                 action = np.zeros(2, np.float32)
                 obs, reward, term, trunc, info = self.env.step(action)
-                done = bool(term) or bool(trunc)
+                if info.get("trial_ended", False):
+                    print(f"Trial{trial_idx} ended.")
+                    ep_start_flag = 1.0
+                else:
+                    ep_start_flag = 0.0    
+                done = bool(term)
 
         X = np.stack(X_list).astype(np.float32)
         y = np.array(y_list, dtype=np.int64)
         return X, y
+
 
 
 import ray
@@ -137,9 +145,17 @@ workers = [
 
 # futures = [w.collect.remote(episodes_per_worker, save_pair_views =  ) for w in workers]
 rollout_futures = []
-for w in workers:
-    save_pair_views = True if w == 0 else False
-    rollout_futures.append(w.collect.remote(episodes_per_worker, save_pair_views = save_pair_views , save_dir="pair_views"))
+for i, w in enumerate(workers):
+    save_pair_views = (i == 0)
+    rollout_futures.append(
+        w.collect.remote(
+            episodes_per_worker,
+            save_pair_views=save_pair_views,
+            save_dir="pair_views"
+        )
+    )
+
+
 
 results = ray.get(rollout_futures)
 
@@ -160,6 +176,12 @@ train_idx, test_idx = perm[:train_n], perm[train_n:]
 X_train, y_train = X[train_idx], y[train_idx]
 X_test,  y_test  = X[test_idx],  y[test_idx]
 
+X_train = torch.from_numpy(X_train).float().to(device)
+y_train = torch.from_numpy(y_train).long().to(device)
+X_test  = torch.from_numpy(X_test).float().to(device)
+y_test  = torch.from_numpy(y_test).long().to(device)
+
+
 clf = nn.Linear(feature_dim, num_pairs).to(device)
 opt = torch.optim.Adam(clf.parameters(), lr=1e-3)
 
@@ -178,6 +200,9 @@ print(f"train acc={train_acc:.3f}, test acc={test_acc:.3f}")
 
 
 # mean feature per pair
+X = torch.from_numpy(X).float().to(device)
+y = torch.from_numpy(y).long().to(device)
+
 mu = []
 for k in range(num_pairs):
     mu_k = X[y == k].mean(dim=0)
