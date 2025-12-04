@@ -102,12 +102,8 @@ class PositionalEncoding(nn.Module):
 
 
 class ShuffleNetEncoder(nn.Module):
-    def __init__(self, pretrained=True, train_backbone=False):
+    def __init__(self, pretrained=True):
         super().__init__()
-
-        if not train_backbone:
-            for p in self.encoder.parameters():
-                p.requires_grad = False
 
         weights = ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = shufflenet_v2_x0_5(weights=weights)
