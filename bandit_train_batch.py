@@ -318,7 +318,7 @@ def main():
     parser.add_argument("--session-N", type=int, default=12)
 
     # model params (keep consistent with worker)
-    parser.add_argument("--feature-dim", type=int, default=64)
+    parser.add_argument("--feature-dim", type=int, default=176)
     parser.add_argument("--hidden", type=int, default=128)
 
     args = parser.parse_args()
