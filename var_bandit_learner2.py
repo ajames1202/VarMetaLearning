@@ -102,8 +102,12 @@ class PositionalEncoding(nn.Module):
 
 
 class ShuffleNetEncoder(nn.Module):
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, train_backbone=False):
         super().__init__()
+
+        if not train_backbone:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
 
         weights = ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = shufflenet_v2_x0_5(weights=weights)
@@ -116,13 +120,18 @@ class ShuffleNetEncoder(nn.Module):
             backbone.stage4
         )
 
-        self.out_dim = 176  # final feature size
+        self.out_dim = 192  # final feature size
         self.pool = nn.AdaptiveAvgPool2d(1)
 
+        # ImageNet normalization
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
     def forward(self, x):
+        x = (x - self.mean) / (self.std + 1e-8)
         x = self.encoder(x)
         x = self.pool(x)
-        return x.flatten(1)   # (B,176)
+        return x.flatten(1)  # (B,192)
 
 
 

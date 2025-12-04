@@ -228,7 +228,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 f"pair_idx={curr_pair_index}, "
                 f"choice={int(trial_action.argmax(dim=-1).item())}, "
                 f"reached_target={reached_target}, "
-                f"flipped={flipped}"
+                f"flipped={flipped}, "
                 f"selected_high_reward={selected_high_reward}, "
                 f"probs={probs} "
             )
