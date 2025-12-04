@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torchvision.models import resnet18, ResNet18_Weights
 import torch.nn.functional as F
-
+from torchvision.models import shufflenet_v2_x0_5, ShuffleNet_V2_X0_5_Weights
 import math
 
 class CNNEncoder(nn.Module):
@@ -100,46 +100,30 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:x.size(0)]
 
-class MoCoResNetEncoder128(nn.Module):
-    """
-    Pretrained MoCo v2 ResNet50 encoder that natively outputs 128-D features.
-    No extra projection layer in this module: the 128-D projection head
-    is part of the pretrained MoCo model.
-    Expects NCHW images in [0,1].
-    """
-    def __init__(self, feature_dim: int = 128,
-                 train_backbone: bool = False,
-                 normalize: bool = True):
+
+class ShuffleNetEncoder(nn.Module):
+    def __init__(self, pretrained=True):
         super().__init__()
-        assert feature_dim == 128, (
-            f"MoCoResNetEncoder128 outputs 128-D features; got feature_dim={feature_dim}"
+
+        weights = ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1 if pretrained else None
+        backbone = shufflenet_v2_x0_5(weights=weights)
+
+        self.encoder = nn.Sequential(
+            backbone.conv1,
+            backbone.maxpool,
+            backbone.stage2,
+            backbone.stage3,
+            backbone.stage4
         )
 
-        self.normalize = normalize
+        self.out_dim = 176  # final feature size
+        self.pool = nn.AdaptiveAvgPool2d(1)
 
-        # Load MoCo v2 from torch.hub
-        # Requires: `pip install git+https://github.com/facebookresearch/moco.git`
-        # and internet access the first time for torch.hub.
-        moco = torch.hub.load('facebookresearch/moco', 'moco_v2', pretrained=True)
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.pool(x)
+        return x.flatten(1)   # (B,176)
 
-        # In MoCo v2, encoder_q is a ResNet50 + 2-layer MLP projector whose final
-        # layer outputs 128-D embeddings. Calling encoder_q(x) -> (B, 128).
-        self.backbone = moco.encoder_q
-
-        if not train_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-
-        # ImageNet-style normalization
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,3,H,W) in [0,1]
-        if self.normalize:
-            x = (x - self.mean) / (self.std + 1e-8)
-        feat = self.backbone(x)  # (B, 128) directly from MoCo projection head
-        return feat
 
 
 class BanditLearner(nn.Module):
@@ -155,7 +139,7 @@ class BanditLearner(nn.Module):
         self.debug_gru_inputs = {"rollout": [], "update": []}
 
         # self.enc = CNNEncoder(feature_dim, train_backbone=False)
-        self.enc = MoCoResNetEncoder128(feature_dim, train_backbone=False)
+        self.enc = ShuffleNetEncoder(pretrained=True)
 
         # self.enc = CNNEncoder(feature_dim)
 

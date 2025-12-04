@@ -275,7 +275,7 @@ class RolloutWorker:
             randomize_sides=True
         )
 
-        feature_dim = 128
+        feature_dim = 176
         input_size = feature_dim + 2 + 1 + 1
         hidden = 128
         action_dim = 2
