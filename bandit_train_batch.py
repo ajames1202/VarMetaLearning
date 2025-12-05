@@ -520,12 +520,12 @@ def main():
 
         cum_high_reward_choice /= args.episodes_per_update
 
-        # OPTIONAL safety: ensure all episodes same T (update2 assumes this)
-        T0 = obs_bandit_batch[0].shape[0]
-        obs_bandit_batch = [x for x in obs_bandit_batch if x.shape[0] == T0]
-        chosen_bandits_batch = chosen_bandits_batch[:len(obs_bandit_batch)]
-        bandit_rewards_batch = bandit_rewards_batch[:len(obs_bandit_batch)]
-        meta_ep_start_batch = meta_ep_start_batch[:len(obs_bandit_batch)]
+        # # OPTIONAL safety: ensure all episodes same T (update2 assumes this)
+        # T0 = obs_bandit_batch[0].shape[0]
+        # obs_bandit_batch = [x for x in obs_bandit_batch if x.shape[0] == T0]
+        # chosen_bandits_batch = chosen_bandits_batch[:len(obs_bandit_batch)]
+        # bandit_rewards_batch = bandit_rewards_batch[:len(obs_bandit_batch)]
+        # meta_ep_start_batch = meta_ep_start_batch[:len(obs_bandit_batch)]
 
         # Train update
         agent.train()
@@ -535,7 +535,8 @@ def main():
             xy_pos_buf=xy_pos_buf,
             goal_vec_buf=goal_vec_buf,
             chosen_bandits_motor_buf=chosen_bandits_motor_buf,
-            bandit_obs=obs_bandit_batch,                 # <-- changed
+            featsL=featsL_batch,
+            featsR=featsR_batch,
             chosen_bandits_buf=chosen_bandits_batch,     # <-- changed
             bandit_rewards_buf=bandit_rewards_batch,     # <-- changed
             meta_ep_start_buf=meta_ep_start_batch,       # <-- changed
