@@ -167,6 +167,7 @@ class TwoChoiceReachingEnv(gym.Env):
         # Rendering
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
+        shuffle: bool = True
     ):
         super().__init__()
 
@@ -210,6 +211,8 @@ class TwoChoiceReachingEnv(gym.Env):
         self.image_factory = ProceduralImageFactory()
         self.session_pairs: List[Tuple[pygame.Surface, pygame.Surface]] = []  # (left,right) surfaces for this session
         self.session_id = 0
+
+        self.shuffle = shuffle
 
         self._build_static_canvas()
 
@@ -337,8 +340,10 @@ class TwoChoiceReachingEnv(gym.Env):
 
         # Build schedule: each pair index repeated N times, then shuffled
         indices = np.repeat(np.arange(K), self.session_N)
-        self.episode_pair_schedule: List[int] = self.rng.permutation(indices).tolist()
-
+        if self.shuffle:
+            self.episode_pair_schedule: List[int] = self.rng.permutation(indices).tolist()
+        else:
+            self.episode_pair_schedule = indices.tolist()
         # Trial bookkeeping
         self.trial_index = 0
         self.steps_in_trial = 0

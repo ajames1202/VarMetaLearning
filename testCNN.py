@@ -133,6 +133,7 @@ env_kwargs = dict(
     session_K=3,
     session_N=12,
     randomize_sides=True,
+    shuffle = False
 )
 
 num_workers = 1
