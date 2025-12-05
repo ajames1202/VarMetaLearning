@@ -364,8 +364,8 @@ class BanditLearner(nn.Module):
             qL_out = out[0::3]                    # (T,B,H)
             qR_out = out[1::3]                    # (T,B,H)
 
-            left_logits  = self.reward_compute(qL_out, feats_L)  # (T,B)
-            right_logits = self.reward_compute(qR_out, feats_R)  # (T,B)
+            left_logits  = self.reward_compute(qL_out, feats_L).squeeze(-1)  # (T,B)
+            right_logits = self.reward_compute(qR_out, feats_R).squeeze(-1)  # (T,B)
 
             p_left  = torch.distributions.Bernoulli(logits=left_logits)
             p_right = torch.distributions.Bernoulli(logits=right_logits)
