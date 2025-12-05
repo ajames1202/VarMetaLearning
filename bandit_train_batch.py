@@ -372,7 +372,7 @@ class RolloutWorker:
             seed=seed + 1000 * worker_id,
             session_K=session_K,
             session_N=session_N,
-            randomize_sides=True,
+            randomize_sides=False,
             shuffle = False
         )
 
