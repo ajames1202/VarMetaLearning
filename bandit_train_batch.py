@@ -516,9 +516,6 @@ def main():
             pair_idx_batch.append(np.array(r.get("pair_idx_buf", []), np.int64))
 
             cum_high_reward_choice += r["metrics"]["cum_high_reward_choice"]
-            trials += r["metrics"]["num_trials"]
-
-            cum_high_reward_choice += r["metrics"]["cum_high_reward_choice"]
             total_trials += r["metrics"]["num_trials"]
 
         cum_high_reward_choice /= args.episodes_per_update
