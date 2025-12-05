@@ -357,57 +357,48 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int,
         }
     }
 
-@ray.remote
+@ray.remote(num_cpus=1, num_gpus=0)
 class RolloutWorker:
-    def __init__(self, session_K, session_N, seed=0, worker_id=0):
+    def __init__(self, session_K: int, session_N: int, seed: int = 0, worker_id: int = 0):
         self.session_K = session_K
         self.session_N = session_N
-        self.device = torch.device("cpu")  # usually run envs on CPU
         self.worker_id = worker_id
+        self.device = torch.device("cpu")
 
-        # each worker has its own env instance
         self.env = vbe.TwoChoiceReachingEnv(
             W=384,
             H=400,
             render_mode="rgb_array",
-            seed=seed,
+            seed=seed + 1000 * worker_id,
             session_K=session_K,
             session_N=session_N,
-            trial_ms=3000,
-            randomize_sides=False,
+            randomize_sides=True
         )
 
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session=False):
-        # rebuild a fresh agent with same hyperparams as in main
-        hidden_size = 128
-        feature_dim = 128
+        feature_dim = 192
         input_size = feature_dim + 2 + 1 + 1
+        hidden = 128
+        action_dim = 2
 
-        agent = bl.BanditLearner(
+        self.agent = bl.BanditLearner(
             input_size=input_size,
             feature_dim=feature_dim,
-            rnn_hidden_size=hidden_size,
-            action_dim=2,
-            feature_source="ids",
-            num_pairs=self.session_K,
-            max_trials=self.session_N * self.session_K,
+            rnn_hidden_size=hidden,
+            action_dim=action_dim,
         ).to(self.device)
 
-        agent.load_state_dict(agent_state_dict)
-        agent.eval()
-
-        # set pair probabilities for this worker's env
-        self.env.unwrapped.pair_probs = probs_this_session
-
-        with torch.no_grad():
-            return meta_ep_rollout(
-                self.env, agent, self.device,
-                self.session_K, self.session_N,
-                worker_id=self.worker_id,
-                print_this_session=print_this_session
-            )
-
-
+    def rollout(self, agent_state_cpu: Dict[str, torch.Tensor], print_this_session: bool = False) -> Dict[str, Any]:
+        # Load params from driver
+        self.agent.load_state_dict(agent_state_cpu, strict=True)
+        return meta_ep_rollout(
+            env=self.env,
+            agent=self.agent,
+            device=self.device,
+            session_K=self.session_K,
+            session_N=self.session_N,
+            worker_id=self.worker_id,
+            print_this_session=print_this_session,
+        )
 
 # -------------------------
 # Main training loop
@@ -484,6 +475,7 @@ def main():
 
             # print("upd=",upd, ", w=", i % len(workers), ", print_this_session=", print_this_session)       
             futures.append(w.rollout.remote(state_ref, print_this_session=print_this_session))
+
 
         results: List[Dict[str, Any]] = ray.get(futures)
 
@@ -563,8 +555,8 @@ def main():
             print(f"[upd {upd:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"cum_high_reward_choice={cum_high_reward_choice:.1f} trials={total_trials}")
 
-        if upd == 10:
-            run_pair_idx_probe(obs_bandit_batch, pair_idx_batch, device=train_device)
+        # if upd == 10:
+        #     run_pair_idx_probe(obs_bandit_batch, pair_idx_batch, device=train_device)
 
 
         # Checkpoint
