@@ -208,6 +208,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
+            flipped = info.get("side_is_flipped", False)
             if(selected_high_reward):
                     # print("High reward choice made for pair index", pair_index_ep, "at count", pair_index_counter[pair_index_ep])
                     high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
@@ -218,6 +219,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 ", choice target:", choice_target.argmax(dim=-1).item(),
                 ", Reached Target:", info.get("selected_target"),
                 ", reward:", reward,
+                ", flipped =", flipped,
                 ", selected_high_reward = ", selected_high_reward,
                 ", p_left =", round(p_left.item(),2),
                 ", p_right =", round(p_right.item(),2)
@@ -299,7 +301,7 @@ class RolloutWorker:
             session_K=session_K,
             session_N=session_N,
             trial_ms=3000,
-            randomize_sides=False,
+            randomize_sides=True,
             shuffle=False,
         )
 
