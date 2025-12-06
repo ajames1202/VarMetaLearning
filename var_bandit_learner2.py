@@ -302,8 +302,8 @@ class BanditLearner(nn.Module):
                 (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
             ).sum(dim=-1).mean()  # sum over arms, mean over T,B
 
-            variational_loss = -var_logp_loss + 0.01 * var_kl_loss
-            # variational_loss = -var_logp_loss
+            # variational_loss = -var_logp_loss + 0.01 * var_kl_loss
+            variational_loss = -var_logp_loss
             variational_loss.backward()
 
             var_loss_sum += variational_loss.item()
