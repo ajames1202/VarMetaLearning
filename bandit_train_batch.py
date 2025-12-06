@@ -503,7 +503,7 @@ if __name__ == "__main__":
 
         if update_idx % 10 == 0:
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
-                  f"mean_cum_rew={mean_cum_rew:.1f}, mean_highR_perN={mean_highR_perN}")
+                  f"mean_cum_rew={mean_cum_rew:.1f}")
 
 
         # print(
