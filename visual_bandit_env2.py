@@ -326,7 +326,7 @@ class TwoChoiceReachingEnv(gym.Env):
             R = np.ones(K) * 0.2
             # self.session_pair_probs = [(float(L[i]), float(R[i])) for i in range(K)]
             self.session_pair_probs = [
-                (float(L[i]), float(R[i])) if i % 2 == 0 else (float(R[i]), float(L[i]))
+                (float(L[i]), float(R[i])) if np.random.rand() < 0.5 else (float(R[i]), float(L[i]))
                 for i in range(K)
             ]
 

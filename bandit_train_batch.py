@@ -319,7 +319,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int,
             log(
                 f"(RolloutWorker pid={os.getpid()}) [W{worker_id}] trial={meta_trial_idx} "
                 f"reward={float(reward):.1f}, pair_idx={curr_pair_index}, choice={trial_action_idx}, "
-                f"reached_target={reached_target}, flipped={flipped}, selected_high_reward={selected_high_reward}"
+                f"reached_target={reached_target}, flipped={flipped}, selected_high_reward={selected_high_reward}, "
+                f"probs={probs.detach().cpu().numpy()}"
             )
 
             meta_trial_idx += 1
@@ -494,11 +495,8 @@ def main():
         meta_ep_start_batch = []       # list of (T,)
         pair_idx_batch = []   # list of (T,)
 
-
         cum_high_reward_choice = 0.0
         total_trials = 0
-
-
 
         for r in results:
             # motor buffers (flat)
