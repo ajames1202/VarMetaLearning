@@ -205,7 +205,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
             _, h_rnn       = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
             
-            pair_index_ep = info.get("pair_index_in_session", -1)
+            pair_index_ep = info.get("prev_pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
             if(selected_high_reward):

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import math
 import numpy as np
+import os
+os.environ["SDL_AUDIODRIVER"] = "dummy"
+os.environ["AUDIODEV"] = "null"
+
 import pygame
 from typing import Optional, List, Tuple
 
@@ -163,6 +167,7 @@ class TwoChoiceReachingEnv(gym.Env):
         # Rendering
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
+        shuffle: bool = True
     ):
         super().__init__()
 
@@ -206,6 +211,8 @@ class TwoChoiceReachingEnv(gym.Env):
         self.image_factory = ProceduralImageFactory()
         self.session_pairs: List[Tuple[pygame.Surface, pygame.Surface]] = []  # (left,right) surfaces for this session
         self.session_id = 0
+
+        self.shuffle = shuffle
 
         self._build_static_canvas()
 
@@ -272,7 +279,7 @@ class TwoChoiceReachingEnv(gym.Env):
 
         # Pick which pair this trial uses
         self.curr_pair_idx = int(self.episode_pair_schedule[self.trial_index])
-        # print("Current pair index:", self.curr_pair_idx)
+        # print("Current pair index:", self.curr_pair_idx, ", self.pair_probs=", self.pair_probs)
 
         # Determine probabilities for this pair
         if self.pair_probs is None:
@@ -319,7 +326,7 @@ class TwoChoiceReachingEnv(gym.Env):
             R = np.ones(K) * 0.2
             # self.session_pair_probs = [(float(L[i]), float(R[i])) for i in range(K)]
             self.session_pair_probs = [
-                (float(L[i]), float(R[i])) if i % 2 == 0 else (float(R[i]), float(L[i]))
+                (float(L[i]), float(R[i])) if np.random.rand() < 0.5 else (float(R[i]), float(L[i]))
                 for i in range(K)
             ]
 
@@ -333,8 +340,10 @@ class TwoChoiceReachingEnv(gym.Env):
 
         # Build schedule: each pair index repeated N times, then shuffled
         indices = np.repeat(np.arange(K), self.session_N)
-        self.episode_pair_schedule: List[int] = self.rng.permutation(indices).tolist()
-
+        if self.shuffle:
+            self.episode_pair_schedule: List[int] = self.rng.permutation(indices).tolist()
+        else:
+            self.episode_pair_schedule = indices.tolist()
         # Trial bookkeeping
         self.trial_index = 0
         self.steps_in_trial = 0
@@ -440,9 +449,14 @@ class TwoChoiceReachingEnv(gym.Env):
             timeout = True
 
         # If the trial ended, advance schedule or end episode
-        pair_index_in_session = self.curr_pair_idx
+        prev_pair_idx = int(self.curr_pair_idx)
+        prev_trial_idx = int(self.trial_index)
+
         terminated = False
         if trial_ended:
+            old_pair_idx = self.curr_pair_idx
+            # print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
+
             # --- NEW: update per-session aggregates once per trial ---
             self.session_reward_sum += float(reward)
             if timeout:
@@ -460,13 +474,16 @@ class TwoChoiceReachingEnv(gym.Env):
         dxy = self.cursor - self.prev_cursor
         self.prev_cursor = self.cursor.copy()
 
+        curr_pair_idx = int(self.curr_pair_idx)
 
         info = {
             "reached_target": reached,
             "hit_boundary": bool(hit_boundary),   # <--- NEW, for debugging/analysis
             "total_trials_in_session": len(self.episode_pair_schedule),
             "trial_index": self.trial_index,
-            "pair_index_in_session": pair_index_in_session,
+            "pair_index_in_session": curr_pair_idx,               # current pair (for returned frame)
+            "prev_trial_index": prev_trial_idx,                   # previous (the one that just ended)
+            "prev_pair_index_in_session": prev_pair_idx,          # previous (the one that just ended)
             "trial_ended": trial_ended,
             "timeout": timeout,
             "selected_target" : chose_side,
