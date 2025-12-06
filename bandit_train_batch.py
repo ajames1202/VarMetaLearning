@@ -309,7 +309,7 @@ class RolloutWorker:
         # rebuild a fresh agent with same hyperparams as in main
         hidden_size = 128
         feature_dim = 128
-        input_size = 2*feature_dim + 2 + 1 + 1
+        input_size = 2*feature_dim + 2 + 1
 
         agent = bl.BanditLearner(
             input_size=input_size,
@@ -359,7 +359,7 @@ if __name__ == "__main__":
 
     hidden_size = 128
     feature_dim = 128
-    input_size = 2*feature_dim + 2 + 1 + 1
+    input_size = 2*feature_dim + 2 + 1
 
 
     agent = bl.BanditLearner(
