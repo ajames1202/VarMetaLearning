@@ -186,7 +186,7 @@ class BanditLearner(nn.Module):
 
         modules += [
             self.rnn,
-            self.rewards_head,
+            self.arm_reward_head,
             self.enc
             # self.fam_head,   # if you use familiarity as bandit aux
         ]
