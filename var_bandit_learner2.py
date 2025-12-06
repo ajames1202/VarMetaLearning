@@ -222,8 +222,8 @@ class BanditLearner(nn.Module):
         # 2) BANDIT data: batched (B, T, ...)
         # -----------------------------
         # bandit_obs: list of B tensors, each (T, C, H, W)
-        left_obs  = torch.stack([torch.as_tensor(b["left"],  device=device, dtype=torch.float32) for b in bandit_obs], dim=0)  # (B,T,C,H,W)
-        right_obs = torch.stack([torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
+        left_obs  = torch.stack([torch.tensor(b["left"],  device=device, dtype=torch.float32) for b in bandit_obs], dim=0)  # (B,T,C,H,W)
+        right_obs = torch.stack([torch.tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)  # (B, T, 2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device) # (B, T)
         meta_ep_start = torch.stack(meta_ep_start_buf, dim=0).to(device)    # (B, T)
