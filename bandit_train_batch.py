@@ -483,7 +483,7 @@ if __name__ == "__main__":
         # --------------------------------------------------
         #   Now we have ~B sessions worth of data -> one update
         # --------------------------------------------------
-        loss, policy_loss = agent.update2(
+        var_loss, motor_loss = agent.update2(
             optim_bandit, optim_motor,
             batch_xy_pos,
             batch_goal_vec,
@@ -499,6 +499,11 @@ if __name__ == "__main__":
         highR_perN_arr = np.stack(highR_perN_list)   # shape (B, N)
         mean_highR_perN = highR_perN_arr.mean(axis=0)
         mean_cum_rew = np.mean(cum_rewards_list)
+
+        if update_idx % 10 == 0:
+            print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
+                  f"mean_cum_rew={mean_cum_rew:.1f}, mean_highR_perN={mean_highR_perN}")
+
 
         # print(
         #     f"[Update {update_idx+1}/{num_updates}] "
