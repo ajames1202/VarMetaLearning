@@ -64,11 +64,12 @@ class BanditLearner(nn.Module):
         self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
 
         # choice_inp = rnn_hidden_size
-        self.rewards_head = nn.Sequential(
-            nn.Linear(rnn_hidden_size + 2*feature_dim, 128),
+        self.arm_reward_head = nn.Sequential(
+            nn.Linear(rnn_hidden_size + feature_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, 2)
+            nn.Linear(128, 1),
         )
+
 
         # self.choice_v_head = nn.Sequential(nn.Linear(combined_dim,128), nn.ReLU(), nn.Linear(128,1))
 
@@ -111,7 +112,15 @@ class BanditLearner(nn.Module):
             out:   (T, H)       or (T, B, H)   (same rank as features)
             new_h: (1, H)       or (1, B, H)
         """
-        x = torch.cat([left_feats, right_feats,  action, reward, meta_ep_start], dim=-1).to(left_feats.dtype).to(left_feats.device)
+        # x = torch.cat([left_feats, right_feats,  action, reward, meta_ep_start], dim=-1).to(left_feats.dtype).to(left_feats.device)
+        aL = action[..., 0:1]          # (T,B,1)
+        aR = action[..., 1:2]
+
+        chosen_feat   = aL * left_feats  + aR * right_feats
+        unchosen_feat = aL * right_feats + aR * left_feats
+
+        x = torch.cat([chosen_feat, unchosen_feat, reward, meta_ep_start], dim=-1).to(left_feats.dtype).to(left_feats.device)
+
 
         # Case 1: unbatched old-style input (T, D)
         if x.dim() == 2:
@@ -140,11 +149,12 @@ class BanditLearner(nn.Module):
 
     
     
-    def reward_compute(self, rnn_out, left_feat, right_feat):
-        # rnn_out: (S,H) or (1,H)
-        # curr_feat: (S,F) or (1,F)
-        x = torch.cat([rnn_out, left_feat, right_feat], dim=-1)
-        return self.rewards_head(x)  # (S,2) or (1,2)
+    def reward_compute(self, h, left_feat, right_feat):
+        # h: (T,B,H) or (1,H)
+        l = self.arm_reward_head(torch.cat([h, left_feat],  dim=-1)).squeeze(-1)
+        r = self.arm_reward_head(torch.cat([h, right_feat], dim=-1)).squeeze(-1)
+        return torch.stack([l, r], dim=-1)  # (...,2)
+
 
 
         
