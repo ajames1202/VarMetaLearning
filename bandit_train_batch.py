@@ -518,8 +518,8 @@ if __name__ == "__main__":
         global_step = update_idx  # one step per update
 
         # scalar losses
-        writer.add_scalar("Loss/ChoiceLoss", loss, global_step)
-        writer.add_scalar("Loss/MotorLoss", policy_loss, global_step)
+        writer.add_scalar("Loss/ChoiceLoss", var_loss, global_step)
+        writer.add_scalar("Loss/MotorLoss", motor_loss, global_step)
 
         # rewards
         writer.add_scalar("Reward/MeanCumSession", mean_cum_rew, global_step)
