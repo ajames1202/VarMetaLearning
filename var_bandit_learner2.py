@@ -65,7 +65,7 @@ class BanditLearner(nn.Module):
 
         # choice_inp = rnn_hidden_size
         self.rewards_head = nn.Sequential(
-            nn.Linear(rnn_hidden_size + feature_dim, 128),
+            nn.Linear(rnn_hidden_size + 2*feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 2)
         )
@@ -100,7 +100,7 @@ class BanditLearner(nn.Module):
         return self.enc(x)    
 
     
-    def rnn_fwd(self, features, action, reward, meta_ep_start, h):
+    def rnn_fwd(self, left_feats, right_feats, action, reward, meta_ep_start, h):
         """
         features: (T, D_f)      or (T, B, D_f)
         action:   (T, D_a)      or (T, B, D_a)
@@ -111,7 +111,7 @@ class BanditLearner(nn.Module):
             out:   (T, H)       or (T, B, H)   (same rank as features)
             new_h: (1, H)       or (1, B, H)
         """
-        x = torch.cat([features, action, reward, meta_ep_start], dim=-1).to(features.dtype).to(features.device)
+        x = torch.cat([left_feats, right_feats,  action, reward, meta_ep_start], dim=-1).to(left_feats.dtype).to(left_feats.device)
 
         # Case 1: unbatched old-style input (T, D)
         if x.dim() == 2:
@@ -140,10 +140,10 @@ class BanditLearner(nn.Module):
 
     
     
-    def reward_compute(self, rnn_out, curr_feat):
+    def reward_compute(self, rnn_out, left_feat, right_feat):
         # rnn_out: (S,H) or (1,H)
         # curr_feat: (S,F) or (1,F)
-        x = torch.cat([rnn_out, curr_feat], dim=-1)
+        x = torch.cat([rnn_out, left_feat, right_feat], dim=-1)
         return self.rewards_head(x)  # (S,2) or (1,2)
 
 
@@ -222,22 +222,19 @@ class BanditLearner(nn.Module):
         # 2) BANDIT data: batched (B, T, ...)
         # -----------------------------
         # bandit_obs: list of B tensors, each (T, C, H, W)
-        bandit_obs = torch.stack(bandit_obs, dim=0).to(device)            # (B, T, C, H, W)
+        left_obs  = torch.stack([torch.as_tensor(b["left"],  device=device, dtype=torch.float32) for b in bandit_obs], dim=0)  # (B,T,C,H,W)
+        right_obs = torch.stack([torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)  # (B, T, 2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device) # (B, T)
         meta_ep_start = torch.stack(meta_ep_start_buf, dim=0).to(device)    # (B, T)
 
-        B, T = bandit_obs.shape[:2]
-        C, H, W = bandit_obs.shape[2:]
+        B, T, C, H, W = left_obs.shape
 
         # Reorder to time-major (T, B, ...)
-        bandit_obs     = bandit_obs.permute(1, 0, 2, 3, 4)         # (T, B, C, H, W)
         chosen_bandits = chosen_bandits.permute(1, 0, 2)           # (T, B, 2)
         rewards_bandits = rewards_bandits.permute(1, 0)            # (T, B)
         meta_ep_start   = meta_ep_start.permute(1, 0)              # (T, B)
 
-        # Encode CNN features: flatten (T, B) -> (T*B, C, H, W)
-        bandit_obs_flat = bandit_obs.reshape(T * B, C, H, W)       # (T*B, C, H, W)
         # For GRU:
         rewards_rnn = rewards_bandits.unsqueeze(-1)    # (T, B, 1)
         start_rnn   = meta_ep_start.unsqueeze(-1)      # (T, B, 1)
@@ -257,12 +254,16 @@ class BanditLearner(nn.Module):
             # -----------------------------
             h_rnn = torch.zeros(1, B, self.rnn.hidden_size, device=device)
 
-            feats_flat = self.encode(bandit_obs_flat)    # (T*B, F)
-            feats_bandit = feats_flat.view(T, B, -1)  # (T, B, F)
+            left_flat  = left_obs.reshape(B*T, C, H, W)
+            right_flat = right_obs.reshape(B*T, C, H, W)
+
+            left_feats  = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)   # (T,B,F)
+            right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)  # (T,B,F)
 
 
             rnn_out, h_rnn = self.rnn_fwd(
-                feats_bandit,       # (T, B, F)
+                left_feats,       # (T, B, F)
+                right_feats,      # (T, B, F)
                 chosen_bandits,     # (T, B, 2)
                 rewards_rnn,        # (T, B, 1)
                 start_rnn,          # (T, B, 1)
@@ -273,7 +274,7 @@ class BanditLearner(nn.Module):
             h_seq_orig = torch.zeros_like(rnn_out)
             h_seq_orig[1:] = rnn_out[:-1]          # (T, B, H)
 
-            reward_logits = self.reward_compute(h_seq_orig, feats_bandit)  # (T, B, 2)
+            reward_logits = self.reward_compute(h_seq_orig, left_feats, right_feats)  # (T, B, 2)
             left_logits   = reward_logits[..., 0]  # (T, B)
             right_logits  = reward_logits[..., 1]  # (T, B)
 
@@ -301,7 +302,8 @@ class BanditLearner(nn.Module):
                 (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
             ).sum(dim=-1).mean()  # sum over arms, mean over T,B
 
-            variational_loss = -var_logp_loss + 0.1 * var_kl_loss
+            # variational_loss = -var_logp_loss + 0.1 * var_kl_loss
+            variational_loss = -var_logp_loss
             variational_loss.backward()
 
             var_loss_sum += variational_loss.item()

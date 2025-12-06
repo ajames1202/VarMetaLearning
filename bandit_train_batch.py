@@ -6,7 +6,6 @@ import time
 import numpy as np
 import torch
 from torch import nn
-from torchvision import transforms as T
 import torch.nn.functional as F
 import argparse
 
@@ -28,55 +27,22 @@ import math, contextlib
 # torch.backends.cudnn.enabled = True
 # torch.autograd.set_detect_anomaly(True)
 
-@ray.remote(num_cpus=1, num_gpus=0)
-class RolloutWorker:
-    def __init__(self, session_K, session_N, seed=0, worker_id=0):
-        self.session_K = session_K
-        self.session_N = session_N
-        self.device = torch.device("cpu")  # usually run envs on CPU
-        self.worker_id = worker_id
+def extract_lr_views(obs_tensor, env, crop_size=112, pad=6):
+    lr = env.unwrapped.left_rect
+    rr = env.unwrapped.right_rect
+    _, _, H, W = obs_tensor.shape
 
-        # each worker has its own env instance
-        self.env = vbe.TwoChoiceReachingEnv(
-            W=384,
-            H=400,
-            render_mode="rgb_array",
-            seed=seed,
-            session_K=session_K,
-            session_N=session_N,
-            trial_ms=3000,
-            randomize_sides=False,
-        )
+    y1 = max(min(lr.top, rr.top) - pad, 0)
+    y2 = min(max(lr.bottom, rr.bottom) + pad, H)
 
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session=False):
-        # rebuild a fresh agent with same hyperparams as in main
-        hidden_size = 128
-        feature_dim = 128
-        input_size = feature_dim + 2 + 1 + 1
+    def crop_resize(rect):
+        x1 = max(rect.left - pad, 0)
+        x2 = min(rect.right + pad, W)
+        patch = obs_tensor[:, :, y1:y2, x1:x2]
+        patch = F.interpolate(patch, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+        return patch
 
-        agent = bl.BanditLearner(
-            input_size=input_size,
-            feature_dim=feature_dim,
-            rnn_hidden_size=hidden_size,
-            action_dim=2,
-            num_pairs=self.session_K,
-            max_trials=self.session_N * self.session_K,
-        ).to(self.device)
-
-        agent.load_state_dict(agent_state_dict)
-        agent.eval()
-
-        # set pair probabilities for this worker's env
-        self.env.unwrapped.pair_probs = probs_this_session
-
-        with torch.no_grad():
-            return meta_ep_rollout(
-                self.env, agent, self.device,
-                self.session_K, self.session_N,
-                worker_id=self.worker_id,
-                print_this_session=print_this_session
-            )
-
+    return crop_resize(lr), crop_resize(rr)
 
 
 def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
@@ -91,12 +57,12 @@ def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(ckpt, path)
 
-def load_checkpoint(path, agent, optimizer=None, map_location="cpu"):
-    ckpt = torch.load(path, map_location=map_location)
-    agent.load_state_dict(ckpt["model_state"])
-    if optimizer is not None and "optim_state" in ckpt:
-        optimizer.load_state_dict(ckpt["optim_state"])
-    return ckpt.get("extra", {})
+# def load_checkpoint(path, agent, optim_bandit=None, optim_motor=None, map_location="cpu"):
+#     ckpt = torch.load(path, map_location=map_location)
+#     agent.load_state_dict(ckpt["model_state"])
+#     if optimizer is not None and "optim_state" in ckpt:
+#         optimizer.load_state_dict(ckpt["optim_state"])
+#     return ckpt.get("extra", {})
 
 
 
@@ -126,7 +92,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     goal_vec_buf = []
     feats_motor = []
     chosen_bandits_motor_buf = []
-    obs_bandit = []
+    left_obs = []
+    right_obs = []
     feats_bandit = []
     chosen_bandits_buf = []
     bandit_rewards_buf = []
@@ -139,17 +106,20 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         obs_tensor = (
             torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0) #(H,W,C)->(1,C,H,W)
         )
-        small = agent.downsample(obs_tensor)
-        features = agent.encode(small).squeeze(0)
-                 # (F,) for this step
 
         # CHOICE at episode start
         if ep_start_flag == 1.0:
-                # build single-step tensors as (1, D)
-            # f1  = features.unsqueeze(0)        # (1, F)
-            small = agent.downsample(obs_tensor)
-            f1 = agent.encode(small)                                # (1, F)
-            obs_bandit.append(small.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+
+            left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
+
+            left_feats = agent.encode(left_view) # (F,) for this step
+            right_feats = agent.encode(right_view) # (F,) for this step
+
+
+            # f1 = agent.encode(small)                                # (1, F)
+            left_obs.append(left_view.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+            right_obs.append(right_view.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+
 
             
             # --- Bandit forward for choice ---
@@ -158,7 +128,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # --- Bandit forward for choice (Thompson sampling with Bernoulli head) ---
 
             # 1) Get logits from the bandit head using current RNN state
-            reward_logits = agent.reward_compute(h_rnn, f1).squeeze(0) # (2,) -> [logit_left, logit_right]
+            reward_logits = agent.reward_compute(h_rnn, left_feats, right_feats).squeeze(0) # (2,) -> [logit_left, logit_right]
 
             # 2) Convert logits -> probabilities
             eps = 1e-4
@@ -218,26 +188,22 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         action = torch.tanh(y)
         action_np = action.squeeze(0).detach().cpu().numpy()
 
+        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
+
+
         next_obs, reward, term, _, info = env.step(action_np) # (H,W,3), scalar, bool, _, dict
         done = term
         
         pair_idx_now = info.get("pair_index_in_session", -1)
 
 
-        feats_motor.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
-        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
-
-
         if info.get("trial_ended"):
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
             meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)  # (1,)
             
-            # if choice_target.argmax(dim=-1).item() != info.get("selected_target"):
-            #     reward = 0
-            # else:
             a_oh        = choice_target                                           # (1, 2) one-hot choice
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-            _, h_rnn       = agent.rnn_fwd(f1, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
+            _, h_rnn       = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
             
             pair_index_ep = info.get("pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1    
@@ -260,7 +226,6 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             ep_start_flag = 1.0
             # print("Trial ended. t=", t, ", pair_index_ep=", pair_index_ep, ", pair_idx_t=", pair_idx_t,  ", choice_target:", choice_target, "reward:", reward, ", done_buf[t]=", done_buf[t])
 
-            feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
             bandit_rewards_buf.append(reward)  # scalar
 
@@ -307,8 +272,66 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     #       f"flip_consistency={np.mean(info['probe_flip_consistency']):.3g}")
 
     cum_rewards = sum(bandit_rewards_buf)
+
+    obs_bandit = {
+        "left":  np.stack(left_obs,  axis=0),   # (T,C,H,W)
+        "right": np.stack(right_obs, axis=0),
+    }
+
     
     return xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards
+
+
+@ray.remote(num_cpus=1, num_gpus=0)
+class RolloutWorker:
+    def __init__(self, session_K, session_N, seed=0, worker_id=0):
+        self.session_K = session_K
+        self.session_N = session_N
+        self.device = torch.device("cpu")  # usually run envs on CPU
+        self.worker_id = worker_id
+
+        # each worker has its own env instance
+        self.env = vbe.TwoChoiceReachingEnv(
+            W=384,
+            H=400,
+            render_mode="rgb_array",
+            seed=seed,
+            session_K=session_K,
+            session_N=session_N,
+            trial_ms=3000,
+            randomize_sides=False,
+        )
+
+    def run_session(self, agent_state_dict, probs_this_session, print_this_session=False):
+        # rebuild a fresh agent with same hyperparams as in main
+        hidden_size = 128
+        feature_dim = 128
+        input_size = 2*feature_dim + 2 + 1 + 1
+
+        agent = bl.BanditLearner(
+            input_size=input_size,
+            feature_dim=feature_dim,
+            rnn_hidden_size=hidden_size,
+            action_dim=2,
+            num_pairs=self.session_K,
+            max_trials=self.session_N * self.session_K,
+        ).to(self.device)
+
+        agent.load_state_dict(agent_state_dict)
+        agent.eval()
+
+        # set pair probabilities for this worker's env
+        self.env.unwrapped.pair_probs = probs_this_session
+
+        with torch.no_grad():
+            return meta_ep_rollout(
+                self.env, agent, self.device,
+                self.session_K, self.session_N,
+                worker_id=self.worker_id,
+                print_this_session=print_this_session
+            )
+
+
 
 if __name__ == "__main__":
 
@@ -333,7 +356,7 @@ if __name__ == "__main__":
 
     hidden_size = 128
     feature_dim = 128
-    input_size = feature_dim + 2 + 1 + 1
+    input_size = 2*feature_dim + 2 + 1 + 1
 
 
     agent = bl.BanditLearner(
@@ -443,7 +466,7 @@ if __name__ == "__main__":
                 batch_xy_pos.extend(xy_pos_buf)
                 batch_goal_vec.extend(goal_vec_buf)
                 batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
-                batch_bandit_obs.append(torch.as_tensor(np.stack(obs_bandit), dtype=torch.float32))
+                batch_bandit_obs.append(obs_bandit)
                 batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
                 batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
                 batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
