@@ -444,7 +444,7 @@ if __name__ == "__main__":
             rollout_futures = []
             for w_id in range(num_launch):
 
-                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx%20 == 0)
+                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx%10 == 0)
                 # meaning: only worker 0, only the first session of this update
 
                 rollout_futures.append(
@@ -500,13 +500,13 @@ if __name__ == "__main__":
         mean_highR_perN = highR_perN_arr.mean(axis=0)
         mean_cum_rew = np.mean(cum_rewards_list)
 
-        print(
-            f"[Update {update_idx+1}/{num_updates}] "
-            f"sessions_in_batch={total_sessions_collected}, "
-            f"mean_cum_session_rewards={mean_cum_rew:.2f}, "
-            f"ChoiceLoss={loss:.4f}, MotorLoss={policy_loss:.4f}, "
-            f"mean_high_reward_choice_perN={mean_highR_perN}"
-        )
+        # print(
+        #     f"[Update {update_idx+1}/{num_updates}] "
+        #     f"sessions_in_batch={total_sessions_collected}, "
+        #     f"mean_cum_session_rewards={mean_cum_rew:.2f}, "
+        #     f"ChoiceLoss={loss:.4f}, MotorLoss={policy_loss:.4f}, "
+        #     f"mean_high_reward_choice_perN={mean_highR_perN}"
+        # )
 
                 # ---- TensorBoard logging ----
         global_step = update_idx  # one step per update
