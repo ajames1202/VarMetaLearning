@@ -74,145 +74,142 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
-    
-    h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # initial hidden state
-    # for episode in range(session_K*session_N):
-    obs,info = env.reset()
-    # print("Total episodes in session:", info.get("total_trials_in_session", -1))
+    h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # GRU hidden state
+    attn_tokens = []  # [q0, o0, q1, o1, ...] each token is (1,H)
+
+    obs, info = env.reset()
     done = False
-    ep = 0
-    
 
-    pair_index_counter = np.ones(session_K, dtype=np.int32)*-1 # counts per pair
-    high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32) # counts per N
+    pair_index_counter = np.ones(session_K, dtype=np.int32) * -1
+    high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32)
 
-    # prev_action = torch.zeros((1, agent.action_dim), dtype=torch.float32, device=device)  # assuming action_dim=2
     meta_ep_len = 0
+    t = 0
+    ep_start_flag = 1.0
+
     xy_pos_buf = []
     goal_vec_buf = []
-    feats_motor = []
     chosen_bandits_motor_buf = []
+
     left_obs = []
     right_obs = []
-    feats_bandit = []
+
     chosen_bandits_buf = []
     bandit_rewards_buf = []
     meta_ep_start_buf = []
 
-    # rnn_outputs = torch.empty((0, agent.gru.hidden_size), dtype=torch.float32, device=device)
-    t = 0
-    ep_start_flag = 1.0  # first step of episode
+    choice_target = None
+    p_left = torch.tensor(0.5)
+    p_right = torch.tensor(0.5)
+
     while not done:
         obs_tensor = (
-            torch.as_tensor(obs, device=device).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0) #(H,W,C)->(1,C,H,W)
+            torch.as_tensor(obs, device=device)
+            .permute(2, 0, 1).unsqueeze(0)
+            .to(torch.float32).div_(255.0)
         )
 
-        # CHOICE at episode start
+        # -----------------------------
+        # CHOICE at trial start
+        # -----------------------------
         if ep_start_flag == 1.0:
-
             left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
 
-            left_feats = agent.encode(left_view) # (F,) for this step
-            right_feats = agent.encode(right_view) # (F,) for this step
+            left_feats = agent.encode(left_view)    # (1,F)
+            right_feats = agent.encode(right_view)  # (1,F)
 
+            left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
+            right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
 
-            # f1 = agent.encode(small)                                # (1, F)
-            left_obs.append(left_view.squeeze(0).detach().cpu().numpy())  # (C,H,W)
-            right_obs.append(right_view.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+            # Build query token (swap-invariant) and attend over history
+            q_t = agent.pair_query_token(left_feats, right_feats)  # (1,H)
+            attn_tokens.append(q_t)
 
+            seq = torch.stack(attn_tokens, dim=0)   # (L,1,H)
+            h_ctx = agent.attn(seq)[-1]             # (1,H) context at query position
 
-            
-            # --- Bandit forward for choice ---
-            
-            # rnn_out, h = agent.(f1, prev_bandit_act, prev_bandit_reward, es1, h)  # rnn_out: (1, H)
-            # --- Bandit forward for choice (Thompson sampling with Bernoulli head) ---
+            reward_logits = agent.reward_compute(h_ctx, left_feats, right_feats).squeeze(0)  # (2,)
 
-            # 1) Get logits from the bandit head using current RNN state
-            reward_logits = agent.reward_compute(h_rnn, left_feats, right_feats).squeeze(0) # (2,) -> [logit_left, logit_right]
-
-            # 2) Convert logits -> probabilities
+            # Thompson sampling (same as your code)
             eps = 1e-4
-            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)  # (2,)  # (2,), in (0,1)
+            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)
             p_left, p_right = probs[0], probs[1]
 
-            # 3) Build an approximate Beta posterior around each p
-            #    concentration controls how "confident" the posterior is.
-            concentration = 5.0  # hyper-parameter, tune if needed
-            alpha_left  = p_left  * concentration + 1.0 # add 1.0 prior
-            beta_left   = (1.0 - p_left)  * concentration + 1.0 # add 1.0 prior
-            alpha_right = p_right * concentration + 1.0 # add 1.0 prior
-            beta_right  = (1.0 - p_right) * concentration + 1.0 # add 1.0 prior
+            concentration = 5.0
+            alpha_left  = p_left  * concentration + 1.0
+            beta_left   = (1.0 - p_left)  * concentration + 1.0
+            alpha_right = p_right * concentration + 1.0
+            beta_right  = (1.0 - p_right) * concentration + 1.0
 
             dist_left  = torch.distributions.Beta(alpha_left,  beta_left)
             dist_right = torch.distributions.Beta(alpha_right, beta_right)
 
-            # 4) Thompson sample & pick the best arm
             u_left  = dist_left.rsample()
             u_right = dist_right.rsample()
 
-            samples = torch.stack([u_left, u_right])           # (2,)
-            a_t = torch.argmax(samples)                        # index of chosen arm
+            a_t = torch.argmax(torch.stack([u_left, u_right]))
             choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
 
-
             meta_ep_len += 1
+            ep_start_flag = 0.0
 
-
-        # --- Motor forward (now we have choice_target) ---
-        # Build (x,y) in [-1,1]
+        # -----------------------------
+        # MOTOR step
+        # -----------------------------
         W, H = env.unwrapped.W, env.unwrapped.H
         x_pix, y_pix = env.unwrapped.cursor
         xy_norm = np.array([(x_pix/(W-1))*2-1, (y_pix/(H-1))*2-1], dtype=np.float32)
 
-        # Panel centers in pixels → normalize to [-1,1]
         left_c  = np.array([env.unwrapped.left_rect.centerx,  env.unwrapped.left_rect.centery],  np.float32)
         right_c = np.array([env.unwrapped.right_rect.centerx, env.unwrapped.right_rect.centery], np.float32)
         left_c_norm  = np.array([(left_c[0]/(W-1))*2-1,  (left_c[1]/(H-1))*2-1],  np.float32)
         right_c_norm = np.array([(right_c[0]/(W-1))*2-1, (right_c[1]/(H-1))*2-1], np.float32)
 
-        # Chosen center based on one-hot
         chosen_center = left_c_norm if choice_target.argmax(dim=-1).item() == 0 else right_c_norm
-        g_norm = chosen_center - xy_norm  # vector *to* goal
+        g_norm = chosen_center - xy_norm
 
-        xy_pos_t  = torch.as_tensor(xy_norm).unsqueeze(0).to(device)  # (1,2)
-        goal_vec_t= torch.as_tensor(g_norm ).unsqueeze(0).to(device)  # (1,2)
+        xy_pos_t   = torch.as_tensor(xy_norm).unsqueeze(0).to(device)
+        goal_vec_t = torch.as_tensor(g_norm).unsqueeze(0).to(device)
 
-        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos = xy_pos_t, goal_vec=goal_vec_t)
+        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos=xy_pos_t, goal_vec=goal_vec_t)
 
-        # store for training
-        xy_pos_buf.append(xy_norm)     # (2,)
-        goal_vec_buf.append(g_norm)    # (2,)
-    
+        xy_pos_buf.append(xy_norm)
+        goal_vec_buf.append(g_norm)
+        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
+
         std = torch.exp(log_std)
-        y = mu + std * torch.randn_like(std)     # pre-tanh noise
+        y = mu + std * torch.randn_like(std)
         action = torch.tanh(y)
         action_np = action.squeeze(0).detach().cpu().numpy()
 
-        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
-
-
-        next_obs, reward, term, _, info = env.step(action_np) # (H,W,3), scalar, bool, _, dict
+        next_obs, reward, term, _, info = env.step(action_np)
+        obs = next_obs
         done = term
-        
+
         pair_idx_now = info.get("pair_index_in_session", -1)
 
-
+        # -----------------------------
+        # Trial ended => append outcome token + update GRU
+        # -----------------------------
         if info.get("trial_ended"):
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
-            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)  # (1,)
-            
-            a_oh        = choice_target                                           # (1, 2) one-hot choice
-            r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-            _, h_rnn       = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)           # update GRU memory
-            
+            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
+
+            a_oh = choice_target
+            r_t  = torch.tensor([[float(reward)]], device=device, dtype=torch.float32)
+
+            # rnn_fwd returns RAW GRU out for this trial (outcome token)
+            o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
+            attn_tokens.append(o_t)
+
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
-            pair_index_counter[pair_index_ep] += 1    
+            pair_index_counter[pair_index_ep] += 1
             selected_high_reward = info.get("selected_high_reward_this_trial", False)
             flipped = info.get("side_is_flipped", False)
-            if(selected_high_reward):
-                    # print("High reward choice made for pair index", pair_index_ep, "at count", pair_index_counter[pair_index_ep])
-                    high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
-            # print("Ep: ", info.get("trial_index") , ", idx = ", pair_idx_now, ", choice target:", choice_target.argmax(dim=-1).item(), ", Reached Target:", info.get("selected_target"), ", reward:", reward, ", selected_high_reward = ", selected_high_reward, ", p_left =", p_left.item(), ", p_right =", p_right.item())    
+
+            if selected_high_reward:
+                high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
+
             log(
                 "Ep: ", info.get("trial_index"),
                 ", idx = ", pair_idx_now,
@@ -221,42 +218,25 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 ", reward:", reward,
                 ", flipped =", flipped,
                 ", selected_high_reward = ", selected_high_reward,
-                ", p_left =", round(p_left.item(),2),
-                ", p_right =", round(p_right.item(),2)
+                ", p_left =", round(float(p_left), 2),
+                ", p_right =", round(float(p_right), 2)
             )
 
-            ep_start_flag = 1.0
-            # print("Trial ended. t=", t, ", pair_index_ep=", pair_index_ep, ", pair_idx_t=", pair_idx_t,  ", choice_target:", choice_target, "reward:", reward, ", done_buf[t]=", done_buf[t])
-
-            chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
-            bandit_rewards_buf.append(reward)  # scalar
-
-            if(meta_ep_len == 1):
-                meta_ep_start_buf.append(1.0)
-            else:
-                meta_ep_start_buf.append(0.0)    
+            chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
+            bandit_rewards_buf.append(float(reward))
+            meta_ep_start_buf.append(float(meta_ep_start))
 
             choice_target = None
+            ep_start_flag = 1.0
 
-    
-        else:
-            ep_start_flag = 0.0
-
-        
-
-        obs = next_obs
         t += 1
-        # prev_action = action
-        # prev_reward = torch.as_tensor([[reward]], dtype=torch.float32, device=device)
 
-    # print("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
-    # log("Done with rollout at t =", t, ", feats_buf len =", len(feats_buf), ", rew_buf len =", len(rew_buf), ", act_buf len =", len(act_buf), ", done_buf len =", len(done_buf))
-
+    # session stats
     high_reward_choice_count_on_left = info.get("high_reward_choice_count_on_left", -1)
-    high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right",-1)
-    total_left_choices = info.get("total_left_choices",-1)
-    total_right_choices = info.get("total_right_choices",-1)
-    # print("Session finished. High-reward choices per N:", high_reward_choice_per_N, ", High-reward choices on left:", high_reward_choice_count_on_left, ", on right:", high_reward_choice_count_on_right, ", Total left choices:", total_left_choices, ", Total right choices:", total_right_choices, ", Total trials in session:", len(rew_buf))
+    high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right", -1)
+    total_left_choices = info.get("total_left_choices", -1)
+    total_right_choices = info.get("total_right_choices", -1)
+
     log(
         "Session finished. High-reward choices per N:", high_reward_choice_per_N,
         ", High-reward choices on left:", high_reward_choice_count_on_left,
@@ -266,22 +246,21 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     )
 
     high_reward_choice_per_N = high_reward_choice_per_N.astype(float)
-    high_reward_choice_per_N /= float(session_K)  # normalize by K
+    high_reward_choice_per_N /= float(session_K)
     high_reward_choice_per_N = high_reward_choice_per_N.round(2)
-
-    # if info.get('probe_fam_inv_err'):
-    #     print(f"probe: fam_inv_err={np.mean(info['probe_fam_inv_err']):.3g}, "
-    #       f"flip_consistency={np.mean(info['probe_flip_consistency']):.3g}")
 
     cum_rewards = sum(bandit_rewards_buf)
 
     obs_bandit = {
-        "left":  np.stack(left_obs,  axis=0),   # (T,C,H,W)
+        "left":  np.stack(left_obs,  axis=0),
         "right": np.stack(right_obs, axis=0),
     }
 
-    
-    return xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards
+    return (
+        xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
+        obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf,
+        high_reward_choice_per_N, cum_rewards
+    )
 
 
 @ray.remote(num_cpus=1, num_gpus=0)
