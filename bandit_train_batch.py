@@ -302,7 +302,7 @@ class RolloutWorker:
             session_N=session_N,
             trial_ms=3000,
             randomize_sides=True,
-            shuffle=False,
+            shuffle=True,
         )
 
     def run_session(self, agent_state_dict, probs_this_session, print_this_session=False):
