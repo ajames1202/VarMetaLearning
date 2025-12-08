@@ -75,8 +75,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             print(*args, **kwargs)
 
     h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # GRU hidden state
-    q_tokens = []   # list of (1,H)
-    o_tokens = []   # list of (1,H)
+    q_tokens = []   # past pair keys (1,H)
+    o_tokens = []   # past outcome values (1,H)
+    q_this_trial = None
 
 
     obs, info = env.reset()
@@ -126,21 +127,21 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # Build query token (swap-invariant) and attend over history
             # Build query token (swap-invariant) and attend over history
             q_t = agent.pair_query_token(left_feats, right_feats)  # (1,H)
-            q_tokens.append(q_t)   # you can keep this if you want for debugging
+            q_this_trial = q_t  # save until trial ends
 
             Tpast = len(o_tokens)
             if Tpast == 0:
-                # No outcome history yet for the first trial: fall back to q_t itself
-                h_ctx = q_t  # (1,H)
+                h_ctx = q_t
             else:
-                # Query = current q_t, Keys/Values = all past outcomes o_0..o_{t-1}
-                q_seq = q_t.unsqueeze(0)              # (1, 1, H)   -> Tq = 1
-                o_seq = torch.stack(o_tokens, dim=0)  # (Tpast, 1, H) -> Tk = Tpast
+                q_seq = q_t.unsqueeze(0)                 # (1,1,H)
+                k_seq = torch.stack(q_tokens, dim=0)     # (Tpast,1,H)
+                v_seq = torch.stack(o_tokens, dim=0)     # (Tpast,1,H)
 
-                ctx = agent.attn(q_seq, o_seq)        # (1, 1, H)
-                h_ctx = ctx[0]                        # (1, H)
+                ctx = agent.attn(q_seq, k_seq, v_seq)    # (1,1,H)
+                h_ctx = ctx[0]                           # (1,H)
 
-            reward_logits = agent.reward_compute(h_ctx, left_feats, right_feats).squeeze(0)  # (2,)
+            reward_logits = agent.reward_compute(h_ctx, left_feats, right_feats).squeeze(0)
+
 
             # Thompson sampling (same as your code)
             eps = 1e-4
@@ -213,6 +214,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # rnn_fwd returns RAW GRU out for this trial (outcome token)
             o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
             o_tokens.append(o_t)
+            q_tokens.append(q_this_trial)
+            q_this_trial = None
 
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1
@@ -292,7 +295,7 @@ class RolloutWorker:
             session_K=session_K,
             session_N=session_N,
             trial_ms=3000,
-            randomize_sides=False,
+            randomize_sides=True,
             shuffle=False,
         )
 

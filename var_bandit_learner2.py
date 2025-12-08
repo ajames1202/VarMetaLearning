@@ -49,61 +49,56 @@ def log_prob_tanh_normal(action, mean, log_std, eps=1e-6):
 class MultiHeadCausalCrossAttention(nn.Module):
     def __init__(self, dim, num_heads, causal=True):
         super().__init__()
-        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        assert dim % num_heads == 0
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.causal = causal
 
-        # Separate projections for Q and K/V
         self.W_q = nn.Linear(dim, dim)
         self.W_k = nn.Linear(dim, dim)
         self.W_v = nn.Linear(dim, dim)
         self.out = nn.Linear(dim, dim)
 
-    def forward(self, x_q, x_kv):  # x_q: (Tq,B,H), x_kv: (Tk,B,H)
+    def forward(self, x_q, x_k, x_v):  # x_q:(Tq,B,H), x_k:(Tk,B,H), x_v:(Tk,B,H)
         Tq, B, H = x_q.shape
-        Tk, B2, H2 = x_kv.shape
-        assert B == B2 and H == H2, "Batch/hidden dims must match"
+        Tk, B2, H2 = x_k.shape
+        Tv, B3, H3 = x_v.shape
+        assert (B == B2 == B3) and (H == H2 == H3) and (Tk == Tv), "shape mismatch"
 
         nh = self.num_heads
         hd = self.head_dim
 
-        # Project
-        q = self.W_q(x_q)   # (Tq,B,H)
-        k = self.W_k(x_kv)  # (Tk,B,H)
-        v = self.W_v(x_kv)  # (Tk,B,H)
+        q = self.W_q(x_q)  # (Tq,B,H)
+        k = self.W_k(x_k)  # (Tk,B,H)
+        v = self.W_v(x_v)  # (Tk,B,H)
 
-        # Reshape to (B, nh, T*, hd)
         q = q.view(Tq, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tq,hd)
         k = k.view(Tk, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tk,hd)
         v = v.view(Tk, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tk,hd)
 
-        # Attention logits: (B,nh,Tq,Tk)
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,nh,Tq,Tk)
 
         if self.causal and self.training:
             if Tq == Tk:
-                # training case: full sequences, enforce "no look-ahead"
                 causal_mask = torch.tril(
                     torch.ones(Tq, Tk, device=x_q.device, dtype=torch.bool),
                     diagonal=0,
-                )  # 1 for j < i
+                )
                 attn_logits = attn_logits.masked_fill(
                     ~causal_mask.view(1, 1, Tq, Tk), float("-inf")
                 )
             else:
-                # rollout case (e.g. Tq=1, Tk=t): all keys are past -> no mask needed
+                # rollout case: Tq=1, Tk=t_past -> all keys are past, no mask needed
                 pass
 
-        attn = F.softmax(attn_logits, dim=-1)        # (B,nh,Tq,Tk)
-        out  = torch.matmul(attn, v)                 # (B,nh,Tq,hd)
+        attn = F.softmax(attn_logits, dim=-1)
+        out  = torch.matmul(attn, v)  # (B,nh,Tq,hd)
 
-        # Back to (Tq,B,H)
-        out = out.permute(2, 0, 1, 3).contiguous().view(Tq, B, H)
-        out = self.out(out)
-        return out
+        out = out.permute(2, 0, 1, 3).contiguous().view(Tq, B, H)  # (Tq,B,H)
+        return self.out(out)
+
 
 
 class BanditLearner(nn.Module):
@@ -317,15 +312,19 @@ class BanditLearner(nn.Module):
                 h_rnn             # (1, B, H)
             )                     # rnn_out: (T, B, H)  (RAW GRU outcome tokens)
 
-            # Query tokens (trial-start) from the current observation; swap-invariant if randomize_sides=True
-            q = self.pair_query_token(left_feats, right_feats)  # (T, B, H)
+            # Query tokens from current observation (swap-invariant)
+            q = self.pair_query_token(left_feats, right_feats)  # (T,B,H)
 
-            # Interleave [q0, o0, q1, o1, ..., qT-1, oT-1]
-            rnn_out_past = torch.zeros_like(rnn_out)
-            rnn_out_past[1:] = rnn_out[:-1]
-            ctx = self.attn(q, rnn_out_past)
+            # Past keys = past pair tokens, past values = past outcome tokens
+            q_past = torch.zeros_like(q)
+            o_past = torch.zeros_like(rnn_out)
+            q_past[1:] = q[:-1]
+            o_past[1:] = rnn_out[:-1]
 
+            ctx = self.attn(q, q_past, o_past)  # (T,B,H)
 
+            # (optional but recommended) match rollout behavior on t=0
+            ctx[0] = q[0]
 
 
             reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T,B,2)
