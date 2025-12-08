@@ -46,47 +46,62 @@ def log_prob_tanh_normal(action, mean, log_std, eps=1e-6):
     return log_prob - corr
 
 
-class MultiHeadCausalSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads):
+class MultiHeadCausalCrossAttention(nn.Module):
+    def __init__(self, dim, num_heads, causal=True):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.causal = causal
 
-        # Project to Q, K, V jointly
-        self.qkv = nn.Linear(dim, 3 * dim)
+        # Separate projections for Q and K/V
+        self.W_q = nn.Linear(dim, dim)
+        self.W_k = nn.Linear(dim, dim)
+        self.W_v = nn.Linear(dim, dim)
         self.out = nn.Linear(dim, dim)
 
-    def forward(self, x):  # x: (T, B, H)
-        T, B, H = x.shape
+    def forward(self, x_q, x_kv):  # x_q: (Tq,B,H), x_kv: (Tk,B,H)
+        Tq, B, H = x_q.shape
+        Tk, B2, H2 = x_kv.shape
+        assert B == B2 and H == H2, "Batch/hidden dims must match"
 
-        qkv = self.qkv(x)                 # (T,B,3H)
-        q, k, v = qkv.chunk(3, dim=-1)    # each (T,B,H)
+        nh = self.num_heads
+        hd = self.head_dim
 
-        # reshape heads: (T,B,nh,hd)
-        q = q.view(T, B, self.num_heads, self.head_dim)
-        k = k.view(T, B, self.num_heads, self.head_dim)
-        v = v.view(T, B, self.num_heads, self.head_dim)
+        # Project
+        q = self.W_q(x_q)   # (Tq,B,H)
+        k = self.W_k(x_kv)  # (Tk,B,H)
+        v = self.W_v(x_kv)  # (Tk,B,H)
 
-        # permute: (B,nh,T,hd)
-        q = q.permute(1, 2, 0, 3)
-        k = k.permute(1, 2, 0, 3)
-        v = v.permute(1, 2, 0, 3)
+        # Reshape to (B, nh, T*, hd)
+        q = q.view(Tq, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tq,hd)
+        k = k.view(Tk, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tk,hd)
+        v = v.view(Tk, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tk,hd)
 
-        # attention logits: (B,nh,T,T)
+        # Attention logits: (B,nh,Tq,Tk)
         attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # causal mask
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        attn_logits = attn_logits.masked_fill(~causal_mask.view(1, 1, T, T), float("-inf"))
+        if self.causal:
+            if Tq == Tk:
+                # training case: full sequences, enforce "no look-ahead"
+                causal_mask = torch.tril(
+                    torch.ones(Tq, Tk, device=x_q.device, dtype=torch.bool),
+                    diagonal=-1,
+                )  # 1 for j < i
+                attn_logits = attn_logits.masked_fill(
+                    ~causal_mask.view(1, 1, Tq, Tk), float("-inf")
+                )
+            else:
+                # rollout case (e.g. Tq=1, Tk=t): all keys are past -> no mask needed
+                pass
 
-        attn = F.softmax(attn_logits, dim=-1)  # (B,nh,T,T)
-        out = torch.matmul(attn, v)            # (B,nh,T,hd)
+        attn = F.softmax(attn_logits, dim=-1)        # (B,nh,Tq,Tk)
+        out  = torch.matmul(attn, v)                 # (B,nh,Tq,hd)
 
-        # back to (T,B,H)
-        out = out.permute(2, 0, 1, 3).contiguous().view(T, B, H)
+        # Back to (Tq,B,H)
+        out = out.permute(2, 0, 1, 3).contiguous().view(Tq, B, H)
         out = self.out(out)
         return out
 
@@ -105,7 +120,7 @@ class BanditLearner(nn.Module):
 
         # --- Bandit RNN + heads
         self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
-        self.attn = MultiHeadCausalSelfAttention(rnn_hidden_size, 4)
+        self.attn = MultiHeadCausalCrossAttention(rnn_hidden_size, 4, causal=True)
 
         # Project a swap-invariant pair descriptor to a query token for attention
         # Input will be concat([left+right, |left-right|]) so dim = 2*feature_dim
@@ -306,15 +321,10 @@ class BanditLearner(nn.Module):
             q = self.pair_query_token(left_feats, right_feats)  # (T, B, H)
 
             # Interleave [q0, o0, q1, o1, ..., qT-1, oT-1]
-            T_, B_, H_ = rnn_out.shape
-            seq2 = torch.empty((2 * T_, B_, H_), device=rnn_out.device, dtype=rnn_out.dtype)
-            seq2[0::2] = q
-            seq2[1::2] = rnn_out
+            ctx = self.attn(q, rnn_out)   # (T,B,H)
 
-            attn2 = self.attn(seq2)   # (2T, B, H)
-            ctx  = attn2[0::2]        # (T, B, H) contexts at query positions
 
-            reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T, B, 2)
+            reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T,B,2)
             left_logits   = reward_logits[..., 0]
             right_logits  = reward_logits[..., 1]
 
@@ -331,6 +341,7 @@ class BanditLearner(nn.Module):
             )
 
             var_logp_loss = logp_rewards.mean()
+
 
             # (optional) KL term kept from your code (unused in final loss unless you re-enable it)
             eps = 1e-8
