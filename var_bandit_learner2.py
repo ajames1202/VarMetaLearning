@@ -83,12 +83,12 @@ class MultiHeadCausalCrossAttention(nn.Module):
         # Attention logits: (B,nh,Tq,Tk)
         attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        if self.causal:
+        if self.causal and self.training:
             if Tq == Tk:
                 # training case: full sequences, enforce "no look-ahead"
                 causal_mask = torch.tril(
                     torch.ones(Tq, Tk, device=x_q.device, dtype=torch.bool),
-                    diagonal=-1,
+                    diagonal=0,
                 )  # 1 for j < i
                 attn_logits = attn_logits.masked_fill(
                     ~causal_mask.view(1, 1, Tq, Tk), float("-inf")
@@ -321,7 +321,11 @@ class BanditLearner(nn.Module):
             q = self.pair_query_token(left_feats, right_feats)  # (T, B, H)
 
             # Interleave [q0, o0, q1, o1, ..., qT-1, oT-1]
-            ctx = self.attn(q, rnn_out)   # (T,B,H)
+            rnn_out_past = torch.zeros_like(rnn_out)
+            rnn_out_past[1:] = rnn_out[:-1]
+            ctx = self.attn(q, rnn_out_past)
+
+
 
 
             reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T,B,2)
