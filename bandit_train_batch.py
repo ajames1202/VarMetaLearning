@@ -280,7 +280,7 @@ class RolloutWorker:
             session_K=session_K,
             session_N=session_N,
             trial_ms=3000,
-            randomize_sides=False,
+            randomize_sides=True,
             shuffle=False,
         )
 
