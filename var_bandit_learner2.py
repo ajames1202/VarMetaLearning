@@ -61,7 +61,7 @@ class MultiHeadCausalCrossAttention(nn.Module):
         self.W_v = nn.Linear(dim, dim)
         self.out = nn.Linear(dim, dim)
 
-    def forward(self, x_q, x_k, x_v):  # x_q:(Tq,B,H), x_k:(Tk,B,H), x_v:(Tk,B,H)
+    def forward(self, x_q, x_k, x_v, causal_diagonal=0):  # x_q:(Tq,B,H), x_k:(Tk,B,H), x_v:(Tk,B,H)
         Tq, B, H = x_q.shape
         Tk, B2, H2 = x_k.shape
         Tv, B3, H3 = x_v.shape
@@ -84,14 +84,12 @@ class MultiHeadCausalCrossAttention(nn.Module):
             if Tq == Tk:
                 causal_mask = torch.tril(
                     torch.ones(Tq, Tk, device=x_q.device, dtype=torch.bool),
-                    diagonal=0,
+                    diagonal=causal_diagonal,
                 )
                 attn_logits = attn_logits.masked_fill(
                     ~causal_mask.view(1, 1, Tq, Tk), float("-inf")
                 )
-            else:
-                # rollout case: Tq=1, Tk=t_past -> all keys are past, no mask needed
-                pass
+
 
         attn = F.softmax(attn_logits, dim=-1)
         out  = torch.matmul(attn, v)  # (B,nh,Tq,hd)
@@ -316,15 +314,14 @@ class BanditLearner(nn.Module):
             q = self.pair_query_token(left_feats, right_feats)  # (T,B,H)
 
             # Past keys = past pair tokens, past values = past outcome tokens
-            q_past = torch.zeros_like(q)
-            o_past = torch.zeros_like(rnn_out)
-            q_past[1:] = q[:-1]
-            o_past[1:] = rnn_out[:-1]
+            # instead of q_past/o_past shifting:
+            k = q
+            v = rnn_out
 
-            ctx = self.attn(q, q_past, o_past)  # (T,B,H)
+            # modify your attention to accept diagonal (or just hardcode here)
+            ctx = self.attn(q, k, v, causal_diagonal=-1)  # strictly past only
+            ctx[0] = q[0]  # match rollout "no history" behavior
 
-            # (optional but recommended) match rollout behavior on t=0
-            ctx[0] = q[0]
 
 
             reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T,B,2)
@@ -392,6 +389,9 @@ class BanditLearner(nn.Module):
                 motor_loss_sum += float(motor_loss_mini.item())
                 motor_slices += 1
 
+            
+            torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), 1.0)
+            torch.nn.utils.clip_grad_norm_(list(self.motor_parameters()), 1.0)
             optim_bandit.step()
             optim_motor.step()
 
