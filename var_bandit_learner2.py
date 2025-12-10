@@ -310,21 +310,31 @@ class BanditLearner(nn.Module):
                 h_rnn             # (1, B, H)
             )                     # rnn_out: (T, B, H)  (RAW GRU outcome tokens)
 
-            # Query tokens from current observation (swap-invariant)
-            q = self.pair_query_token(left_feats, right_feats)  # (T,B,H)
+            # # Query tokens from current observation (swap-invariant)
+            q_all = self.pair_query_token(left_feats, right_feats)  # (T,B,H)
 
-            # Past keys = past pair tokens, past values = past outcome tokens
-            # instead of q_past/o_past shifting:
-            k = q
-            v = rnn_out
+            # We want: for timestep t >= 1, attend over (0..t-1)
+            # Build a context tensor we will fill.
+            ctx = torch.zeros_like(q_all)
 
-            # modify your attention to accept diagonal (or just hardcode here)
-            ctx = self.attn(q, k, v, causal_diagonal=-1)  # strictly past only
-            ctx[0] = q[0]  # match rollout "no history" behavior
+            T = q_all.size(0)
+            if T > 1:
+                # queries for times 1..T-1
+                q_now = q_all[1:]          # (T-1,B,H)
+                # keys/values for times 0..T-2  (strictly past relative to q_now)
+                k_hist = q_all[:-1]        # (T-1,B,H)
+                v_hist = rnn_out[:-1]      # (T-1,B,H)
 
+                # causal mask with diagonal=0 is fine here:
+                # for row i (orig time t=i+1), allowed keys j <= i (orig times 0..i) -> all past steps
+                ctx_past = self.attn(q_now, k_hist, v_hist)  # (T-1,B,H)
+                ctx[1:] = ctx_past
 
+            # t=0 has no history, so we just use the local pair token
+            ctx[0] = q_all[0]
 
             reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T,B,2)
+
             left_logits   = reward_logits[..., 0]
             right_logits  = reward_logits[..., 1]
 
