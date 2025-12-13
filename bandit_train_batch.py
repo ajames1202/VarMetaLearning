@@ -75,7 +75,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             print(*args, **kwargs)
 
     h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # GRU hidden state
-    q_tokens = []   # past pair keys (1,H)
+    q_left_tokens = []   # past pair keys (1,H)
+    q_right_tokens = []   # past pair keys (1,H)
+    k_tokens = []   # past keys (1,H)
     o_tokens = []   # past outcome values (1,H)
     q_this_trial = None
 
@@ -126,27 +128,38 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
 
             # Build query token (swap-invariant) and attend over history
             # Build query token (swap-invariant) and attend over history
-            q_t = agent.pair_query_token(left_feats, right_feats)  # (1,H)
-            q_this_trial = q_t  # save until trial ends
+            q_left = agent.q_in(left_feats)    # (T,B,H)
+            q_right = agent.q_in(right_feats)  # (T,B,H)
+
+
 
             Tpast = len(o_tokens)
             if Tpast == 0:
-                h_ctx = q_t
+                ctx_left  = q_left.unsqueeze(0)    # (1,1,H)
+                ctx_right = q_right.unsqueeze(0)   # (1,1,H)
             else:
-                q_seq = q_t.unsqueeze(0)                 # (1,1,H)
-                k_seq = torch.stack(q_tokens, dim=0)     # (Tpast,1,H)
-                v_seq = torch.stack(o_tokens, dim=0)     # (Tpast,1,H)
+                # query is CURRENT token (len=1)
+                ql = q_left.unsqueeze(0)           # (1,1,H)
+                qr = q_right.unsqueeze(0)          # (1,1,H)
 
-                ctx = agent.attn(q_seq, k_seq, v_seq)    # (1,1,H)
-                h_ctx = ctx[0]                           # (1,H)
+                # keys/values are PAST tokens
+                k = torch.stack(k_tokens, dim=0)   # (Tpast,1,H)
+                v = torch.stack(o_tokens, dim=0)   # (Tpast,1,H)
 
-            reward_logits = agent.reward_compute(h_ctx, left_feats, right_feats).squeeze(0)
+                # IMPORTANT: don't use is_causal here (query len is 1; causal would only allow key index 0)
+                ctx_left,  _ = agent.attn(ql, k, v, need_weights=False)
+                ctx_right, _ = agent.attn(qr, k, v, need_weights=False)
+
+
+            left_logits  = agent.reward_compute(ctx_left,  left_feats.unsqueeze(0))   # (1,1,F)
+            right_logits = agent.reward_compute(ctx_right, right_feats.unsqueeze(0))
 
 
             # Thompson sampling (same as your code)
             eps = 1e-4
-            probs = torch.sigmoid(reward_logits).clamp(eps, 1.0 - eps)
-            p_left, p_right = probs[0], probs[1]
+            probs = torch.sigmoid(torch.cat([left_logits, right_logits], dim=-1)).clamp(eps, 1.0 - eps)
+            p_left, p_right = probs[0,0], probs[0,1]
+
 
             concentration = 5.0
             alpha_left  = p_left  * concentration + 1.0
@@ -214,8 +227,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # rnn_fwd returns RAW GRU out for this trial (outcome token)
             o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
             o_tokens.append(o_t)
-            q_tokens.append(q_this_trial)
-            q_this_trial = None
+            q_left_t = agent.q_in(left_feats)    # (1,H)
+            q_right_t = agent.q_in(right_feats)  # (1,H)
+            q_left_tokens.append(q_left_t)  
+            q_right_tokens.append(q_right_t)
+            pair_key = q_left_t + q_right_t  # (1,H)
+            k_tokens.append(pair_key)
 
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1

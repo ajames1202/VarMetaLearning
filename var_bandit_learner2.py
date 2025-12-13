@@ -46,59 +46,6 @@ def log_prob_tanh_normal(action, mean, log_std, eps=1e-6):
     return log_prob - corr
 
 
-class MultiHeadCausalCrossAttention(nn.Module):
-    def __init__(self, dim, num_heads, causal=True):
-        super().__init__()
-        assert dim % num_heads == 0
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.causal = causal
-
-        self.W_q = nn.Linear(dim, dim)
-        self.W_k = nn.Linear(dim, dim)
-        self.W_v = nn.Linear(dim, dim)
-        self.out = nn.Linear(dim, dim)
-
-    def forward(self, x_q, x_k, x_v, causal_diagonal=0):  # x_q:(Tq,B,H), x_k:(Tk,B,H), x_v:(Tk,B,H)
-        Tq, B, H = x_q.shape
-        Tk, B2, H2 = x_k.shape
-        Tv, B3, H3 = x_v.shape
-        assert (B == B2 == B3) and (H == H2 == H3) and (Tk == Tv), "shape mismatch"
-
-        nh = self.num_heads
-        hd = self.head_dim
-
-        q = self.W_q(x_q)  # (Tq,B,H)
-        k = self.W_k(x_k)  # (Tk,B,H)
-        v = self.W_v(x_v)  # (Tk,B,H)
-
-        q = q.view(Tq, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tq,hd)
-        k = k.view(Tk, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tk,hd)
-        v = v.view(Tk, B, nh, hd).permute(1, 2, 0, 3)  # (B,nh,Tk,hd)
-
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,nh,Tq,Tk)
-
-        if self.causal and self.training:
-            if Tq == Tk:
-                causal_mask = torch.tril(
-                    torch.ones(Tq, Tk, device=x_q.device, dtype=torch.bool),
-                    diagonal=causal_diagonal,
-                )
-                attn_logits = attn_logits.masked_fill(
-                    ~causal_mask.view(1, 1, Tq, Tk), float("-inf")
-                )
-
-
-        attn = F.softmax(attn_logits, dim=-1)
-        out  = torch.matmul(attn, v)  # (B,nh,Tq,hd)
-
-        out = out.permute(2, 0, 1, 3).contiguous().view(Tq, B, H)  # (Tq,B,H)
-        return self.out(out)
-
-
-
 class BanditLearner(nn.Module):
     def __init__(self, input_size, feature_dim, rnn_hidden_size, action_dim,
                  log_std_min=-5.0, log_std_max=-1.0,
@@ -113,14 +60,9 @@ class BanditLearner(nn.Module):
 
         # --- Bandit RNN + heads
         self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
-        self.attn = MultiHeadCausalCrossAttention(rnn_hidden_size, 4, causal=True)
-
-        # Project a swap-invariant pair descriptor to a query token for attention
-        # Input will be concat([left+right, |left-right|]) so dim = 2*feature_dim
-        self.obs_proj = nn.Sequential(
-            nn.Linear(2 * feature_dim, rnn_hidden_size),
-            nn.Tanh(),
-        )
+        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4)
+        
+        self.q_in = nn.Linear(feature_dim, rnn_hidden_size, bias=False)
 
         self.arm_reward_head = nn.Sequential(
             nn.Linear(rnn_hidden_size + feature_dim, 128),
@@ -158,7 +100,7 @@ class BanditLearner(nn.Module):
         modules += [
             self.rnn,
             self.attn,
-            self.obs_proj,
+            self.q_in,
             self.arm_reward_head,
             self.enc
             # self.fam_head,   # if you use familiarity as bandit aux
@@ -186,16 +128,7 @@ class BanditLearner(nn.Module):
         # x = self.downsample(x)  # (T, C, H, W)
         return self.enc(x)
 
-    def pair_query_token(self, left_feat, right_feat):
-        """Swap-invariant query token for current (left,right) pair.
-
-        left_feat/right_feat: (1,F) or (T,F) or (T,B,F)
-        returns: (...,H)
-        """
-        s = left_feat + right_feat
-        d = torch.abs(left_feat - right_feat)
-        return self.obs_proj(torch.cat([s, d], dim=-1))
-
+    
     def rnn_fwd(self, left_feats, right_feats, action, reward, meta_ep_start, h):
         """
         left_feats/right_feats: (T, F) or (T, B, F)
@@ -233,11 +166,10 @@ class BanditLearner(nn.Module):
         else:
             raise ValueError(f"Unexpected input rank {x.dim()} for rnn_fwd")
 
-    def reward_compute(self, h, left_feat, right_feat):
+    def reward_compute(self, h, feats):
         # h: (T,B,H) or (1,H)
-        l = self.arm_reward_head(torch.cat([h, left_feat],  dim=-1)).squeeze(-1)
-        r = self.arm_reward_head(torch.cat([h, right_feat], dim=-1)).squeeze(-1)
-        return torch.stack([l, r], dim=-1)  # (...,2)
+        l = self.arm_reward_head(torch.cat([h, feats],  dim=-1))
+        return l  # (...,2)
 
     def motor_fwd(self, choice_target, xy_pos=None, goal_vec=None):
         pos_emb  = self.mlp_pos(xy_pos)
@@ -311,38 +243,38 @@ class BanditLearner(nn.Module):
             )                     # rnn_out: (T, B, H)  (RAW GRU outcome tokens)
 
             # # Query tokens from current observation (swap-invariant)
-            q_all = self.pair_query_token(left_feats, right_feats)  # (T,B,H)
+            q_left_all  = self.q_in(left_feats)     # (T,B,H)
+            q_right_all = self.q_in(right_feats)    # (T,B,H)
+            pair_key_all = q_left_all + q_right_all # (T,B,H)
 
-            # We want: for timestep t >= 1, attend over (0..t-1)
-            # Build a context tensor we will fill.
-            ctx = torch.zeros_like(q_all)
+            q_left_q  = q_left_all[1:]              # queries at t=1..T-1
+            q_right_q = q_right_all[1:]
 
-            T = q_all.size(0)
-            if T > 1:
-                # queries for times 1..T-1
-                q_now = q_all[1:]          # (T-1,B,H)
-                # keys/values for times 0..T-2  (strictly past relative to q_now)
-                k_hist = q_all[:-1]        # (T-1,B,H)
-                v_hist = rnn_out[:-1]      # (T-1,B,H)
+            k_hist = pair_key_all[:-1]              # keys at t=0..T-2  
+            v_hist = rnn_out[:-1]                   # vals at t=0..T-2  
 
-                # causal mask with diagonal=0 is fine here:
-                # for row i (orig time t=i+1), allowed keys j <= i (orig times 0..i) -> all past steps
-                ctx_past = self.attn(q_now, k_hist, v_hist)  # (T-1,B,H)
-                ctx[1:] = ctx_past
-
+            ctx_l, _ = self.attn(q_left_q,  k_hist, v_hist, is_causal=True)
+            ctx_r, _ = self.attn(q_right_q, k_hist, v_hist, is_causal=True)
             # t=0 has no history, so we just use the local pair token
-            ctx[0] = q_all[0]
+            ctx_left = ctx_l.new_zeros(T, B, q_left_all.size(-1)) #
+            ctx_left[0]  = q_left_all[0]
+            ctx_right = ctx_r.new_zeros(T, B, q_right_all.size(-1)) # (T,B,H)
+            ctx_right[0] = q_right_all[0]
 
-            reward_logits = self.reward_compute(ctx, left_feats, right_feats)  # (T,B,2)
+            ctx_left[1:]  = ctx_l      
+            ctx_right[1:] = ctx_r      
 
-            left_logits   = reward_logits[..., 0]
-            right_logits  = reward_logits[..., 1]
+
+            left_logits = self.reward_compute(ctx_left, left_feats)  # (T,B,1)
+            right_logits = self.reward_compute(ctx_right, right_feats)  # (T,B,1)
+
 
             p_left_rwd  = torch.distributions.Bernoulli(logits=left_logits)
             p_right_rwd = torch.distributions.Bernoulli(logits=right_logits)
 
-            logp_left  = p_left_rwd.log_prob(rewards_bandits)
-            logp_right = p_right_rwd.log_prob(rewards_bandits)
+            
+            logp_left  = p_left_rwd.log_prob(rewards_rnn)
+            logp_right = p_right_rwd.log_prob(rewards_rnn)
 
             logp_rewards = torch.where(
                 chosen_bandits[..., 0] == 1,
@@ -355,12 +287,12 @@ class BanditLearner(nn.Module):
 
             # (optional) KL term kept from your code (unused in final loss unless you re-enable it)
             eps = 1e-8
-            probs = torch.sigmoid(reward_logits)
-            prior_p = 0.5
-            var_kl_loss = (
-                probs * (torch.log(probs + eps) - math.log(prior_p)) +
-                (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
-            ).sum(dim=-1).mean()
+            # probs = torch.sigmoid(reward_logits)
+            # prior_p = 0.5
+            # var_kl_loss = (
+            #     probs * (torch.log(probs + eps) - math.log(prior_p)) +
+            #     (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
+            # ).sum(dim=-1).mean()
 
             variational_loss = -var_logp_loss
             variational_loss.backward()
