@@ -253,8 +253,17 @@ class BanditLearner(nn.Module):
             k_hist = pair_key_all[:-1]              # keys at t=0..T-2  
             v_hist = rnn_out[:-1]                   # vals at t=0..T-2  
 
-            ctx_l, _ = self.attn(q_left_q,  k_hist, v_hist, is_causal=True)
-            ctx_r, _ = self.attn(q_right_q, k_hist, v_hist, is_causal=True)
+            L = q_left_q.size(0)  # query length (T-1)
+
+            # mask future keys: shape (L, L), True means "masked"
+            attn_mask = torch.triu(
+                torch.ones((L, L), device=q_left_q.device, dtype=torch.bool),
+                diagonal=1
+            )
+
+
+            ctx_l, _ = self.attn(q_left_q,  k_hist, v_hist, attn_mask=attn_mask)
+            ctx_r, _ = self.attn(q_right_q, k_hist, v_hist, attn_mask=attn_mask)
             # t=0 has no history, so we just use the local pair token
             ctx_left = ctx_l.new_zeros(T, B, q_left_all.size(-1)) #
             ctx_left[0]  = q_left_all[0]
