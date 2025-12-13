@@ -78,6 +78,22 @@ class RolloutWorker:
                 print_this_session=print_this_session
             )
 
+def extract_lr_views(obs_tensor, env, crop_size=112, pad=6):
+    lr = env.unwrapped.left_rect
+    rr = env.unwrapped.right_rect
+    _, _, H, W = obs_tensor.shape
+
+    y1 = max(min(lr.top, rr.top) - pad, 0)
+    y2 = min(max(lr.bottom, rr.bottom) + pad, H)
+
+    def crop_resize(rect):
+        x1 = max(rect.left - pad, 0)
+        x2 = min(rect.right + pad, W)
+        patch = obs_tensor[:, :, y1:y2, x1:x2]
+        patch = F.interpolate(patch, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+        return patch
+
+    return crop_resize(lr), crop_resize(rr)
 
 
 def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
@@ -128,7 +144,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     goal_vec_buf = []
     feats_motor = []
     chosen_bandits_motor_buf = []
-    obs_bandit = []
+    left_obs = []
+    right_obs = []
     feats_bandit = []
     chosen_bandits_buf = []
     bandit_rewards_buf = []
@@ -154,10 +171,16 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if ep_start_flag == 1.0:
                 # build single-step tensors as (1, D)
             # f1  = features.unsqueeze(0)        # (1, F)
-            small = agent.downsample(obs_tensor)
-            f1 = agent.encode(small)                                # (1, F)
-            obs_bandit.append(small.squeeze(0).detach().cpu().numpy())  # (C,H,W)
-            trial_feat = agent.encode(small).detach()     # (1,F) cache THIS
+            left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
+
+            left_feats = agent.encode(left_view) # (F,) for this step
+            right_feats = agent.encode(right_view) # (F,) for this step
+
+
+            # f1 = agent.encode(small)                                # (1, F)
+            left_obs.append(left_view.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+            right_obs.append(right_view.squeeze(0).detach().cpu().numpy())  # (C,H,W)
+
             trial_action = choice_target                 # cache action too
 
 
@@ -168,7 +191,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # --- Bandit forward for choice (Thompson sampling with Bernoulli head) ---
 
             # 1) Get logits from the bandit head using current RNN state
-            reward_logits = agent.reward_compute(h_rnn, f1).squeeze(0) # (2,) -> [logit_left, logit_right]
+            reward_logits = agent.reward_compute(h_rnn, left_feats,right_feats).squeeze(0) # (2,) -> [logit_left, logit_right]
 
             # 2) Convert logits -> probabilities
             eps = 1e-4
@@ -244,12 +267,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             
             a_oh        = choice_target                                           # (1, 2) one-hot choice
             r_t         = torch.tensor([[float(reward)]], device=device)          # corrected 0/1
-            dummy_out, h_rnn, history = agent.rnn_fwd(trial_feat, trial_action, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
+            dummy_out, h_rnn, history = agent.rnn_fwd(left_feats, right_feats, trial_action, r_t, meta_ep_start_torch, history=history)           # update history and h_rnn
             
             # feat_np = f1.squeeze(0).detach().cpu().numpy()  # (F,)
-            trial_feats.append(trial_feat)
-            trial_pair_ids.append(pair_idx_now)
-            pair_features[pair_idx_now].append(trial_feat)
+            # trial_feats.append(trial_feat)
+            # trial_pair_ids.append(pair_idx_now)
+            # pair_features[pair_idx_now].append(trial_feat)
 
 
 
@@ -274,7 +297,6 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             ep_start_flag = 1.0
             # print("Trial ended. t=", t, ", pair_index_ep=", pair_index_ep, ", pair_idx_t=", pair_idx_t,  ", choice_target:", choice_target, "reward:", reward, ", done_buf[t]=", done_buf[t])
 
-            feats_bandit.append(f1.squeeze(0).detach().cpu().numpy())  # (F,)
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())  # (2,)
             bandit_rewards_buf.append(reward)  # scalar
 

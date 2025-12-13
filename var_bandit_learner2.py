@@ -82,13 +82,17 @@ class BanditLearner(nn.Module):
             nn.TransformerEncoderLayer(d_model=self.hidden_size, nhead=4, dim_feedforward=256, dropout=0.0),
             num_layers=2
         )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+
 
         # choice_inp = rnn_hidden_size
-        self.rewards_head = nn.Sequential(
-            nn.Linear(self.hidden_size + feature_dim, 128),
+        self.arm_reward_head = nn.Sequential(
+            nn.Linear(rnn_hidden_size + feature_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, 2)
+            nn.Linear(128, 1),
         )
+
 
         # self.choice_v_head = nn.Sequential(nn.Linear(combined_dim,128), nn.ReLU(), nn.Linear(128,1))
 
@@ -122,9 +126,14 @@ class BanditLearner(nn.Module):
     def generate_square_subsequent_mask(self, sz: int, device) -> torch.Tensor:
         return torch.triu(torch.full((sz, sz), float('-inf'), device=device), diagonal=1)
     
-    def rnn_fwd(self, features, action, reward, meta_ep_start, h=None, history=None):
-        x = torch.cat([features, action, reward, meta_ep_start], dim=-1).to(features.dtype).to(features.device)
+    def rnn_fwd(self, left_feats, right_feats, action, reward, meta_ep_start, h=None, history=None):
+        # x = torch.cat([features, action, reward, meta_ep_start], dim=-1).to(features.dtype).to(features.device)
+        aL = action[..., 0:1]          # (T,B,1)
+        aR = action[..., 1:2]
 
+        chosen_feat   = aL * left_feats  + aR * right_feats
+        unchosen_feat = aL * right_feats + aR * left_feats
+        x = torch.cat([chosen_feat, unchosen_feat, reward, meta_ep_start], dim=-1)
         if history is not None:
             # x should be (1, D). Keep it 2D so it matches history (t, D).
             if x.dim() == 1:
@@ -132,38 +141,47 @@ class BanditLearner(nn.Module):
 
             history = torch.cat([history, x], dim=0)  # (t+1, D)
 
-            seq_len = history.size(0)
-            seq = history.unsqueeze(1)  # (seq_len, 1, D)
+            
+            seq = history.unsqueeze(1)  # (T, 1, D)
             seq = self.input_proj(seq)
+            # --- append CLS at END so it can summarize the prefix ---
+            cls = self.cls_token.to(seq.dtype).to(seq.device).expand(1, seq.size(1), -1)  # (1, 1, H)
+            seq = torch.cat([seq, cls], dim=0)                 # (T+1, 1, H)
             seq = self.pos_enc(seq)
-            mask = self.generate_square_subsequent_mask(seq_len, seq.device)
-            out = self.transformer(seq, mask=mask)  # (seq_len, 1, hidden)
-            new_h = out[-1]  # (1, hidden)
-            return out[-1].squeeze(0), new_h, history
+
+            mask = self.generate_square_subsequent_mask(seq.size(0), seq.device)
+            out = self.transformer(seq, mask=mask)  # (T+1, 1, hidden)
+            out_cls = out[-1]                                  # (1, H) summary
+            new_h = out_cls
+            return out_cls.squeeze(0), new_h, history
 
 
         else:
             # batched full sequence mode
-            batched = x.dim() == 3
-            if not batched:
-                x = x.unsqueeze(1)
             seq = self.input_proj(x)
+            # append CLS at end
+            cls = self.cls_token.to(seq.dtype).to(seq.device).expand(1, seq.size(1), -1)  # (1, B, H)
+            seq = torch.cat([seq, cls], dim=0)                  # (T+1, B, H)
+
             seq = self.pos_enc(seq)
             seq_len = seq.size(0)
             mask = self.generate_square_subsequent_mask(seq_len, seq.device)
             out = self.transformer(seq, mask=mask)  # (T, B, H)
-            new_h = out[-1].unsqueeze(0)  # (1, B, H)
-            if not batched:
-                out = out.squeeze(1)
-                new_h = new_h.squeeze(1)
-            return out, new_h
+
+            out_x   = out[:-1]                                   # (T, B, H) per-step states (same shape you used before)
+            out_cls = out[-1]                                    # (B, H) final summary for whole sequence
+
+            new_h = out_cls.unsqueeze(0)                         # (1, B, H)
+
+            return out_x, new_h
     
     
-    def reward_compute(self, rnn_out, curr_feat):
-        # rnn_out: (S,H) or (1,H)
-        # curr_feat: (S,F) or (1,F)
-        x = torch.cat([rnn_out, curr_feat], dim=-1)
-        return self.rewards_head(x)  # (S,2) or (1,2)
+    def reward_compute(self, h, left_feat, right_feat):
+        # h: (T,B,H) or (1,H)
+        l = self.arm_reward_head(torch.cat([h, left_feat],  dim=-1)).squeeze(-1)
+        r = self.arm_reward_head(torch.cat([h, right_feat], dim=-1)).squeeze(-1)
+        return torch.stack([l, r], dim=-1)  # (...,2)
+
 
 
         
@@ -242,22 +260,20 @@ class BanditLearner(nn.Module):
         # 2) BANDIT data: batched (B, T, ...)
         # -----------------------------
         # bandit_obs: list of B tensors, each (T, C, H, W)
-        bandit_obs = torch.stack(bandit_obs, dim=0).to(device)            # (B, T, C, H, W)
+        left_obs  = torch.stack([torch.tensor(b["left"],  device=device, dtype=torch.float32) for b in bandit_obs], dim=0)  # (B,T,C,H,W)
+        right_obs = torch.stack([torch.tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)  # (B, T, 2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device) # (B, T)
         meta_ep_start = torch.stack(meta_ep_start_buf, dim=0).to(device)    # (B, T)
 
-        B, T = bandit_obs.shape[:2]
-        C, H, W = bandit_obs.shape[2:]
+        B, T, C, H, W = left_obs.shape
 
         # Reorder to time-major (T, B, ...)
-        bandit_obs     = bandit_obs.permute(1, 0, 2, 3, 4)         # (T, B, C, H, W)
         chosen_bandits = chosen_bandits.permute(1, 0, 2)           # (T, B, 2)
         rewards_bandits = rewards_bandits.permute(1, 0)            # (T, B)
         meta_ep_start   = meta_ep_start.permute(1, 0)              # (T, B)
 
         # Encode CNN features: flatten (T, B) -> (T*B, C, H, W)
-        bandit_obs_flat = bandit_obs.reshape(T * B, C, H, W)       # (T*B, C, H, W)
         # For GRU:
         rewards_rnn = rewards_bandits.unsqueeze(-1)    # (T, B, 1)
         start_rnn   = meta_ep_start.unsqueeze(-1)      # (T, B, 1)
@@ -275,12 +291,17 @@ class BanditLearner(nn.Module):
             # -----------------------------
             # 3) BANDIT loss
             # -----------------------------
-            feats_flat = self.encode(bandit_obs_flat)    # (T*B, F)
-            feats_bandit = feats_flat.view(T, B, -1)  # (T, B, F)
+            left_flat  = left_obs.reshape(B*T, C, H, W)
+            right_flat = right_obs.reshape(B*T, C, H, W)
+
+            left_feats  = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)   # (T,B,F)
+            right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)  # (T,B,F)
+
 
 
             rnn_out, _ = self.rnn_fwd(
-                feats_bandit,       # (T, B, F)
+                left_feats,       # (T, B, F)
+                right_feats,      # (T, B, F)
                 chosen_bandits,     # (T, B, 2)
                 rewards_rnn,        # (T, B, 1)
                 start_rnn,          # (T, B, 1)
@@ -290,7 +311,7 @@ class BanditLearner(nn.Module):
             h_seq_orig = torch.zeros_like(rnn_out)
             h_seq_orig[1:] = rnn_out[:-1]          # (T, B, H)
 
-            reward_logits = self.reward_compute(h_seq_orig, feats_bandit)  # (T, B, 2)
+            reward_logits = self.reward_compute(h_seq_orig, left_feats, right_feats)  # (T, B, 2)
             left_logits   = reward_logits[..., 0]  # (T, B)
             right_logits  = reward_logits[..., 1]  # (T, B)
 
