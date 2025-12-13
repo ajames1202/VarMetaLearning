@@ -158,7 +158,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # Thompson sampling (same as your code)
             eps = 1e-4
             probs = torch.sigmoid(torch.cat([left_logits, right_logits], dim=-1)).clamp(eps, 1.0 - eps)
-            p_left, p_right = probs[0,0], probs[0,1]
+            p_left  = probs[0, 0, 0]
+            p_right = probs[0, 0, 1]
+
 
 
             concentration = 5.0
