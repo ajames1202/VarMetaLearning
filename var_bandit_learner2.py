@@ -59,8 +59,8 @@ class BanditLearner(nn.Module):
         self.enc = CNNEncoder(feature_dim)
 
         # --- Bandit RNN + heads
-        self.rnn = nn.GRU(input_size=input_size, hidden_size=rnn_hidden_size)
-        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4)
+        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, kdim=rnn_hidden_size, vdim=input_size
+)
         
         self.q_in = nn.Linear(feature_dim, rnn_hidden_size, bias=False)
 
@@ -98,7 +98,6 @@ class BanditLearner(nn.Module):
         # everything that should be updated by bandit_loss
         modules = []
         modules += [
-            self.rnn,
             self.attn,
             self.q_in,
             self.arm_reward_head,
@@ -129,43 +128,6 @@ class BanditLearner(nn.Module):
         return self.enc(x)
 
     
-    def rnn_fwd(self, left_feats, right_feats, action, reward, meta_ep_start, h):
-        """
-        left_feats/right_feats: (T, F) or (T, B, F)
-        action:                (T, 2) or (T, B, 2)
-        reward/meta_ep_start:  (T, 1) or (T, B, 1)
-        h:                     (1, H) or (1, B, H)
-
-        Returns RAW GRU outputs (outcome tokens):
-          out:   (T, H) or (T, B, H)
-          new_h: (1, H) or (1, B, H)
-        """
-        aL = action[..., 0:1]
-        aR = action[..., 1:2]
-
-        chosen_feat   = aL * left_feats  + aR * right_feats
-        unchosen_feat = aL * right_feats + aR * left_feats
-
-        x = torch.cat([chosen_feat, unchosen_feat, reward, meta_ep_start], dim=-1).to(left_feats.dtype)
-
-        # Case 1: unbatched (T,D)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)  # (T,1,D)
-            if h is not None and h.dim() == 2:
-                h = h.unsqueeze(1)  # (1,1,H)
-            out, new_h = self.rnn(x, h)   # out: (T,1,H)
-            out = out.squeeze(1)          # (T,H)
-            new_h = new_h.squeeze(1)      # (1,H)
-            return out, new_h
-
-        # Case 2: batched (T,B,D)
-        elif x.dim() == 3:
-            out, new_h = self.rnn(x, h)   # out: (T,B,H)
-            return out, new_h
-
-        else:
-            raise ValueError(f"Unexpected input rank {x.dim()} for rnn_fwd")
-
     def reward_compute(self, h, feats):
         # h: (T,B,H) or (1,H)
         l = self.arm_reward_head(torch.cat([h, feats],  dim=-1))
@@ -225,7 +187,6 @@ class BanditLearner(nn.Module):
             # -----------------------------
             # 3) BANDIT loss (query/outcome interleaving)
             # -----------------------------
-            h_rnn = torch.zeros(1, B, self.rnn.hidden_size, device=device)
 
             left_flat  = left_obs.reshape(B*T, C, H, W)
             right_flat = right_obs.reshape(B*T, C, H, W)
@@ -233,14 +194,17 @@ class BanditLearner(nn.Module):
             left_feats  = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)   # (T,B,F)
             right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)  # (T,B,F)
 
-            rnn_out, h_rnn = self.rnn_fwd(
-                left_feats,       # (T, B, F)
-                right_feats,      # (T, B, F)
-                chosen_bandits,   # (T, B, 2)
-                rewards_rnn,      # (T, B, 1)
-                start_rnn,        # (T, B, 1)
-                h_rnn             # (1, B, H)
-            )                     # rnn_out: (T, B, H)  (RAW GRU outcome tokens)
+            
+            aL = chosen_bandits[..., 0:1]
+            aR = chosen_bandits[..., 1:2]
+
+            chosen_feat   = aL * left_feats  + aR * right_feats
+            unchosen_feat = aL * right_feats + aR * left_feats
+
+            x = torch.cat([chosen_feat, unchosen_feat, rewards_rnn, start_rnn], dim=-1).to(left_feats.dtype)
+
+
+
 
             # # Query tokens from current observation (swap-invariant)
             q_left_all  = self.q_in(left_feats)     # (T,B,H)
@@ -251,7 +215,7 @@ class BanditLearner(nn.Module):
             q_right_q = q_right_all[1:]
 
             k_hist = pair_key_all[:-1]              # keys at t=0..T-2  
-            v_hist = rnn_out[:-1]                   # vals at t=0..T-2  
+            v_hist = x[:-1]                   # vals at t=0..T-2  
 
             L = q_left_q.size(0)  # query length (T-1)
 

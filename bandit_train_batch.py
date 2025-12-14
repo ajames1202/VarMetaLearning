@@ -74,7 +74,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
-    h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # GRU hidden state
+    # h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # GRU hidden state
     q_left_tokens = []   # past pair keys (1,H)
     q_right_tokens = []   # past pair keys (1,H)
     k_tokens = []   # past keys (1,H)
@@ -223,12 +223,21 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
             meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
 
-            a_oh = choice_target
+            # a_oh = choice_target
             r_t  = torch.tensor([[float(reward)]], device=device, dtype=torch.float32)
 
             # rnn_fwd returns RAW GRU out for this trial (outcome token)
-            o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
-            o_tokens.append(o_t)
+            # o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
+            aL = choice_target[..., 0:1]
+            aR = choice_target[..., 1:2]
+
+            chosen_feat   = aL * left_feats  + aR * right_feats
+            unchosen_feat = aL * right_feats + aR * left_feats
+
+            x = torch.cat([chosen_feat, unchosen_feat, r_t, meta_ep_start_torch], dim=-1).to(left_feats.dtype)
+
+
+            o_tokens.append(x)
             q_left_t = agent.q_in(left_feats)    # (1,H)
             q_right_t = agent.q_in(right_feats)  # (1,H)
             q_left_tokens.append(q_left_t)  
