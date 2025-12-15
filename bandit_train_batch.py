@@ -234,7 +234,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             chosen_feat   = aL * left_feats  + aR * right_feats
             unchosen_feat = aL * right_feats + aR * left_feats
 
-            x = torch.cat([chosen_feat, unchosen_feat, r_t, meta_ep_start_torch], dim=-1).to(left_feats.dtype)
+            x = torch.cat([chosen_feat, r_t], dim=-1).to(left_feats.dtype)
 
 
             o_tokens.append(x)
@@ -242,7 +242,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             q_right_t = agent.q_in(right_feats)  # (1,H)
             q_left_tokens.append(q_left_t)  
             q_right_tokens.append(q_right_t)
-            pair_key = q_left_t + q_right_t  # (1,H)
+            #pair_key = q_left_t + q_right_t  # (1,H)
+            pair_key = agent.q_in(chosen_feat)  # (1,H)
             k_tokens.append(pair_key)
 
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
@@ -331,7 +332,7 @@ class RolloutWorker:
         # rebuild a fresh agent with same hyperparams as in main
         hidden_size = 128
         feature_dim = 128
-        input_size = 2*feature_dim + 1 + 1
+        input_size = feature_dim + 1
 
         agent = bl.BanditLearner(
             input_size=input_size,
@@ -381,7 +382,7 @@ if __name__ == "__main__":
 
     hidden_size = 128
     feature_dim = 128
-    input_size = 2*feature_dim + 1 + 1
+    input_size = feature_dim + 1
 
 
     agent = bl.BanditLearner(

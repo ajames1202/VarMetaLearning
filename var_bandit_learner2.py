@@ -201,7 +201,7 @@ class BanditLearner(nn.Module):
             chosen_feat   = aL * left_feats  + aR * right_feats
             unchosen_feat = aL * right_feats + aR * left_feats
 
-            x = torch.cat([chosen_feat, unchosen_feat, rewards_rnn, start_rnn], dim=-1).to(left_feats.dtype)
+            x = torch.cat([chosen_feat, rewards_rnn], dim=-1).to(left_feats.dtype)
 
 
 
@@ -209,7 +209,9 @@ class BanditLearner(nn.Module):
             # # Query tokens from current observation (swap-invariant)
             q_left_all  = self.q_in(left_feats)     # (T,B,H)
             q_right_all = self.q_in(right_feats)    # (T,B,H)
-            pair_key_all = q_left_all + q_right_all # (T,B,H)
+            
+            #pair_key_all = q_left_all + q_right_all # (T,B,H)
+            pair_key_all = self.q_in(chosen_feat)  # (T,B,H)
 
             q_left_q  = q_left_all[1:]              # queries at t=1..T-1
             q_right_q = q_right_all[1:]
