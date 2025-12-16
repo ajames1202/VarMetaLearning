@@ -251,10 +251,12 @@ class BanditLearner(nn.Module):
             logp_right = p_right_rwd.log_prob(rewards_rnn)
 
             logp_rewards = torch.where(
-                chosen_bandits[..., 0] == 1,
+                chosen_bandits[..., 0:1] == 1,
                 logp_left,
                 logp_right
             )
+
+            logp_rewards = logp_rewards.squeeze(-1)
 
             var_logp_loss = logp_rewards.mean()
 

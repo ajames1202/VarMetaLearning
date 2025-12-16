@@ -1,6 +1,6 @@
 # at top of bandit_train.py
 import ray
-
+from PIL import Image
 from typing import Any, Tuple, Dict
 import time
 import numpy as np
@@ -501,6 +501,28 @@ if __name__ == "__main__":
                 highR_perN_list.append(high_reward_choice_per_N)
                 cum_rewards_list.append(cum_rewards)
 
+
+                # ##### --- DEBUG: save one session's left/right crops to disk ---
+                # if update_idx == 0 and total_sessions_collected == 0:
+                #     print("Saving lrft/right images")
+                #     out_dir = f"debug_views/upd{update_idx:04d}_session{total_sessions_collected:03d}"
+                #     os.makedirs(out_dir, exist_ok=True)
+
+                #     left  = obs_bandit["left"]   # (T,3,112,112), float [0,1]
+                #     right = obs_bandit["right"]
+
+                #     T = left.shape[0]
+
+                #     for t in range(T):
+                #         # LEFT
+                #         img = (left[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                #         Image.fromarray(img).save(f"{out_dir}/left_{t:03d}.png")
+
+                #         # RIGHT
+                #         img = (right[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                #         Image.fromarray(img).save(f"{out_dir}/right_{t:03d}.png")
+
+
                 total_sessions_collected += 1
                 if total_sessions_collected >= B:
                     break  # in case we overshoot slightly with num_launch
@@ -532,6 +554,7 @@ if __name__ == "__main__":
                   f"mean_cum_rew={mean_cum_rew:.1f}")
 
 
+        #
         # print(
         #     f"[Update {update_idx+1}/{num_updates}] "
         #     f"sessions_in_batch={total_sessions_collected}, "
