@@ -59,8 +59,7 @@ class BanditLearner(nn.Module):
         self.enc = CNNEncoder(feature_dim)
 
         # --- Bandit RNN + heads
-        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, kdim=rnn_hidden_size, vdim=input_size
-)
+        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, kdim=rnn_hidden_size, vdim=input_size)
         
         self.q_in = nn.Linear(feature_dim, rnn_hidden_size, bias=False)
 
