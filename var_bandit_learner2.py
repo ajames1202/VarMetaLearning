@@ -4,6 +4,7 @@ from torch import nn
 from torchvision import transforms as T
 import torch.nn.functional as F
 import math
+from torchvision.models import shufflenet_v2_x0_5, ShuffleNet_V2_X0_5_Weights
 
 class CNNEncoder(nn.Module):
     """A small CNN for processing visual inputs (expects NCHW)."""
@@ -45,6 +46,52 @@ def log_prob_tanh_normal(action, mean, log_std, eps=1e-6):
     corr = torch.log(1 - torch.tanh(pretahn_actions).pow(2) + 1e-6).sum(dim=-1)
     return log_prob - corr
 
+def lr_repulsion_loss(left_feats, right_feats, margin=0.2):
+    # left_feats/right_feats: (T,B,F)
+    lf = left_feats.reshape(-1, left_feats.size(-1))
+    rf = right_feats.reshape(-1, right_feats.size(-1))
+    lf = F.normalize(lf, dim=-1)
+    rf = F.normalize(rf, dim=-1)
+    sim = (lf * rf).sum(dim=-1)          # cosine similarity in [-1,1]
+    return F.relu(sim - margin).mean()   # penalize if too similar
+
+
+def report_param_set(params, label):
+    params = list(params)
+    touched = 0
+    total = 0
+    for p in params:
+        total += 1
+        if p.grad is not None and float(p.grad.abs().sum()) != 0.0:
+            touched += 1
+    print(f"{label}: touched {touched}/{total} params")
+
+def debug_left_right_feats(left_feats, right_feats, tag=""):
+    # left_feats/right_feats: (T,B,F)
+    with torch.no_grad():
+        lf = left_feats.reshape(-1, left_feats.size(-1))   # (N,F)
+        rf = right_feats.reshape(-1, right_feats.size(-1)) # (N,F)
+
+        # normalize for cosine
+        lf_n = F.normalize(lf, dim=-1)
+        rf_n = F.normalize(rf, dim=-1)
+
+        cos_pair = (lf_n * rf_n).sum(dim=-1)            # (N,)
+        l2_pair  = (lf - rf).norm(dim=-1)               # (N,)
+
+        # random pairing baseline
+        perm = torch.randperm(rf.size(0), device=rf.device)
+        cos_rand = (lf_n * rf_n[perm]).sum(dim=-1)
+        l2_rand  = (lf - rf[perm]).norm(dim=-1)
+
+        print(f"[{tag}] cosine paired   mean/std: {cos_pair.mean():.3f} / {cos_pair.std():.3f}")
+        print(f"[{tag}] cosine random   mean/std: {cos_rand.mean():.3f} / {cos_rand.std():.3f}")
+        print(f"[{tag}] L2 paired       mean/std: {l2_pair.mean():.3f} / {l2_pair.std():.3f}")
+        print(f"[{tag}] L2 random       mean/std: {l2_rand.mean():.3f} / {l2_rand.std():.3f}")
+
+
+        
+
 
 class BanditLearner(nn.Module):
     def __init__(self, input_size, feature_dim, rnn_hidden_size, action_dim,
@@ -59,7 +106,7 @@ class BanditLearner(nn.Module):
         self.enc = CNNEncoder(feature_dim)
 
         # --- Bandit RNN + heads
-        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, kdim=rnn_hidden_size, vdim=input_size)
+        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, kdim=rnn_hidden_size, vdim=1)
         
         self.q_in = nn.Linear(feature_dim, rnn_hidden_size, bias=False)
 
@@ -68,6 +115,9 @@ class BanditLearner(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
+
+        # self.ctx_to_logit = nn.Linear(rnn_hidden_size, 1)
+
 
         # motor policy
         self.log_std_min = log_std_min
@@ -99,6 +149,7 @@ class BanditLearner(nn.Module):
         modules += [
             self.attn,
             self.q_in,
+            # self.ctx_to_logit,
             self.arm_reward_head,
             self.enc
             # self.fam_head,   # if you use familiarity as bandit aux
@@ -178,6 +229,7 @@ class BanditLearner(nn.Module):
         num_epochs = 1
         var_loss_sum, var_slices = 0.0, 0
         motor_loss_sum, motor_slices = 0.0, 0
+        left_feats, right_feats = None, None
 
         for _ in range(num_epochs):
             optim_motor.zero_grad(set_to_none=True)
@@ -200,16 +252,25 @@ class BanditLearner(nn.Module):
             chosen_feat   = aL * left_feats  + aR * right_feats
             unchosen_feat = aL * right_feats + aR * left_feats
 
-            x = torch.cat([chosen_feat, rewards_rnn], dim=-1).to(left_feats.dtype)
-
-
+            x = torch.cat([rewards_rnn], dim=-1).to(left_feats.dtype)
 
 
             # # Query tokens from current observation (swap-invariant)
             q_left_all  = self.q_in(left_feats)     # (T,B,H)
             q_right_all = self.q_in(right_feats)    # (T,B,H)
+
+            # with torch.no_grad():
+            #     ql = q_left_all.reshape(-1, q_left_all.size(-1))   # (T*B,H)
+            #     qr = q_right_all.reshape(-1, q_right_all.size(-1))
+
+            #     cos = F.cosine_similarity(ql, qr, dim=-1)
+            #     l2  = (ql - qr).norm(dim=-1)
+
+
+            #     print(f"[q] cosine mean/std: {cos.mean().item():.4f} / {cos.std().item():.4f}")
+            #     print(f"[q] L2     mean/std: {l2.mean().item():.4f} / {l2.std().item():.4f}")
+
             
-            #pair_key_all = q_left_all + q_right_all # (T,B,H)
             pair_key_all = self.q_in(chosen_feat)  # (T,B,H)
 
             q_left_q  = q_left_all[1:]              # queries at t=1..T-1
@@ -226,9 +287,43 @@ class BanditLearner(nn.Module):
                 diagonal=1
             )
 
+            
+            # with torch.no_grad():
+            #     E = self.attn.embed_dim
 
-            ctx_l, _ = self.attn(q_left_q,  k_hist, v_hist, attn_mask=attn_mask)
-            ctx_r, _ = self.attn(q_right_q, k_hist, v_hist, attn_mask=attn_mask)
+            #     if self.attn.in_proj_weight is not None:
+            #         W = self.attn.in_proj_weight
+            #         b = self.attn.in_proj_bias
+            #         Wq, Wk = W[:E], W[E:2*E]
+            #         bq = b[:E] if b is not None else None
+            #         bk = b[E:2*E] if b is not None else None
+            #     else:
+            #         # separate weights case
+            #         Wq = self.attn.q_proj_weight
+            #         Wk = self.attn.k_proj_weight
+            #         b = self.attn.in_proj_bias
+            #         bq = b[:E] if b is not None else None
+            #         bk = b[E:2*E] if b is not None else None
+
+            #     ql_p = F.linear(q_left_q,  Wq, bq)     # (L,B,E)
+            #     qr_p = F.linear(q_right_q, Wq, bq)
+            #     k_p  = F.linear(k_hist,    Wk, bk)     # (S,B,E)
+
+            #     scores_l = torch.einsum("lbe,sbe->bls", ql_p, k_p) / math.sqrt(E)
+            #     scores_r = torch.einsum("lbe,sbe->bls", qr_p, k_p) / math.sqrt(E)
+
+            #     print("[scores L] mean/std/min/max:",
+            #         scores_l.mean().item(), scores_l.std().item(),
+            #         scores_l.min().item(), scores_l.max().item())
+            #     print("[scores R] mean/std/min/max:",
+            #         scores_r.mean().item(), scores_r.std().item(),
+            #         scores_r.min().item(), scores_r.max().item())
+            #     print("[scores] mean |Δ|:", (scores_l - scores_r).abs().mean().item())
+
+
+
+            ctx_l, w_l = self.attn(q_left_q,  k_hist, v_hist, attn_mask=attn_mask)
+            ctx_r, w_r = self.attn(q_right_q, k_hist, v_hist, attn_mask=attn_mask)
             # t=0 has no history, so we just use the local pair token
             ctx_left = ctx_l.new_zeros(T, B, q_left_all.size(-1)) #
             ctx_left[0]  = q_left_all[0]
@@ -241,6 +336,32 @@ class BanditLearner(nn.Module):
 
             left_logits = self.reward_compute(ctx_left, left_feats)  # (T,B,1)
             right_logits = self.reward_compute(ctx_right, right_feats)  # (T,B,1)
+
+            # left_logits  = self.ctx_to_logit(ctx_left)   # (T,B,1)
+            # right_logits = self.ctx_to_logit(ctx_right)  # (T,B,1)
+
+            # with torch.no_grad():
+            #     cl = ctx_left.reshape(-1, ctx_left.size(-1))
+            #     cr = ctx_right.reshape(-1, ctx_right.size(-1))
+            #     cos = F.cosine_similarity(F.normalize(cl,dim=-1), F.normalize(cr,dim=-1), dim=-1)
+            #     l2  = (cl-cr).norm(dim=-1)
+            #     print(f"[ctx] cosine mean/std: {cos.mean():.4f} / {cos.std():.4f}")
+            #     print(f"[ctx] L2     mean/std: {l2.mean():.4f} / {l2.std():.4f}")
+                
+            #     d = (left_logits - right_logits).squeeze(-1)  # (T,B)
+            #     print(f"[logits] |Δ| mean/std: {d.abs().mean():.4f} / {d.abs().std():.4f}")
+            #     print(f"[logits] Δ mean/std:  {d.mean():.4f} / {d.std():.4f}")
+
+            #     eps = 1e-9
+            #     ent_l = -(w_l.clamp_min(eps) * w_l.clamp_min(eps).log()).sum(dim=-1).mean()
+            #     ent_r = -(w_r.clamp_min(eps) * w_r.clamp_min(eps).log()).sum(dim=-1).mean()
+            #     print(f"[attn] entropy left/right: {ent_l.item():.3f} / {ent_r.item():.3f}")
+
+            #     # how different are the distributions?
+            #     diff = (w_l - w_r).abs().mean().item()
+            #     print(f"[attn] mean |wL-wR|: {diff:.4f}")
+
+
 
 
             p_left_rwd  = torch.distributions.Bernoulli(logits=left_logits)
@@ -263,15 +384,14 @@ class BanditLearner(nn.Module):
 
             # (optional) KL term kept from your code (unused in final loss unless you re-enable it)
             eps = 1e-8
-            # probs = torch.sigmoid(reward_logits)
-            # prior_p = 0.5
-            # var_kl_loss = (
-            #     probs * (torch.log(probs + eps) - math.log(prior_p)) +
-            #     (1.0 - probs) * (torch.log(1.0 - probs + eps) - math.log(1.0 - prior_p))
-            # ).sum(dim=-1).mean()
-
             variational_loss = -var_logp_loss
-            variational_loss.backward()
+            # variational_loss.backward()
+            contrast_loss = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
+
+            lambda_contrast = 0.05  # try 0.01–0.2
+            bandit_total = variational_loss + lambda_contrast * contrast_loss
+            bandit_total.backward()
+
 
             var_loss_sum += variational_loss.item()
             var_slices += 1
@@ -312,6 +432,9 @@ class BanditLearner(nn.Module):
             torch.nn.utils.clip_grad_norm_(list(self.motor_parameters()), 1.0)
             optim_bandit.step()
             optim_motor.step()
+
+
+        # debug_left_right_feats(left_feats, right_feats, tag="enc")
 
         var_loss = var_loss_sum / max(1, var_slices)
         motor_loss = motor_loss_sum / max(1, motor_slices)

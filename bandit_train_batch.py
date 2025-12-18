@@ -1,5 +1,7 @@
 # at top of bandit_train.py
 import ray
+ray.init(include_dashboard=False)
+
 from PIL import Image
 from typing import Any, Tuple, Dict
 import time
@@ -26,6 +28,37 @@ import math, contextlib
 
 # torch.backends.cudnn.enabled = True
 # torch.autograd.set_detect_anomaly(True)
+
+
+TOP_GROUPS = [
+    "enc", "attn", "q_in", "ctx_to_logit",
+    "mlp_pos", "mlp_goal", "mu_head", "log_std_head",
+]
+
+def log_group_weight_updates(writer, agent, before, step, tag="Upd"):
+    """
+    before: dict(name -> tensor clone) from agent.named_parameters()
+    Logs ~8-16 curves total: L2 and max|Δ| per top-level module group.
+    """
+    # accumulators
+    sq = {g: 0.0 for g in TOP_GROUPS}
+    mx = {g: 0.0 for g in TOP_GROUPS}
+
+    with torch.no_grad():
+        for name, p in agent.named_parameters():
+            if name not in before:
+                continue
+            g = name.split(".", 1)[0]  # top-level: enc.*, attn.*, ...
+            if g not in sq:
+                continue
+            d = (p - before[name])
+            sq[g] += float(d.pow(2).sum().item())
+            mx[g] = max(mx[g], float(d.abs().max().item()))
+
+    for g in TOP_GROUPS:
+        writer.add_scalar(f"{tag}/L2/{g}", math.sqrt(sq[g]), step)
+        writer.add_scalar(f"{tag}/MaxAbs/{g}", mx[g], step)
+
 
 def extract_lr_views(obs_tensor, env, crop_size=112, pad=6):
     lr = env.unwrapped.left_rect
@@ -120,6 +153,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if ep_start_flag == 1.0:
             left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
 
+            # with torch.no_grad():
+            #     pix_mean = (left_view - right_view).abs().mean().item()
+            #     pix_max  = (left_view - right_view).abs().max().item()
+            #     print("pixel |mean|:", pix_mean, "pixel |max|:", pix_max)
+
+
             left_feats = agent.encode(left_view)    # (1,F)
             right_feats = agent.encode(right_view)  # (1,F)
 
@@ -146,37 +185,36 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 k = torch.stack(k_tokens, dim=0)   # (Tpast,1,H)
                 v = torch.stack(o_tokens, dim=0)   # (Tpast,1,H)
 
-                # IMPORTANT: don't use is_causal here (query len is 1; causal would only allow key index 0)
-                ctx_left,  _ = agent.attn(ql, k, v, need_weights=False)
-                ctx_right, _ = agent.attn(qr, k, v, need_weights=False)
+                ctx_left,  _ = agent.attn(ql, k, v)
+                ctx_right, _ = agent.attn(qr, k, v)
 
 
             left_logits  = agent.reward_compute(ctx_left,  left_feats.unsqueeze(0))   # (1,1,F)
             right_logits = agent.reward_compute(ctx_right, right_feats.unsqueeze(0))
-
+            # left_logits  = agent.ctx_to_logit(ctx_left)   # (1,1,1)
+            # right_logits = agent.ctx_to_logit(ctx_right)  # (1,1,   
 
             # Thompson sampling (same as your code)
-            eps = 1e-4
-            probs = torch.sigmoid(torch.cat([left_logits, right_logits], dim=-1)).clamp(eps, 1.0 - eps)
-            p_left  = probs[0, 0, 0]
-            p_right = probs[0, 0, 1]
+            # -----------------------------
+            # Softmax policy over the two logits
+            # -----------------------------
+            tau = 0.2  # temperature: smaller => more decisive; try 0.05–1.0
 
+            action_logits = torch.cat([left_logits, right_logits], dim=-1)  # (1,1,2)
 
+            # Option A: probs (nice for logging)
+            p_choose = torch.softmax(action_logits / tau, dim=-1)           # (1,1,2)
+            p_left  = p_choose[0, 0, 0]
+            p_right = p_choose[0, 0, 1]
 
-            concentration = 5.0
-            alpha_left  = p_left  * concentration + 1.0
-            beta_left   = (1.0 - p_left)  * concentration + 1.0
-            alpha_right = p_right * concentration + 1.0
-            beta_right  = (1.0 - p_right) * concentration + 1.0
+            log("left_logits:", left_logits[0,0,0], "right_logits:", right_logits[0,0,0])
 
-            dist_left  = torch.distributions.Beta(alpha_left,  beta_left)
-            dist_right = torch.distributions.Beta(alpha_right, beta_right)
+            # Sample action from categorical distribution
+            dist = torch.distributions.Categorical(probs=p_choose[0, 0])    # (2,)
+            a_t = dist.sample()                                            # scalar: 0=left, 1=right
 
-            u_left  = dist_left.rsample()
-            u_right = dist_right.rsample()
-
-            a_t = torch.argmax(torch.stack([u_left, u_right]))
             choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
+
 
             meta_ep_len += 1
             ep_start_flag = 0.0
@@ -234,7 +272,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             chosen_feat   = aL * left_feats  + aR * right_feats
             unchosen_feat = aL * right_feats + aR * left_feats
 
-            x = torch.cat([chosen_feat, r_t], dim=-1).to(left_feats.dtype)
+            x = torch.cat([r_t], dim=-1).to(left_feats.dtype)
 
 
             o_tokens.append(x)
@@ -256,7 +294,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
 
             log(
                 "Ep: ", info.get("trial_index"),
-                ", idx = ", pair_idx_now,
+                ", curr_idx = ", pair_index_ep,
+                ", iter = ", pair_index_counter[pair_index_ep],
                 ", choice target:", choice_target.argmax(dim=-1).item(),
                 ", Reached Target:", info.get("selected_target"),
                 ", reward:", reward,
@@ -324,8 +363,8 @@ class RolloutWorker:
             session_K=session_K,
             session_N=session_N,
             trial_ms=3000,
-            randomize_sides=False,
-            shuffle=False,
+            randomize_sides=True,
+            shuffle=True,
         )
 
     def run_session(self, agent_state_dict, probs_this_session, print_this_session=False):
@@ -532,6 +571,11 @@ if __name__ == "__main__":
         # --------------------------------------------------
         #   Now we have ~B sessions worth of data -> one update
         # --------------------------------------------------
+        
+        # --- snapshot weights before update ---
+        # before = {n: p.detach().clone() for n, p in agent.named_parameters()}
+
+
         var_loss, motor_loss = agent.update2(
             optim_bandit, optim_motor,
             batch_xy_pos,
@@ -543,6 +587,11 @@ if __name__ == "__main__":
             batch_meta_ep_start,
             device
         )
+
+        # --- log grouped parameter updates (Δw) ---
+        # log_group_weight_updates(writer, agent, before, update_idx, tag="Upd")
+
+
 
         # logging
         highR_perN_arr = np.stack(highR_perN_list)   # shape (B, N)
