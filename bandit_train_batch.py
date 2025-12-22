@@ -286,7 +286,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
 
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
             pair_index_counter[pair_index_ep] += 1
-            selected_high_reward = info.get("selected_high_reward_this_trial", False)
+            selected_high_reward = info.get("selected_high_reward_this_trial", -1)
             flipped = info.get("side_is_flipped", False)
 
             if selected_high_reward:
