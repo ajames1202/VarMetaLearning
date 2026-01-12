@@ -1,96 +1,155 @@
-import torch
+import ray
+from PIL import Image
+from typing import Any, Tuple, Dict
+import time
 import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+import argparse
 
-import visual_bandit_env2 as vbe          # your env
-import var_bandit_learner2 as bl          # BanditLearner
-from bandit_train_batch import load_checkpoint, meta_ep_rollout  # existing helpers
+
+import visual_bandit_env3 as vbe
+import var_bandit_learner2 as bl
+from bandit_train_batch import RolloutWorker as rw
+from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
+import math
+import pygame
+import os
+from datetime import datetime
+
+from gymnasium.wrappers import RecordVideo
+from torch.utils.tensorboard import SummaryWriter
 
 
-def main():
-    # ---- 1. Config: MUST match training ----
-    session_K = 3
-    session_N = 20
+import math, contextlib
+import matplotlib.pyplot as plt
 
-    feature_dim = 128
-    hidden_size = 128
-    input_size = feature_dim + 2 + 1 + 1   # features + prev_action(2) + prev_reward(1) + meta_ep_start(1)
 
-    # Path to the checkpoint you copied from the cluster, e.g.
-    # scp user@cluster:/path/to/checkpoints/bandit_latest.pth .
-    CHECKPOINT_PATH = "checkpoints/bandit_latest.pth"
+# --- TensorBoard writer ---
+log_dir = os.path.join("runs", f"bandit_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+writer = SummaryWriter(log_dir)
 
-    # ---- 2. Device (CPU or GPU if available) ----
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
 
-    # ---- 3. Recreate the agent with SAME hyperparams as training ----
-    agent = bl.BanditLearner(
-        input_size=input_size,
-        feature_dim=feature_dim,
-        rnn_hidden_size=hidden_size,
-        action_dim=2,
-        feature_source="ids",       # important: same as in training
-        num_pairs=session_K,
-        max_trials=session_N * session_K,
-    ).to(device)
+session_K = 3
+session_N = 12
 
-    # We don't need an optimizer for inference
-    _extra = load_checkpoint(CHECKPOINT_PATH, agent, optimizer=None, map_location=device)
-    agent.eval()
-    print(f"Loaded checkpoint from: {CHECKPOINT_PATH}")
+hidden_size = 128
+feature_dim = 128
+input_size = feature_dim + 1
 
-    # ---- 4. Create an environment for evaluation ----
-    # Same settings as in RolloutWorker in bandit_train_batch.py
-    env = vbe.TwoChoiceReachingEnv(
-        W=384,
-        H=400,
-        render_mode="rgb_array",   # change to "human" if your env supports it and you want a window
-        seed=0,
-        session_K=session_K,
-        session_N=session_N,
-        trial_ms=3000,
-        randomize_sides=False,
+ema = None
+ema_beta = 0.9
+best_ema = -float("inf")
+patience = 30
+min_delta = 0.1
+bad = 0
+warmup_updates = 500
+
+
+agent = bl.BanditLearner(
+    input_size=input_size,
+    feature_dim=feature_dim,
+    rnn_hidden_size=hidden_size,
+    action_dim=2,
+    num_pairs=session_K,
+    max_trials=session_N * session_K,
+)
+
+optim_bandit = torch.optim.Adam(agent.bandit_parameters(), lr=1e-3)
+optim_motor  = torch.optim.Adam(agent.motor_parameters(),  lr=1e-3)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+agent.to(device)
+
+# ---------- Ray init ----------
+ray.init(ignore_reinit_error=True)
+
+# ---------- rollout workers ----------
+workers = [
+    rw.remote(session_K, session_N, seed=42, worker_id=i)
+    for i in range(8)
+]
+
+
+ckpt = torch.load(os.path.join("checkpoints", "best.pt"), map_location=device)
+print(f"Loaded best checkpoint from update {ckpt['extra']['update']}, ema_score={ckpt['extra']['ema_score']:.2f}")
+agent.load_state_dict(ckpt["model_state"])
+agent.eval()
+
+eval_il = []
+eval_ao = []
+eval_ol = []
+
+mean_cum_rew_il = 0.0
+mean_cum_rew_ao = 0.0
+mean_cum_rew_ol = 0.0
+
+num_eval_sessions = 500 # larger number for stable eval
+
+for i in range(num_eval_sessions):
+    res = ray.get(
+        workers[0].run_session.remote(
+            {k: v.cpu() for k, v in agent.state_dict().items()},
+            probs_this_session=[(0.8, 0.2)] * session_K,
+            print_this_session=True
+        )
     )
 
-    # Example bandit probabilities for this evaluation session
-    # Here: either all pairs have (0.8, 0.2) or all (0.2, 0.8)
-    if np.random.rand() < 0.5:
-        L = [0.8] * session_K
-    else:
-        L = [0.2] * session_K
-    R = [1.0 - x for x in L]
-    probs_this_session = [(L[i], R[i]) for i in range(session_K)]
-    env.unwrapped.pair_probs = probs_this_session
-
-    print("Pair probabilities for this session:", probs_this_session)
-
-    # ---- 5. Run ONE rollout with the loaded agent ----
     (
-        xy_pos_buf,
-        goal_vec_buf,
-        feats_motor,
-        chosen_bandits_motor_buf,
-        feats_bandit,
-        chosen_bandits_buf,
-        bandit_rewards_buf,
-        meta_ep_start_buf,
-        high_reward_choice_per_N,
-        cum_rewards,
-    ) = meta_ep_rollout(
-        env,
-        agent,
-        device,
-        session_K=session_K,
-        session_N=session_N,
-        worker_id=0,
-        print_this_session=True,   # will print detailed per-trial info
-    )
+        _, _, _,
+        _, _, _, _,
+        _, _,
+        cum_rew_il, cum_rew_ao, cum_rew_ol,
+        high_reward_choices_il,
+        high_reward_choices_ao,
+        high_reward_choices_ol
+    ) = res
 
-    print("\n=== Evaluation summary ===")
-    print("Total bandit rewards in session:", cum_rewards)
-    print("High-reward choice fraction per N:", high_reward_choice_per_N)
-    print("Number of trials:", len(bandit_rewards_buf))
+    # extract from env stats (you already compute these)
+    eval_il.append(high_reward_choices_il)  # high_reward_choices_il
+    eval_ao.append(high_reward_choices_ao)
+    eval_ol.append(high_reward_choices_ol)
+
+    mean_cum_rew_il += cum_rew_il
+    mean_cum_rew_ao += cum_rew_ao
+    mean_cum_rew_ol += cum_rew_ol
+
+mean_il = np.array(eval_il).mean(axis=0)
+mean_ao = np.array(eval_ao).mean(axis=0)
+mean_ol = np.array(eval_ol).mean(axis=0)
+
+mean_cum_rew_il /= num_eval_sessions
+mean_cum_rew_ao /= num_eval_sessions
+mean_cum_rew_ol /= num_eval_sessions
+
+print(f"Eval results over {num_eval_sessions} sessions:")
+print(f" Mean cum reward IL: {mean_cum_rew_il:.1f}, AO: {mean_cum_rew_ao:.1f}, OL: {mean_cum_rew_ol:.1f}")
+
+fig, ax = plt.subplots(figsize=(6,4))
+trials = np.arange(session_N)
+
+ax.plot(trials, mean_il, label="IL")
+ax.plot(trials, mean_ao, label="AO")
+ax.plot(trials, mean_ol, label="OL")
+
+ax.set_xlabel("Trial index")
+ax.set_ylabel("Mean high-reward choice")
+ax.set_title("Per-trial performance (best checkpoint)")
+ax.legend()
+ax.grid(True)
+
+plot_dir = os.path.join("checkpoints", "plots")
+os.makedirs(plot_dir, exist_ok=True)
+
+# save to file
+plot_path = os.path.join(plot_dir, "PerTrialReward_pretrained2.png")
+fig.savefig(plot_path, dpi=150, bbox_inches="tight")
 
 
-if __name__ == "__main__":
-    main()
+writer.add_figure("Eval/PerTrialReward", fig)
+plt.close(fig)
+
+
+ray.shutdown()
+writer.close()

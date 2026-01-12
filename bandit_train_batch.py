@@ -1,6 +1,6 @@
 # at top of bandit_train.py
 import ray
-ray.init(include_dashboard=False)
+# ray.init(include_dashboard=False)
 
 from PIL import Image
 from typing import Any, Tuple, Dict
@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import argparse
 
 
-import visual_bandit_env2 as vbe
+import visual_bandit_env3 as vbe
 import var_bandit_learner2 as bl
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
@@ -25,6 +25,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 import math, contextlib
+import matplotlib.pyplot as plt
+
 
 # torch.backends.cudnn.enabled = True
 # torch.autograd.set_detect_anomaly(True)
@@ -90,16 +92,6 @@ def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(ckpt, path)
 
-# def load_checkpoint(path, agent, optim_bandit=None, optim_motor=None, map_location="cpu"):
-#     ckpt = torch.load(path, map_location=map_location)
-#     agent.load_state_dict(ckpt["model_state"])
-#     if optimizer is not None and "optim_state" in ckpt:
-#         optimizer.load_state_dict(ckpt["optim_state"])
-#     return ckpt.get("extra", {})
-
-
-
-
                     
 def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print_this_session=False):
 
@@ -118,8 +110,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     obs, info = env.reset()
     done = False
 
-    pair_index_counter = np.ones(session_K, dtype=np.int32) * -1
-    high_reward_choice_per_N = np.zeros(session_N, dtype=np.int32)
+    pair_index_counter_il = np.ones(session_K, dtype=np.int32) * -1
+    pair_index_counter_ao = np.ones(session_K, dtype=np.int32) * -1
+    pair_index_counter_ol = np.ones(session_K, dtype=np.int32) * -1
+    high_reward_choices_il = np.zeros(session_N, dtype=np.int32)
+    high_reward_choice_ao = np.zeros(session_N, dtype=np.int32)
+    high_reward_choice_ol = np.zeros(session_N, dtype=np.int32)
 
     meta_ep_len = 0
     t = 0
@@ -135,6 +131,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     chosen_bandits_buf = []
     bandit_rewards_buf = []
     meta_ep_start_buf = []
+    trial_cond_buf = []
+    actor_buf = []
+
 
     choice_target = None
     p_left = torch.tensor(0.5)
@@ -153,11 +152,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if ep_start_flag == 1.0:
             left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
 
-            # with torch.no_grad():
-            #     pix_mean = (left_view - right_view).abs().mean().item()
-            #     pix_max  = (left_view - right_view).abs().max().item()
-            #     print("pixel |mean|:", pix_mean, "pixel |max|:", pix_max)
-
+            curr_trial_condition = info.get("curr_trial_condition")
 
             left_feats = agent.encode(left_view)    # (1,F)
             right_feats = agent.encode(right_view)  # (1,F)
@@ -170,12 +165,10 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             q_left = agent.q_in(left_feats)    # (T,B,H)
             q_right = agent.q_in(right_feats)  # (T,B,H)
 
-
-
             Tpast = len(o_tokens)
             if Tpast == 0:
-                ctx_left  = q_left.unsqueeze(0)    # (1,1,H)
-                ctx_right = q_right.unsqueeze(0)   # (1,1,H)
+                ctx_left = agent.attn_ln(q_left.unsqueeze(0))
+                ctx_right = agent.attn_ln(q_right.unsqueeze(0))
             else:
                 # query is CURRENT token (len=1)
                 ql = q_left.unsqueeze(0)           # (1,1,H)
@@ -185,39 +178,46 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 k = torch.stack(k_tokens, dim=0)   # (Tpast,1,H)
                 v = torch.stack(o_tokens, dim=0)   # (Tpast,1,H)
 
+                # print("K shape:", k.shape, "V shape:", v.shape)
+
                 ctx_left,  _ = agent.attn(ql, k, v)
                 ctx_right, _ = agent.attn(qr, k, v)
 
+                ctx_left  = agent.attn_ln(ctx_left  + ql)
+                ctx_right = agent.attn_ln(ctx_right + qr)
 
-            left_logits  = agent.reward_compute(ctx_left,  left_feats.unsqueeze(0))   # (1,1,F)
-            right_logits = agent.reward_compute(ctx_right, right_feats.unsqueeze(0))
-            # left_logits  = agent.ctx_to_logit(ctx_left)   # (1,1,1)
-            # right_logits = agent.ctx_to_logit(ctx_right)  # (1,1,   
 
-            # Thompson sampling (same as your code)
-            # -----------------------------
-            # Softmax policy over the two logits
-            # -----------------------------
-            tau = 0.2  # temperature: smaller => more decisive; try 0.05–1.0
+            if(curr_trial_condition != "AO-o" and curr_trial_condition != "OL-o"):
 
-            action_logits = torch.cat([left_logits, right_logits], dim=-1)  # (1,1,2)
+                left_logits  = agent.reward_compute(ctx_left,  left_feats.unsqueeze(0))   # (1,1,F)
+                right_logits = agent.reward_compute(ctx_right, right_feats.unsqueeze(0))
 
-            # Option A: probs (nice for logging)
-            p_choose = torch.softmax(action_logits / tau, dim=-1)           # (1,1,2)
-            p_left  = p_choose[0, 0, 0]
-            p_right = p_choose[0, 0, 1]
+                tau = 0.2  # temperature: smaller => more decisive; try 0.05–1.0
 
-            log("left_logits:", left_logits[0,0,0], "right_logits:", right_logits[0,0,0])
+                action_logits = torch.cat([left_logits, right_logits], dim=-1)  # (1,1,2)
 
-            # Sample action from categorical distribution
-            dist = torch.distributions.Categorical(probs=p_choose[0, 0])    # (2,)
-            a_t = dist.sample()                                            # scalar: 0=left, 1=right
+                # Option A: probs (nice for logging)
+                p_choose = torch.softmax(action_logits / tau, dim=-1)           # (1,1,2)
+                p_left  = p_choose[0, 0, 0]
+                p_right = p_choose[0, 0, 1]
 
-            choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
+                # log("p_left:", p_left, "p_right:", p_right)
+
+                # Sample action from categorical distribution
+                dist = torch.distributions.Categorical(probs=p_choose[0, 0])    # (2,)
+                a_t = dist.sample()                                            # scalar: 0=left, 1=right
+
+                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
+            else:
+                # observational trial: no choice, use env-chosen action
+                a_t = 0  # Dummy
+                choice_target = F.one_hot(torch.tensor(a_t), num_classes=2).unsqueeze(0).float()  # (1,2)
+                log("Obs trial: env chose ", "left" if a_t == 0 else "right")    
 
 
             meta_ep_len += 1
             ep_start_flag = 0.0
+
 
         # -----------------------------
         # MOTOR step
@@ -261,18 +261,28 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
             meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
 
-            # a_oh = choice_target
-            r_t  = torch.tensor([[float(reward)]], device=device, dtype=torch.float32)
-
+            actor = 0
+            if curr_trial_condition == "AO-o" or curr_trial_condition == "OL-o":
+                # on obs trials, use env-chosen action
+                a_t = info.get("selected_target", -1)
+                choice_target = F.one_hot(torch.tensor(a_t), num_classes=2).unsqueeze(0).float()  # (1,2)
+                actor = 1
+            if curr_trial_condition == "AO-o":
+                reward = 2    
             # rnn_fwd returns RAW GRU out for this trial (outcome token)
             # o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
+
             aL = choice_target[..., 0:1]
             aR = choice_target[..., 1:2]
 
             chosen_feat   = aL * left_feats  + aR * right_feats
             unchosen_feat = aL * right_feats + aR * left_feats
 
-            x = torch.cat([r_t], dim=-1).to(left_feats.dtype)
+            # x = r_t.to(left_feats.dtype)
+            action_emb = agent.action(torch.tensor(a_t, dtype=torch.long).unsqueeze(0))  # (1,H)
+            actor_emb = agent.actor(torch.tensor(actor, dtype=torch.long).unsqueeze(0))      # (1,H)
+            reward_emb = agent.rwd_in(torch.tensor(reward, dtype=torch.long).unsqueeze(0))      # (1,H)
+            x = action_emb + actor_emb + reward_emb
 
 
             o_tokens.append(x)
@@ -285,17 +295,31 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             k_tokens.append(pair_key)
 
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
-            pair_index_counter[pair_index_ep] += 1
+            
             selected_high_reward = info.get("selected_high_reward_this_trial", -1)
             flipped = info.get("side_is_flipped", False)
 
-            if selected_high_reward:
-                high_reward_choice_per_N[pair_index_counter[pair_index_ep]] += 1
+            if(curr_trial_condition == "IL"):
+                pair_index_counter_il[pair_index_ep] += 1
+            elif(curr_trial_condition == "AO-s"):
+                pair_index_counter_ao[pair_index_ep] += 1
+            elif(curr_trial_condition == "OL-s"):
+                pair_index_counter_ol[pair_index_ep] += 1        
+
+            if (curr_trial_condition == "IL") and selected_high_reward:
+                high_reward_choices_il[pair_index_counter_il[pair_index_ep]] += 1
+            elif (curr_trial_condition == "AO-s") and selected_high_reward:
+                high_reward_choice_ao[pair_index_counter_ao[pair_index_ep]] += 1
+            elif (curr_trial_condition == "OL-s") and selected_high_reward:
+                high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1        
 
             log(
                 "Ep: ", info.get("trial_index"),
                 ", curr_idx = ", pair_index_ep,
-                ", iter = ", pair_index_counter[pair_index_ep],
+                ", iter_il = ", pair_index_counter_il[pair_index_ep],
+                ", iter_ao = ", pair_index_counter_ao[pair_index_ep],
+                ", iter_ol = ", pair_index_counter_ol[pair_index_ep],
+                ", curr_trial_condition =", curr_trial_condition,
                 ", choice target:", choice_target.argmax(dim=-1).item(),
                 ", Reached Target:", info.get("selected_target"),
                 ", reward:", reward,
@@ -305,14 +329,19 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 ", p_right =", round(float(p_right), 2)
             )
 
+
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
             bandit_rewards_buf.append(float(reward))
             meta_ep_start_buf.append(float(meta_ep_start))
+            actor_buf.append(actor)
+            trial_cond_buf.append(curr_trial_condition)
 
             choice_target = None
             ep_start_flag = 1.0
 
         t += 1
+
+    log("trial_conditions:", env.unwrapped.trial_cond)
 
     # session stats
     high_reward_choice_count_on_left = info.get("high_reward_choice_count_on_left", -1)
@@ -321,18 +350,26 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     total_right_choices = info.get("total_right_choices", -1)
 
     log(
-        "Session finished. High-reward choices per N:", high_reward_choice_per_N,
+        "Session finished. High-reward choices for il:", high_reward_choices_il,
+        ", High-reward choices for ao:", high_reward_choice_ao,
+        ", High-reward choices for ol:", high_reward_choice_ol,
         ", High-reward choices on left:", high_reward_choice_count_on_left,
         ", on right:", high_reward_choice_count_on_right,
         ", Total left choices:", total_left_choices,
         ", Total right choices:", total_right_choices,
     )
 
-    high_reward_choice_per_N = high_reward_choice_per_N.astype(float)
-    high_reward_choice_per_N /= float(session_K)
-    high_reward_choice_per_N = high_reward_choice_per_N.round(2)
 
-    cum_rewards = sum(bandit_rewards_buf)
+    bandit_rewards_arr = np.asarray(bandit_rewards_buf, dtype=np.float32)
+    trial_cond_arr = np.asarray(trial_cond_buf)
+
+    cum_rewards_il = float(bandit_rewards_arr[trial_cond_arr == "IL"].sum())
+    cum_rewards_ao = float(bandit_rewards_arr[trial_cond_arr == "AO-s"].sum())
+    cum_rewards_ol = float(bandit_rewards_arr[trial_cond_arr == "OL-s"].sum())
+
+    high_reward_choices_il = np.array(high_reward_choices_il, dtype=np.int32)
+    high_reward_choices_ao = np.array(high_reward_choice_ao, dtype=np.int32)
+    high_reward_choices_ol = np.array(high_reward_choice_ol, dtype=np.int32)
 
     obs_bandit = {
         "left":  np.stack(left_obs,  axis=0),
@@ -342,7 +379,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     return (
         xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
         obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf,
-        high_reward_choice_per_N, cum_rewards
+        actor_buf, trial_cond_buf,
+        cum_rewards_il, cum_rewards_ao, cum_rewards_ol, 
+        high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol
     )
 
 
@@ -395,6 +434,35 @@ class RolloutWorker:
                 worker_id=self.worker_id,
                 print_this_session=print_this_session
             )
+        
+    def collect_teacher_data(self, agent_state_dict, probs_this_session, print_this_session=False):
+        # implement if needed
+        hidden_size = 128
+        feature_dim = 128
+        input_size = feature_dim + 1
+
+        agent = bl.BanditLearner(
+            input_size=input_size,
+            feature_dim=feature_dim,
+            rnn_hidden_size=hidden_size,
+            action_dim=2,
+            num_pairs=self.session_K,
+            max_trials=self.session_N * self.session_K,
+        ).to(self.device)
+
+        agent.load_state_dict(agent_state_dict)
+        agent.eval()
+
+        # set pair probabilities for this worker's env
+        self.env.unwrapped.pair_probs = probs_this_session
+
+        with torch.no_grad():
+            return meta_ep_rollout(
+                self.env, agent, self.device,
+                self.session_K, self.session_N,
+                worker_id=self.worker_id,
+                print_this_session=print_this_session
+            )    
 
 
 
@@ -405,7 +473,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--episodes-per-update', type=int, default=8)  # <-- B
-    parser.add_argument('--num-updates', type=int, default=500)        # <-- 500
+    parser.add_argument('--num-updates', type=int, default=700)        # <-- 500
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -417,11 +485,20 @@ if __name__ == "__main__":
 
 
     session_K = 3
-    session_N = 10
+    session_N = 12
 
     hidden_size = 128
     feature_dim = 128
     input_size = feature_dim + 1
+
+    ema = None
+    ema_beta = 0.9
+    best_ema = -float("inf")
+    patience = 30
+    min_delta = 0.1
+    bad = 0
+    warmup_updates = 500
+
 
 
     agent = bl.BanditLearner(
@@ -442,13 +519,17 @@ if __name__ == "__main__":
     # ---------- Ray init ----------
     # local: ray.init()
     # cluster: ray.init(address="auto")
-    ray.init(ignore_reinit_error=True)
+    # ray.init(ignore_reinit_error=True)
 
     # ---------- rollout workers ----------
     workers = [
         RolloutWorker.remote(session_K, session_N, seed=args.seed + 1000 * i, worker_id=i)
         for i in range(args.num_workers)
     ]
+
+    # ---------- Collect teacher data ----------
+
+
 
 
     num_updates = args.num_updates
@@ -470,10 +551,14 @@ if __name__ == "__main__":
         batch_chosen_bandits = []
         batch_bandit_rewards = []
         batch_meta_ep_start = []
+        batch_actor = []
+        batch_trial_cond = []
 
 
         highR_perN_list   = []
-        cum_rewards_list  = []
+        cum_rewards_list_il  = []
+        cum_rewards_list_ao  = []
+        cum_rewards_list_ol  = []
 
         while total_sessions_collected < B:
 
@@ -526,7 +611,9 @@ if __name__ == "__main__":
             # ---------- aggregate results ----------
             for res in rollout_results:
                 (xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf, 
-                 obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, high_reward_choice_per_N, cum_rewards) = res
+                 obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf, 
+                actor_buf, trial_cond_buf,
+                 cum_rewards_il, cum_rewards_ao, cum_rewards_ol, high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol) = res
 
 
                 batch_xy_pos.extend(xy_pos_buf)
@@ -536,31 +623,14 @@ if __name__ == "__main__":
                 batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
                 batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
                 batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
+                batch_actor.append(torch.as_tensor(np.stack(actor_buf), dtype=torch.long))
+                batch_trial_cond.append(np.stack(trial_cond_buf))
 
-                highR_perN_list.append(high_reward_choice_per_N)
-                cum_rewards_list.append(cum_rewards)
 
 
-                # ##### --- DEBUG: save one session's left/right crops to disk ---
-                # if update_idx == 0 and total_sessions_collected == 0:
-                #     print("Saving lrft/right images")
-                #     out_dir = f"debug_views/upd{update_idx:04d}_session{total_sessions_collected:03d}"
-                #     os.makedirs(out_dir, exist_ok=True)
-
-                #     left  = obs_bandit["left"]   # (T,3,112,112), float [0,1]
-                #     right = obs_bandit["right"]
-
-                #     T = left.shape[0]
-
-                #     for t in range(T):
-                #         # LEFT
-                #         img = (left[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                #         Image.fromarray(img).save(f"{out_dir}/left_{t:03d}.png")
-
-                #         # RIGHT
-                #         img = (right[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                #         Image.fromarray(img).save(f"{out_dir}/right_{t:03d}.png")
-
+                cum_rewards_list_il.append(cum_rewards_il)
+                cum_rewards_list_ao.append(cum_rewards_ao)
+                cum_rewards_list_ol.append(cum_rewards_ol)
 
                 total_sessions_collected += 1
                 if total_sessions_collected >= B:
@@ -585,6 +655,8 @@ if __name__ == "__main__":
             batch_chosen_bandits,
             batch_bandit_rewards,
             batch_meta_ep_start,
+            batch_actor,
+            batch_trial_cond,
             device
         )
 
@@ -594,23 +666,41 @@ if __name__ == "__main__":
 
 
         # logging
-        highR_perN_arr = np.stack(highR_perN_list)   # shape (B, N)
-        mean_highR_perN = highR_perN_arr.mean(axis=0)
-        mean_cum_rew = np.mean(cum_rewards_list)
+        # highR_perN_arr = np.stack(highR_perN_list)   # shape (B, N)
+        # mean_highR_perN = highR_perN_arr.mean(axis=0)
+        mean_cum_rew_il = np.mean(cum_rewards_list_il)
+        mean_cum_rew_ao = np.mean(cum_rewards_list_ao)
+        mean_cum_rew_ol = np.mean(cum_rewards_list_ol)
+
+        train_score = mean_cum_rew_il + mean_cum_rew_ao + mean_cum_rew_ol
+
+        ema = train_score if ema is None else (ema_beta * ema + (1 - ema_beta) * train_score)
+
+
 
         if update_idx % 10 == 0:
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
-                  f"mean_cum_rew={mean_cum_rew:.1f}")
+                  f"mean_cum_rew_il={mean_cum_rew_il:.1f} "
+                  f"mean_cum_rew_ao={mean_cum_rew_ao:.1f} "
+                  f"mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
+            
+
+        if update_idx >= warmup_updates:
+            if ema > best_ema + min_delta:
+                best_ema = ema
+                bad = 0
+                save_checkpoint(os.path.join(args.save_dir, "best.pt"),
+                                agent, optim_bandit, optim_motor,
+                                extra={"update": update_idx, "ema_score": ema})
+            else:
+                bad += 1
+            if bad >= patience:
+                print(f"Early stopping at update {update_idx}, best_ema={best_ema:.2f}")
+                break
+    
 
 
-        #
-        # print(
-        #     f"[Update {update_idx+1}/{num_updates}] "
-        #     f"sessions_in_batch={total_sessions_collected}, "
-        #     f"mean_cum_session_rewards={mean_cum_rew:.2f}, "
-        #     f"ChoiceLoss={loss:.4f}, MotorLoss={policy_loss:.4f}, "
-        #     f"mean_high_reward_choice_perN={mean_highR_perN}"
-        # )
+        
 
                 # ---- TensorBoard logging ----
         global_step = update_idx  # one step per update
@@ -620,32 +710,91 @@ if __name__ == "__main__":
         writer.add_scalar("Loss/MotorLoss", motor_loss, global_step)
 
         # rewards
-        writer.add_scalar("Reward/MeanCumSession", mean_cum_rew, global_step)
+        writer.add_scalar("Reward/MeanCumSession_IL", mean_cum_rew_il, global_step)
+        writer.add_scalar("Reward/MeanCumSession_AO", mean_cum_rew_ao, global_step)
+        writer.add_scalar("Reward/MeanCumSession_OL", mean_cum_rew_ol, global_step)
 
-        # per-N stats (either as histogram or individual scalars)
-        # writer.add_histogram("Policy/HighRewardChoicePerN", mean_highR_perN, global_step)
-        # or, if you want separate curves:
-        for n, val in enumerate(mean_highR_perN):
-            writer.add_scalar(f"Policy/HighRewardChoicePerN_N{n}", val, global_step)
 
-        # if (update_idx + 1) % 10 == 0:
-        #     for name, param in agent.named_parameters():
-        #         writer.add_histogram(f"Params/{name}", param.detach().cpu().numpy(), global_step)
+    ckpt = torch.load(os.path.join(args.save_dir, "best.pt"), map_location=device)
+    print(f"Loaded best checkpoint from update {ckpt['extra']['update']}, ema_score={ckpt['extra']['ema_score']:.2f}")
+    agent.load_state_dict(ckpt["model_state"])
+    agent.eval()
 
+    eval_il = []
+    eval_ao = []
+    eval_ol = []
+
+    mean_cum_rew_il = 0.0
+    mean_cum_rew_ao = 0.0
+    mean_cum_rew_ol = 0.0
+
+    num_eval_sessions = 32  # small but stable
+
+    for i in range(num_eval_sessions):
+        res = ray.get(
+            workers[0].run_session.remote(
+                {k: v.cpu() for k, v in agent.state_dict().items()},
+                probs_this_session=[(0.8, 0.2)] * session_K,
+                print_this_session=False
+            )
+        )
+
+        (
+            _, _, _,
+            _, _, _, _,
+            _, _,
+            cum_rew_il, cum_rew_ao, cum_rew_ol,
+            high_reward_choices_il,
+            high_reward_choices_ao,
+            high_reward_choices_ol
+        ) = res
+
+        # extract from env stats (you already compute these)
+        eval_il.append(high_reward_choices_il)  # high_reward_choices_il
+        eval_ao.append(high_reward_choices_ao)
+        eval_ol.append(high_reward_choices_ol)
+
+        mean_cum_rew_il += cum_rew_il
+        mean_cum_rew_ao += cum_rew_ao
+        mean_cum_rew_ol += cum_rew_ol
+
+    mean_il = np.array(eval_il).mean(axis=0)
+    mean_ao = np.array(eval_ao).mean(axis=0)
+    mean_ol = np.array(eval_ol).mean(axis=0)
+
+    mean_cum_rew_il /= num_eval_sessions
+    mean_cum_rew_ao /= num_eval_sessions
+    mean_cum_rew_ol /= num_eval_sessions
+
+    print(f"Eval results over {num_eval_sessions} sessions:")
+    print(f" Mean cum reward IL: {mean_cum_rew_il:.1f}, AO: {mean_cum_rew_ao:.1f}, OL: {mean_cum_rew_ol:.1f}")
+
+    fig, ax = plt.subplots(figsize=(6,4))
+    trials = np.arange(session_N)
+
+    ax.plot(trials, mean_il, label="IL")
+    ax.plot(trials, mean_ao, label="AO")
+    ax.plot(trials, mean_ol, label="OL")
+
+    ax.set_xlabel("Trial index")
+    ax.set_ylabel("Mean high-reward choice")
+    ax.set_title("Per-trial performance (best checkpoint)")
+    ax.legend()
+    ax.grid(True)
+
+    plot_dir = os.path.join(args.save_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # save to file
+    plot_path = os.path.join(plot_dir, "PerTrialReward.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+
+
+    writer.add_figure("Eval/PerTrialReward", fig)
+    plt.close(fig)
 
 
     ray.shutdown()
     writer.close()
 
-            # if (ses + 1) % 10 == 0:  # every 10 sessions
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_dir = getattr(args, "save_dir", "checkpoints")  # if you add CLI arg
-    ckpt_path = os.path.join(save_dir, f"var_bandit_{stamp}.pt")
-    extra = {
-        "feature_dim": feature_dim,
-        "hidden_size": hidden_size,
-        "action_dim": 2,
-    }
-    save_checkpoint(ckpt_path, agent, optim_bandit, optim_motor, extra)
-    print(f"Saved checkpoint to {ckpt_path}")
 
