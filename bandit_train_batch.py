@@ -473,7 +473,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--episodes-per-update', type=int, default=8)  # <-- B
-    parser.add_argument('--num-updates', type=int, default=700)        # <-- 500
+    parser.add_argument('--num-updates', type=int, default=1000)        # <-- 500
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -497,7 +497,7 @@ if __name__ == "__main__":
     patience = 30
     min_delta = 0.1
     bad = 0
-    warmup_updates = 500
+    warmup_updates = 900
 
 
 

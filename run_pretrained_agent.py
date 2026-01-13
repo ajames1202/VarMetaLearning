@@ -11,7 +11,7 @@ import argparse
 
 import visual_bandit_env3 as vbe
 import var_bandit_learner2 as bl
-from bandit_train_batch import RolloutWorker as rw
+from bandit_train_batch import meta_ep_rollout
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
 import pygame
@@ -62,14 +62,13 @@ optim_motor  = torch.optim.Adam(agent.motor_parameters(),  lr=1e-3)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 agent.to(device)
 
-# ---------- Ray init ----------
-ray.init(ignore_reinit_error=True)
+# # ---------- Ray init ----------
+# ray.init(ignore_reinit_error=True)
 
-# ---------- rollout workers ----------
-workers = [
-    rw.remote(session_K, session_N, seed=42, worker_id=i)
-    for i in range(8)
-]
+# # ---------- rollout workers ----------
+# workers = [
+#     rw.remote(session_K, session_N, seed=42, worker_id=0)
+# ]
 
 
 ckpt = torch.load(os.path.join("checkpoints", "best.pt"), map_location=device)
@@ -86,15 +85,44 @@ mean_cum_rew_ao = 0.0
 mean_cum_rew_ol = 0.0
 
 num_eval_sessions = 500 # larger number for stable eval
+weights_ref = {k: v.cpu() for k, v in agent.state_dict().items()}
 
 for i in range(num_eval_sessions):
-    res = ray.get(
-        workers[0].run_session.remote(
-            {k: v.cpu() for k, v in agent.state_dict().items()},
-            probs_this_session=[(0.8, 0.2)] * session_K,
-            print_this_session=True
-        )
+    print(f"Eval session {i+1}/{num_eval_sessions}")
+    # res = ray.get(
+    #     workers[0].run_session.remote(
+    #         weights_ref,
+    #         probs_this_session=[(0.8, 0.2)] * session_K,
+    #         print_this_session=False
+    #     )
+    # )
+
+    env = vbe.TwoChoiceReachingEnv(
+        W=384,
+        H=400,
+        render_mode="rgb_array",
+        seed=42,
+        session_K=session_K,
+        session_N=session_N,
+        trial_ms=3000,
+        randomize_sides=True,
+        shuffle=True,
     )
+
+    hidden_size = 128
+    feature_dim = 128
+    input_size = feature_dim + 1
+
+    agent = bl.BanditLearner(
+        input_size=input_size,
+        feature_dim=feature_dim,
+        rnn_hidden_size=hidden_size,
+        action_dim=2,
+        num_pairs=3,
+    ).to(device)
+
+    agent.load_state_dict(weights_ref)
+    agent.eval()
 
     (
         _, _, _,
@@ -104,7 +132,11 @@ for i in range(num_eval_sessions):
         high_reward_choices_il,
         high_reward_choices_ao,
         high_reward_choices_ol
-    ) = res
+    ) = meta_ep_rollout(
+        env, agent, device,
+                3, 12,
+                worker_id=0,
+                print_this_session=False)
 
     # extract from env stats (you already compute these)
     eval_il.append(high_reward_choices_il)  # high_reward_choices_il
@@ -143,7 +175,7 @@ plot_dir = os.path.join("checkpoints", "plots")
 os.makedirs(plot_dir, exist_ok=True)
 
 # save to file
-plot_path = os.path.join(plot_dir, "PerTrialReward_pretrained2.png")
+plot_path = os.path.join(plot_dir, "PerTrialReward_pretrained3.png")
 fig.savefig(plot_path, dpi=150, bbox_inches="tight")
 
 
