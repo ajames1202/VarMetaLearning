@@ -624,7 +624,7 @@ if __name__ == "__main__":
                 batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
                 batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
                 batch_actor.append(torch.as_tensor(np.stack(actor_buf), dtype=torch.long))
-                batch_trial_cond.append(np.stack(trial_cond_buf))
+                batch_trial_cond.append(np.array(trial_cond_buf))
 
 
 

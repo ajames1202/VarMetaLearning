@@ -71,7 +71,7 @@ agent.to(device)
 # ]
 
 
-ckpt = torch.load(os.path.join("checkpoints", "best.pt"), map_location=device)
+ckpt = torch.load(os.path.join("C:/Users/Ashwin/Downloads/", "best.pt"), map_location=device)
 print(f"Loaded best checkpoint from update {ckpt['extra']['update']}, ema_score={ckpt['extra']['ema_score']:.2f}")
 agent.load_state_dict(ckpt["model_state"])
 agent.eval()
