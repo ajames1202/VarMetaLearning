@@ -197,8 +197,8 @@ class BanditLearner(nn.Module):
 
 
         # pol_net_inp = 4 * rnn_hidden_size + rnn_hidden_size #(x_t.size = 4*H, z_t.size = H)
-        self.policy_net_il  = nn.Sequential(nn.Linear(self.rnn_hidden_size + self.z_dim, 128), nn.ReLU(), nn.Linear(128, 1))
-        self.policy_net_obs = nn.Sequential(nn.Linear(self.rnn_hidden_size + 2*self.z_dim, 128), nn.ReLU(), nn.Linear(128, 1))
+        self.policy_net_il  = nn.Sequential(nn.Linear(self.rnn_hidden_size + self.z_dim, 128), nn.ReLU(), nn.Linear(128, 2))
+        self.policy_net_obs = nn.Sequential(nn.Linear(self.rnn_hidden_size + 2*self.z_dim, 128), nn.ReLU(), nn.Linear(128, 2))
 
         self.critic_net_il  = nn.Sequential(nn.Linear(self.z_dim, 128), nn.ReLU(), nn.Linear(128, 1))
 
@@ -208,9 +208,6 @@ class BanditLearner(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-
-
-
 
         # motor policy
         self.log_std_min = log_std_min
@@ -259,7 +256,11 @@ class BanditLearner(nn.Module):
             self.a_logits, 
             self.r_logits,
             self.teacher_ln, 
-            self.attn_ln2
+            self.attn_ln2,
+            self.policy_net_il,
+            self.policy_net_obs,
+            self.critic_net_il,
+            self.critic_net_obs
             # self.fam_head,   # if you use familiarity as bandit aux
         ]
         for m in modules:
@@ -302,13 +303,6 @@ class BanditLearner(nn.Module):
         return mu, log_std
 
    
-
-
-class TeacherInferenceNet(BanditLearner):
-    def __init__(self, input_size, feature_dim, rnn_hidden_size, action_dim):
-        BanditLearner.__init__(self, input_size, feature_dim, rnn_hidden_size, action_dim)
-
-
     def update2(self, optim_bandit, optim_motor, xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
         bandit_obs,           # list of dicts with "left"/"right"
         chosen_bandits_buf,   # list of (T, 2) tensors
@@ -407,6 +401,7 @@ class TeacherInferenceNet(BanditLearner):
             rwd_emb_ao = self.rwd_in(rewards_ao_o.squeeze(-1).long())
             # val_ao = action_emb_ao + actor_emb_ao + rwd_emb_ao  # (T,B,H)
             x_ao_o = inp_emb_ao + action_emb_ao + actor_emb_ao + rwd_emb_ao  # (T,B,2F)
+            x_ao_o_dec = inp_emb_ao + actor_emb_ao
            
             L = x_ao_o.size(0)  # query length (T-1)
             # mask future keys: shape (L, L), True means "masked", all keys > t are masked
@@ -422,7 +417,7 @@ class TeacherInferenceNet(BanditLearner):
             eps = torch.randn_like(mu_q_ao)
             z_ao_o = mu_q_ao + log_std_q_ao.exp() * eps                   # (T,B,z_dim)
             z_final[t_ao_o_idx, b_ao_o_idx] = z_ao_o
-            x_final[t_ao_o_idx, b_ao_o_idx] = x_ao_o
+            x_final[t_ao_o_idx, b_ao_o_idx] = x_ao_o_dec
             act_final[t_ao_o_idx, b_ao_o_idx] = action_ao_o
             rew_final[t_ao_o_idx, b_ao_o_idx] = rewards_ao_o.squeeze(-1)
 
@@ -436,16 +431,28 @@ class TeacherInferenceNet(BanditLearner):
             log_std_prior_ao = log_std_prior_ao.clamp(-5.0, 2.0)
 
             #Recontrunction loss for AO
-            attn_mask_obs_tmin1 = torch.triu(torch.ones((L, L), device=z_ao_o.device, dtype=torch.bool), diagonal=0)
+            # attn_mask_obs_tmin1 = torch.triu(torch.ones((L, L), device=z_ao_o.device, dtype=torch.bool), diagonal=0)
             x_ao_o_z = self.H_to_z(x_ao_o)
-            out_ao_act,_ = self.action_dec(z_ao_o, x_ao_o_z, x_ao_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
+            L, B, Dz = x_ao_o_z.shape
+
+            bos = torch.zeros(1, B, Dz, device=x_ao_o_z.device)      # or learnable parameter
+            kv  = torch.cat([bos, x_ao_o_z[:-1]], dim=0)             # shift right by 1
+
+            # standard causal mask (allows self-attend)
+            attn_mask = torch.triu(
+                torch.ones((L, L), device=x_ao_o_z.device, dtype=torch.bool),
+                diagonal=1
+            )
+
+            out_ao_act, _ = self.action_dec(z_ao_o, kv, kv, attn_mask=attn_mask)
             logits_a_ao = self.a_logits(out_ao_act)
+
             ao_choice_loss = F.cross_entropy(logits_a_ao.reshape(-1,2), action_ao_o.reshape(-1))
             
 
-            out_ao_r,_ = self.reward_dec(z_ao_o, x_ao_o_z, x_ao_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
-            logits_ao_r = self.r_logits(out_ao_r)
-            ao_reward_loss = F.binary_cross_entropy_with_logits(logits_ao_r, rewards_ao_o.float())
+            # out_ao_r,_ = self.reward_dec(z_ao_o, x_ao_o_z, x_ao_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
+            # logits_ao_r = self.r_logits(out_ao_r)
+            # ao_reward_loss = F.binary_cross_entropy_with_logits(logits_ao_r, rewards_ao_o.float())
 
             #KL loss
             log_std_q_ao = log_std_q_ao[1:]
@@ -470,6 +477,7 @@ class TeacherInferenceNet(BanditLearner):
             rwd_emb_ol = self.rwd_in(rewards_ol_o.squeeze(-1).long())
             # val_ol = action_emb_ol + actor_emb_ol + rwd_emb_ol  # (T,B,H)
             x_ol_o = inp_emb_ol + action_emb_ol + actor_emb_ol + rwd_emb_ol
+            x_ol_o_dec = inp_emb_ol + actor_emb_ol
 
             L = x_ol_o.size(0)  # query length (T-1)
             # mask future keys: shape (L, L), True means "masked", all keys
@@ -483,7 +491,7 @@ class TeacherInferenceNet(BanditLearner):
             eps = torch.randn_like(mu_q_ol)
             z_ol_o = mu_q_ol + log_std_q_ol.exp() * eps                   # (T,B,z_dim)
             z_final[t_ol_o_idx, b_ol_o_idx] = z_ol_o
-            x_final[t_ol_o_idx, b_ol_o_idx] = x_ol_o
+            x_final[t_ol_o_idx, b_ol_o_idx] = x_ol_o_dec
             act_final[t_ol_o_idx, b_ol_o_idx] = action_ol_o
             rew_final[t_ol_o_idx, b_ol_o_idx] = rewards_ol_o.squeeze(-1)
             
@@ -498,15 +506,27 @@ class TeacherInferenceNet(BanditLearner):
 
 
             #Recontrunction loss for OL
-            attn_mask_obs_tmin1 = torch.triu(torch.ones((L, L), device=x_ol_o.device, dtype=torch.bool), diagonal=0)
+            # attn_mask_obs_tmin1 = torch.triu(torch.ones((L, L), device=x_ol_o.device, dtype=torch.bool), diagonal=0)
             x_ol_o_z = self.H_to_z(x_ol_o)
 
-            out_ol_act,_ = self.action_dec(z_ol_o, x_ol_o_z, x_ol_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
+            # out_ol_act,_ = self.action_dec(z_ol_o, x_ol_o_z, x_ol_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
+            # logits_a_ol = self.a_logits(out_ol_act)
+
+            bos = torch.zeros(1, B, Dz, device=x_ol_o_z.device)      # or learnable parameter
+            kv  = torch.cat([bos, x_ol_o_z[:-1]], dim=0)             # shift right by 1
+
+            # standard causal mask (allows self-attend)
+            attn_mask = torch.triu(
+                torch.ones((L, L), device=x_ol_o_z.device, dtype=torch.bool),
+                diagonal=1
+            )
+            out_ol_act, _ = self.action_dec(z_ol_o, kv, kv, attn_mask=attn_mask)
             logits_a_ol = self.a_logits(out_ol_act)
             ol_choice_loss = F.cross_entropy(logits_a_ol.reshape(-1,2), action_ol_o.reshape(-1))
             
 
-            out_ol_r,_ = self.reward_dec(z_ol_o, x_ol_o_z, x_ol_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
+            # out_ol_r,_ = self.reward_dec(z_ol_o, x_ol_o_z, x_ol_o_z, attn_mask=attn_mask_obs_tmin1)  ## Use an attention module ?
+            out_ol_r,_ = self.reward_dec(z_ol_o, kv, kv, attn_mask=attn_mask)  ## Use an attention module ?
             logits_r_ol = self.r_logits(out_ol_r)
             ol_reward_loss = F.binary_cross_entropy_with_logits(logits_r_ol, rewards_ol_o.float())
 
@@ -536,6 +556,7 @@ class TeacherInferenceNet(BanditLearner):
             rwd_emb_il = self.rwd_in(rewards_il.squeeze(-1).long())
             # val_ol = action_emb_ol + actor_emb_ol + rwd_emb_ol  # (T,B,H)
             x_il = inp_emb_il+ action_emb_il + actor_emb_il + rwd_emb_il
+            x_il_dec = inp_emb_il + actor_emb_il
 
             L = x_il.size(0)  # query length (T-1)
             # mask future keys: shape (L, L), True means "masked", all keys
@@ -548,7 +569,7 @@ class TeacherInferenceNet(BanditLearner):
             eps = torch.randn_like(mu_q_il)
             z_il = mu_q_il + eps * torch.exp(log_std_q_il)
             z_final[t_il_idx, b_il_idx] = z_il
-            x_final[t_il_idx, b_il_idx] = x_il
+            x_final[t_il_idx, b_il_idx] = x_il_dec
             act_final[t_il_idx, b_il_idx] = action_il
             rew_final[t_il_idx, b_il_idx] = rewards_il.squeeze(-1)
 
@@ -569,6 +590,7 @@ class TeacherInferenceNet(BanditLearner):
             rwd_emb_ao_s = self.rwd_in(rewards_ao_s.squeeze(-1).long())
             # val_ol = action_emb_ol + actor_emb_ol + rwd_emb_ol  # (T,B,H)
             x_ao_s = inp_emb_ao_s + action_emb_ao_s + actor_emb_ao_s + rwd_emb_ao_s
+            x_ao_s_dec = inp_emb_ao_s + actor_emb_ao_s
             L = x_ao_s.size(0)
             attn_mask_obs = torch.triu(torch.ones((L, L), device=x_ao_s.device, dtype=torch.bool), diagonal=1)
             z_ao_s_out, w = self.enc_self(x_ao_s, x_ao_s, x_ao_s, attn_mask=attn_mask_obs)
@@ -579,7 +601,7 @@ class TeacherInferenceNet(BanditLearner):
             eps = torch.randn_like(mu_q_ao_s)
             z_ao_s = mu_q_ao_s + eps * torch.exp(log_std_q_ao_s)
             z_final[t_ao_s_idx, b_ao_s_idx] = z_ao_s
-            x_final[t_ao_s_idx, b_ao_s_idx] = x_ao_s
+            x_final[t_ao_s_idx, b_ao_s_idx] = x_ao_s_dec
             act_final[t_ao_s_idx, b_ao_s_idx] = action_ao_s
             rew_final[t_ao_s_idx, b_ao_s_idx] = rewards_ao_s.squeeze(-1)
 
@@ -599,6 +621,7 @@ class TeacherInferenceNet(BanditLearner):
             rwd_emb_ol_s = self.rwd_in(rewards_ol_s.squeeze(-1).long())
             # val_ol = action_emb_ol + actor_emb_ol + rwd_emb_ol  # (T,B,H)
             x_ol_s = inp_emb_ol_s + action_emb_ol_s + actor_emb_ol_s + rwd_emb_ol_s
+            x_ol_s_dec = inp_emb_ol_s + actor_emb_ol_s
             L = x_ol_s.size(0)
             attn_mask_obs = torch.triu(torch.ones((L, L), device=x_ol_s.device, dtype=torch.bool), diagonal=1)
             z_ol_s_out, w = self.enc_self(x_ol_s, x_ol_s, x_ol_s, attn_mask=attn_mask_obs)
@@ -609,7 +632,7 @@ class TeacherInferenceNet(BanditLearner):
             eps = torch.randn_like(mu_q_ol_s)
             z_ol_s = mu_q_ol_s + eps * torch.exp(log_std_q_ol_s)
             z_final[t_ol_s_idx, b_ol_s_idx] = z_ol_s
-            x_final[t_ol_s_idx, b_ol_s_idx] = x_ol_s
+            x_final[t_ol_s_idx, b_ol_s_idx] = x_ol_s_dec
             act_final[t_ol_s_idx, b_ol_s_idx] = action_ol_s
             rew_final[t_ol_s_idx, b_ol_s_idx] = rewards_ol_s.squeeze(-1)
 
@@ -621,26 +644,32 @@ class TeacherInferenceNet(BanditLearner):
             for b in range(B):
                 z_ao_o_last_t = torch.zeros(self.z_dim, device=device)
                 z_ol_o_last_t = torch.zeros(self.z_dim, device=device)
+                z_il_tm1 = torch.zeros(self.z_dim, device=device)
+                z_ao_s_tm1 = torch.zeros(self.z_dim, device=device)
+                z_ol_s_tm1 = torch.zeros(self.z_dim, device=device)
 
                 for t in range(T):
                     if trial_cond[t,b] == "IL":
-                        policy_logit = self.policy_net_il(torch.concat([x_final[t,b], z_final[t,b]], dim = -1)).squeeze(-1)
-                        critic_val = self.critic_net_il(z_final[t,b]).squeeze(-1)
+                        policy_logits = self.policy_net_il(torch.concat([x_final[t,b], z_il_tm1], dim = -1)).squeeze(-1)
+                        critic_val = self.critic_net_il(z_il_tm1).squeeze(-1)
+                        z_il_tm1 = z_final[t,b]
                     elif trial_cond[t,b] == "AO-o":
                         z_ao_o_last_t = z_final[t,b]
                         continue
                     elif trial_cond[t,b] == "AO-s":
-                        policy_logit = self.policy_net_obs(torch.concat([x_final[t,b], z_final[t,b], z_ao_o_last_t], dim = -1)).squeeze(-1)
-                        critic_val = self.critic_net_obs(torch.cat([z_final[t,b], z_ao_o_last_t], dim=-1)).squeeze(-1)
+                        policy_logits = self.policy_net_obs(torch.concat([x_final[t,b], z_ao_s_tm1, z_ao_o_last_t], dim = -1)).squeeze(-1)
+                        critic_val = self.critic_net_obs(torch.cat([z_ao_s_tm1, z_ao_o_last_t], dim=-1)).squeeze(-1)
+                        z_ao_s_tm1 = z_final[t,b]
                     elif trial_cond[t,b] == "OL-o":
                         z_ol_o_last_t = z_final[t,b]
                         continue
                     elif trial_cond[t,b] == "OL-s":
-                        policy_logit = self.policy_net_obs(torch.concat([x_final[t,b], z_final[t,b], z_ol_o_last_t], dim = -1)).squeeze(-1)
-                        critic_val = self.critic_net_obs(torch.cat([z_final[t,b], z_ol_o_last_t], dim = -1)).squeeze(-1)
+                        policy_logits = self.policy_net_obs(torch.concat([x_final[t,b], z_ol_s_tm1, z_ol_o_last_t], dim = -1)).squeeze(-1)
+                        critic_val = self.critic_net_obs(torch.cat([z_ol_s_tm1, z_ol_o_last_t], dim = -1)).squeeze(-1)
+                        z_ol_s_tm1 = z_final[t,b]
                     
-                    dist_t = torch.distributions.Bernoulli(logits=policy_logit)
-                    logpi_t = dist_t.log_prob(act_final[t,b].float())
+                    dist_t = torch.distributions.Categorical(logits=policy_logits)
+                    logpi_t = dist_t.log_prob(act_final[t,b])
                     adv = (rew_final[t,b] - critic_val).detach()
                     actor_loss[t,b] += -(adv * logpi_t)
                     critic_loss[t,b] += (rew_final[t,b] - critic_val).pow(2)
@@ -650,7 +679,7 @@ class TeacherInferenceNet(BanditLearner):
             actor_loss = actor_loss.mean()
             critic_loss = critic_loss.mean()
 
-            beh_loss = actor_loss + critic_loss + ao_choice_loss + ao_reward_loss \
+            beh_loss = actor_loss + critic_loss + ao_choice_loss \
             + kl_err_ao + ol_choice_loss + ol_reward_loss + kl_err_ol    
 
             # (optional) KL term kept from your code (unused in final loss unless you re-enable it)
@@ -704,8 +733,11 @@ class TeacherInferenceNet(BanditLearner):
             optim_motor.step()
 
 
+
         # debug_left_right_feats(left_feats, right_feats, tag="enc")
 
         var_loss = var_loss_sum / max(1, var_slices)
         motor_loss = motor_loss_sum / max(1, motor_slices)
         return var_loss, motor_loss
+
+

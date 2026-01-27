@@ -13,7 +13,7 @@ import argparse
 
 
 import visual_bandit_env3 as vbe
-import var_bandit_learner2 as bl
+import var_bandit_learner3 as bl
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
 import pygame
@@ -94,22 +94,85 @@ def save_checkpoint(path, agent, optim_bandit, optim_motor, extra):
 
                     
 def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print_this_session=False):
+    """
+    Rollout consistent with update2() in var_bandit_learner2_3mha_complete.py:
+      - action selection uses policy_net_il / policy_net_obs
+      - teacher/self latent state variables updated via 3 encoder MHAs with key_padding_mask (no manual filtering)
+      - preserves env protocol:
+          * episode end: term from env.step
+          * trial end: info.get("trial_ended")
+          * teacher action on AO-o/OL-o: info.get("selected_target")
+      - AO-o reward is stored as 2 (NO_FEEDBACK) to match training convention
+    """
 
     def log(*args, **kwargs):
         if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
-    # h_rnn = torch.zeros(1, agent.rnn.hidden_size, device=device)  # GRU hidden state
-    q_left_tokens = []   # past pair keys (1,H)
-    q_right_tokens = []   # past pair keys (1,H)
-    k_tokens = []   # past keys (1,H)
-    o_tokens = []   # past outcome values (1,H)
-    q_this_trial = None
+    # -----------------------------
+    # Helpers: compute last-step z using masked MHA over full history tokens
+    # -----------------------------
+    @torch.no_grad()
+    def _infer_last_z(x_seq, keep_mask_tb, encoder, ln):
+        L = x_seq.size(0)
+        if L == 0:
+            return torch.zeros(agent.z_dim, device=device)
 
+        # key_padding_mask: True = ignore. Shape (1,L)
+        kpm = (~keep_mask_tb).view(1, L)
+
+        # If no allowed keys exist in the whole sequence, return zeros
+        if (~kpm).sum() == 0:
+            return torch.zeros(agent.z_dim, device=device)
+
+        attn_mask = torch.triu(
+            torch.ones((L, L), device=device, dtype=torch.bool),
+            diagonal=1
+        )
+
+        # --- safe attention: bypass rows with zero valid keys in prefix ---
+        valid_query = ((~kpm).cumsum(dim=1) > 0)        # (1,L)
+        valid_query_T = valid_query.T.unsqueeze(-1)     # (L,1,1)
+
+        h, _ = encoder(x_seq, x_seq, x_seq,
+                       attn_mask=attn_mask,
+                       key_padding_mask=kpm)
+
+        # kill NaNs/Infs coming from attention kernel
+        # h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # fallback to residual (skip attention) where query had no valid keys
+        h = torch.where(valid_query_T, h, x_seq)
+
+        # apply residual + LN
+        h = ln(h + x_seq)
+
+        q = agent.post_head(h[-1])             # (1, 2*zdim)
+        mu = q[..., :agent.z_dim].squeeze(0)   # (zdim,)
+        # mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        return mu
+
+
+    # -----------------------------
+    # Memory: store full event tokens so encoder inference matches training x_all
+    # -----------------------------
+    x_tokens = []  # list of (1,H) event tokens in time order
+    actor_ids = [] # list of int: 0=self,1=teacher
+    cond_ids = []  # list of str: "IL","AO-s","AO-o","OL-s","OL-o"
+
+    # -----------------------------
+    # Latent state vars used by update2 policy loop
+    # -----------------------------
+    z_il_tm1   = torch.zeros(agent.z_dim, device=device)
+    z_ao_s_tm1 = torch.zeros(agent.z_dim, device=device)
+    z_ol_s_tm1 = torch.zeros(agent.z_dim, device=device)
+    z_ao_o_last = torch.zeros(agent.z_dim, device=device)
+    z_ol_o_last = torch.zeros(agent.z_dim, device=device)
 
     obs, info = env.reset()
     done = False
 
+    # bookkeeping arrays expected downstream (kept consistent with your current code)
     pair_index_counter_il = np.ones(session_K, dtype=np.int32) * -1
     pair_index_counter_ao = np.ones(session_K, dtype=np.int32) * -1
     pair_index_counter_ol = np.ones(session_K, dtype=np.int32) * -1
@@ -134,10 +197,15 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     trial_cond_buf = []
     actor_buf = []
 
-
+    # per-trial cached
     choice_target = None
-    p_left = torch.tensor(0.5)
-    p_right = torch.tensor(0.5)
+    curr_trial_condition = None
+    left_feats = None
+    right_feats = None
+    inp_pair = None
+    x_dec = None
+    a_t = None
+    probs = None
 
     while not done:
         obs_tensor = (
@@ -147,11 +215,10 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         )
 
         # -----------------------------
-        # CHOICE at trial start
+        # Trial start: observe stimuli + choose action using policy_net
         # -----------------------------
         if ep_start_flag == 1.0:
             left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
-
             curr_trial_condition = info.get("curr_trial_condition")
 
             left_feats = agent.encode(left_view)    # (1,F)
@@ -160,67 +227,60 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
             right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
 
-            # Build query token (swap-invariant) and attend over history
-            # Build query token (swap-invariant) and attend over history
-            q_left = agent.q_in(left_feats)    # (T,B,H)
-            q_right = agent.q_in(right_feats)  # (T,B,H)
+            lr_concat = torch.cat([left_feats, right_feats], dim=-1)  # (1,2F)
+            inp_pair = agent.inp_emb(lr_concat)                       # (1,H)
 
-            Tpast = len(o_tokens)
-            if Tpast == 0:
-                ctx_left = agent.attn_ln(q_left.unsqueeze(0))
-                ctx_right = agent.attn_ln(q_right.unsqueeze(0))
+            # training uses x_dec = inp + actor_emb
+            actor_self = agent.actor(torch.tensor([0], device=device, dtype=torch.long))  # (1,H)
+            x_dec = inp_pair + actor_self  # (1,H)
+            tau = 0.2
+
+            # Choose action ONLY on self-choice trials (IL, AO-s, OL-s).
+            if (curr_trial_condition == "IL"):
+                logits = agent.policy_net_il(torch.cat([x_dec.squeeze(0), z_il_tm1], dim=-1)).view(1, 2)
+                # logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+                # logits = logits.clamp(-20, 20)
+                logits = logits/tau
+                dist = torch.distributions.Categorical(logits=logits)
+                probs = dist.probs.detach().cpu().numpy()
+                a_t = dist.sample().squeeze().to(torch.long)    # scalar
+                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+
+            elif (curr_trial_condition == "AO-s"):
+                logits = agent.policy_net_obs(torch.cat([x_dec.squeeze(0), z_ao_s_tm1, z_ao_o_last], dim=-1)).view(1, 2)
+                # logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+                # logits = logits.clamp(-20, 20)
+                logits = logits/tau
+                dist = torch.distributions.Categorical(logits=logits)
+                probs = dist.probs.detach().cpu().numpy()
+                a_t = dist.sample().squeeze().to(torch.long)  
+                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+
+            elif (curr_trial_condition == "OL-s"):
+                logits = agent.policy_net_obs(torch.cat([x_dec.squeeze(0), z_ol_s_tm1, z_ol_o_last], dim=-1)).view(1, 2)
+                # logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+                # logits = logits.clamp(-20, 20)
+                logits = logits/tau
+                dist = torch.distributions.Categorical(logits=logits)
+                probs = dist.probs.detach().cpu().numpy()
+                a_t = dist.sample().squeeze().to(torch.long)  
+                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+
             else:
-                # query is CURRENT token (len=1)
-                ql = q_left.unsqueeze(0)           # (1,1,H)
-                qr = q_right.unsqueeze(0)          # (1,1,H)
-
-                # keys/values are PAST tokens
-                k = torch.stack(k_tokens, dim=0)   # (Tpast,1,H)
-                v = torch.stack(o_tokens, dim=0)   # (Tpast,1,H)
-
-                # print("K shape:", k.shape, "V shape:", v.shape)
-
-                ctx_left,  _ = agent.attn(ql, k, v)
-                ctx_right, _ = agent.attn(qr, k, v)
-
-                ctx_left  = agent.attn_ln(ctx_left  + ql)
-                ctx_right = agent.attn_ln(ctx_right + qr)
-
-
-            if(curr_trial_condition != "AO-o" and curr_trial_condition != "OL-o"):
-
-                left_logits  = agent.reward_compute(ctx_left,  left_feats.unsqueeze(0))   # (1,1,F)
-                right_logits = agent.reward_compute(ctx_right, right_feats.unsqueeze(0))
-
-                tau = 0.2  # temperature: smaller => more decisive; try 0.05–1.0
-
-                action_logits = torch.cat([left_logits, right_logits], dim=-1)  # (1,1,2)
-
-                # Option A: probs (nice for logging)
-                p_choose = torch.softmax(action_logits / tau, dim=-1)           # (1,1,2)
-                p_left  = p_choose[0, 0, 0]
-                p_right = p_choose[0, 0, 1]
-
-                # log("p_left:", p_left, "p_right:", p_right)
-
-                # Sample action from categorical distribution
-                dist = torch.distributions.Categorical(probs=p_choose[0, 0])    # (2,)
-                a_t = dist.sample()                                            # scalar: 0=left, 1=right
-
-                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()  # (1,2)
-            else:
-                # observational trial: no choice, use env-chosen action
-                a_t = 0  # Dummy
-                choice_target = F.one_hot(torch.tensor(a_t), num_classes=2).unsqueeze(0).float()  # (1,2)
-                log("Obs trial: env chose ", "left" if a_t == 0 else "right")    
-
+                # Observational trials: AO-o / OL-o
+                # If env reveals selected_target early, use it; otherwise placeholder until trial end.
+                a_env = info.get("selected_target", None)
+                if a_env is not None and int(a_env) in (0, 1):
+                    a_t = torch.tensor(int(a_env), device=device, dtype=torch.long)
+                else:
+                    a_t = torch.tensor(0, device=device, dtype=torch.long)
+                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
 
             meta_ep_len += 1
             ep_start_flag = 0.0
 
-
         # -----------------------------
-        # MOTOR step
+        # Motor step (exact env usage)
         # -----------------------------
         W, H = env.unwrapped.W, env.unwrapped.H
         x_pix, y_pix = env.unwrapped.cursor
@@ -234,9 +294,10 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         chosen_center = left_c_norm if choice_target.argmax(dim=-1).item() == 0 else right_c_norm
         g_norm = chosen_center - xy_norm
 
-        xy_pos_t   = torch.as_tensor(xy_norm).unsqueeze(0).to(device)
-        goal_vec_t = torch.as_tensor(g_norm).unsqueeze(0).to(device)
+        xy_pos_t = torch.as_tensor(xy_norm, device=device).unsqueeze(0)
+        goal_vec_t = torch.as_tensor(g_norm, device=device).unsqueeze(0)
 
+        # print("choice_target.shape=", choice_target.shape, ", xy_pos_t.shape=", xy_pos_t.shape, ", goal_vec_t.shape=", goal_vec_t.shape)
         mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos=xy_pos_t, goal_vec=goal_vec_t)
 
         xy_pos_buf.append(xy_norm)
@@ -252,66 +313,88 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         obs = next_obs
         done = term
 
-        pair_idx_now = info.get("pair_index_in_session", -1)
-
         # -----------------------------
-        # Trial ended => append outcome token + update GRU
+        # Trial end (exact key: trial_ended)
         # -----------------------------
         if info.get("trial_ended"):
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
-            meta_ep_start_torch = torch.tensor([[meta_ep_start]], device=device, dtype=torch.float32)
 
-            actor = 0
-            if curr_trial_condition == "AO-o" or curr_trial_condition == "OL-o":
-                # on obs trials, use env-chosen action
-                a_t = info.get("selected_target", -1)
-                choice_target = F.one_hot(torch.tensor(a_t), num_classes=2).unsqueeze(0).float()  # (1,2)
-                actor = 1
+            actor_id = 0
+            # On observation trials, set action from env
+            if (curr_trial_condition == "AO-o") or (curr_trial_condition == "OL-o"):
+                a_env = info.get("selected_target", -1)
+                a_t = torch.tensor(int(a_env), device=device, dtype=torch.long)
+                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+                actor_id = 1
+
+            # Reward encoding: AO-o has NO_FEEDBACK=2
+            r_idx = int(reward)
             if curr_trial_condition == "AO-o":
-                reward = 2    
-            # rnn_fwd returns RAW GRU out for this trial (outcome token)
-            # o_t, h_rnn = agent.rnn_fwd(left_feats, right_feats, a_oh, r_t, meta_ep_start_torch, h_rnn)  # o_t: (1,H)
+                r_idx = 2
 
-            aL = choice_target[..., 0:1]
-            aR = choice_target[..., 1:2]
+            # Build event token x_all = inp + action + actor + reward  (matches training x_all)
+            action_emb = agent.action(a_t.view(1))  # (1,H)
+            actor_emb  = agent.actor(torch.tensor([actor_id], device=device, dtype=torch.long))  # (1,H)
+            reward_emb = agent.rwd_in(torch.tensor([r_idx], device=device, dtype=torch.long))    # (1,H)
 
-            chosen_feat   = aL * left_feats  + aR * right_feats
-            unchosen_feat = aL * right_feats + aR * left_feats
+            x_event = inp_pair + action_emb + actor_emb + reward_emb  # (1,H)
 
-            # x = r_t.to(left_feats.dtype)
-            action_emb = agent.action(torch.tensor(a_t, dtype=torch.long).unsqueeze(0))  # (1,H)
-            actor_emb = agent.actor(torch.tensor(actor, dtype=torch.long).unsqueeze(0))      # (1,H)
-            reward_emb = agent.rwd_in(torch.tensor(reward, dtype=torch.long).unsqueeze(0))      # (1,H)
-            x = action_emb + actor_emb + reward_emb
+            x_tokens.append(x_event)
+            actor_ids.append(actor_id)
+            cond_ids.append(curr_trial_condition)
 
+            # -----------------------------
+            # Latent updates via 3 MHAs with masking (no manual filtering)
+            # -----------------------------
+            x_seq = torch.stack(x_tokens, dim=0)  # (L,1,H)
+            L = x_seq.size(0)
 
-            o_tokens.append(x)
-            q_left_t = agent.q_in(left_feats)    # (1,H)
-            q_right_t = agent.q_in(right_feats)  # (1,H)
-            q_left_tokens.append(q_left_t)  
-            q_right_tokens.append(q_right_t)
-            #pair_key = q_left_t + q_right_t  # (1,H)
-            pair_key = agent.q_in(chosen_feat)  # (1,H)
-            k_tokens.append(pair_key)
+            actor_t = torch.as_tensor(actor_ids, device=device, dtype=torch.long)  # (L,)
+            cond_list = cond_ids  # python list
 
+            # keep masks for keys/values
+            keep_self = (actor_t == 0)  # self events
+            keep_ao_teacher = torch.as_tensor([c == "AO-o" for c in cond_list], device=device, dtype=torch.bool)
+            keep_ol_teacher = torch.as_tensor([c == "OL-o" for c in cond_list], device=device, dtype=torch.bool)
+
+            # infer last-step posterior mean z for relevant stream
+            if curr_trial_condition in ("IL", "AO-s", "OL-s"):
+                z_last_self = _infer_last_z(x_seq, keep_self, agent.enc_self, agent.self_ln)
+                if curr_trial_condition == "IL":
+                    z_il_tm1 = z_last_self
+                elif curr_trial_condition == "AO-s":
+                    z_ao_s_tm1 = z_last_self
+                else:
+                    z_ol_s_tm1 = z_last_self
+
+            elif curr_trial_condition == "AO-o":
+                z_last_ao = _infer_last_z(x_seq, keep_ao_teacher, agent.enc_teacher_ao, agent.teacher_ao_ln)
+                z_ao_o_last = z_last_ao
+
+            elif curr_trial_condition == "OL-o":
+                z_last_ol = _infer_last_z(x_seq, keep_ol_teacher, agent.enc_teacher_ol, agent.teacher_ol_ln)
+                z_ol_o_last = z_last_ol
+
+            # -----------------------------
+            # Bookkeeping (unchanged)
+            # -----------------------------
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
-            
             selected_high_reward = info.get("selected_high_reward_this_trial", -1)
-            flipped = info.get("side_is_flipped", False)
+            flipped = info.get("prev_side_is_flipped", False)
 
-            if(curr_trial_condition == "IL"):
+            if curr_trial_condition == "IL":
                 pair_index_counter_il[pair_index_ep] += 1
-            elif(curr_trial_condition == "AO-s"):
+            elif curr_trial_condition == "AO-s":
                 pair_index_counter_ao[pair_index_ep] += 1
-            elif(curr_trial_condition == "OL-s"):
-                pair_index_counter_ol[pair_index_ep] += 1        
+            elif curr_trial_condition == "OL-s":
+                pair_index_counter_ol[pair_index_ep] += 1
 
             if (curr_trial_condition == "IL") and selected_high_reward:
                 high_reward_choices_il[pair_index_counter_il[pair_index_ep]] += 1
             elif (curr_trial_condition == "AO-s") and selected_high_reward:
                 high_reward_choice_ao[pair_index_counter_ao[pair_index_ep]] += 1
             elif (curr_trial_condition == "OL-s") and selected_high_reward:
-                high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1        
+                high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1
 
             log(
                 "Ep: ", info.get("trial_index"),
@@ -320,46 +403,27 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 ", iter_ao = ", pair_index_counter_ao[pair_index_ep],
                 ", iter_ol = ", pair_index_counter_ol[pair_index_ep],
                 ", curr_trial_condition =", curr_trial_condition,
-                ", choice target:", choice_target.argmax(dim=-1).item(),
+                ", choice target:", int(choice_target.argmax(dim=-1).item()),
                 ", Reached Target:", info.get("selected_target"),
-                ", reward:", reward,
+                ", reward:", r_idx,
                 ", flipped =", flipped,
                 ", selected_high_reward = ", selected_high_reward,
-                ", p_left =", round(float(p_left), 2),
-                ", p_right =", round(float(p_right), 2)
+                ", probs = ", probs
             )
 
-
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
-            bandit_rewards_buf.append(float(reward))
+            bandit_rewards_buf.append(float(r_idx))
             meta_ep_start_buf.append(float(meta_ep_start))
-            actor_buf.append(actor)
+            actor_buf.append(int(actor_id))
             trial_cond_buf.append(curr_trial_condition)
 
+            # reset for next trial
             choice_target = None
             ep_start_flag = 1.0
 
         t += 1
 
-    log("trial_conditions:", env.unwrapped.trial_cond)
-
-    # session stats
-    high_reward_choice_count_on_left = info.get("high_reward_choice_count_on_left", -1)
-    high_reward_choice_count_on_right = info.get("high_reward_choice_count_on_right", -1)
-    total_left_choices = info.get("total_left_choices", -1)
-    total_right_choices = info.get("total_right_choices", -1)
-
-    log(
-        "Session finished. High-reward choices for il:", high_reward_choices_il,
-        ", High-reward choices for ao:", high_reward_choice_ao,
-        ", High-reward choices for ol:", high_reward_choice_ol,
-        ", High-reward choices on left:", high_reward_choice_count_on_left,
-        ", on right:", high_reward_choice_count_on_right,
-        ", Total left choices:", total_left_choices,
-        ", Total right choices:", total_right_choices,
-    )
-
-
+    # Summary returns (keep existing structure)
     bandit_rewards_arr = np.asarray(bandit_rewards_buf, dtype=np.float32)
     trial_cond_arr = np.asarray(trial_cond_buf)
 
@@ -372,7 +436,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     high_reward_choices_ol = np.array(high_reward_choice_ol, dtype=np.int32)
 
     obs_bandit = {
-        "left":  np.stack(left_obs,  axis=0),
+        "left":  np.stack(left_obs, axis=0),
         "right": np.stack(right_obs, axis=0),
     }
 
@@ -380,9 +444,11 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
         obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf,
         actor_buf, trial_cond_buf,
-        cum_rewards_il, cum_rewards_ao, cum_rewards_ol, 
+        cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
         high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol
     )
+
+
 
 
 @ray.remote(num_cpus=1, num_gpus=0)
@@ -416,9 +482,7 @@ class RolloutWorker:
             input_size=input_size,
             feature_dim=feature_dim,
             rnn_hidden_size=hidden_size,
-            action_dim=2,
-            num_pairs=self.session_K,
-            max_trials=self.session_N * self.session_K,
+            action_dim=2
         ).to(self.device)
 
         agent.load_state_dict(agent_state_dict)
@@ -505,12 +569,10 @@ if __name__ == "__main__":
         input_size=input_size,
         feature_dim=feature_dim,
         rnn_hidden_size=hidden_size,
-        action_dim=2,
-        num_pairs=session_K,
-        max_trials=session_N * session_K,
+        action_dim=2
     )
 
-    optim_bandit = torch.optim.Adam(agent.bandit_parameters(), lr=1e-3)
+    optim_bandit = torch.optim.Adam(agent.bandit_parameters(), lr=1e-4)
     optim_motor  = torch.optim.Adam(agent.motor_parameters(),  lr=1e-3)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

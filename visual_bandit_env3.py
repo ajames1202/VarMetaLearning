@@ -527,12 +527,17 @@ class TwoChoiceReachingEnv(gym.Env):
         prev_pair_idx = int(self.curr_pair_idx)
         prev_trial_idx = int(self.trial_index)
 
+        prev_side_is_flipped = self.side_is_flipped
+        prev_probs = tuple(self.curr_probs)
+        prev_high_side = "L" if prev_probs[0] >= prev_probs[1] else "R"
+
+
         terminated = False
         if trial_ended:
             # print("Trial = ", self.trial_index, ", reached:", reached, ", Condition = ", self.trial_cond[self.trial_index], ", K = ", self.K, ", obs_trial=", self.obs_trial)
             old_pair_idx = self.curr_pair_idx
             # print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
-            if self.trial_cond == "AO-o":
+            if self.trial_cond[prev_trial_idx]  == "AO-o":
                 reward = -1
 
             self.session_reward_sum += float(reward)
@@ -564,6 +569,9 @@ class TwoChoiceReachingEnv(gym.Env):
             "pair_index_in_session": curr_pair_idx,               # current pair (for returned frame)
             "prev_trial_index": prev_trial_idx,                   # previous (the one that just ended)
             "prev_pair_index_in_session": prev_pair_idx,          # previous (the one that just ended)
+            "prev_side_is_flipped": prev_side_is_flipped,
+            "prev_probs": prev_probs,
+            "prev_high_side": prev_high_side,
             "trial_ended": trial_ended,
             "timeout": timeout,
             "selected_target" : chose_side,
