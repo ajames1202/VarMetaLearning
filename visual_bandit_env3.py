@@ -517,6 +517,7 @@ class TwoChoiceReachingEnv(gym.Env):
             trial_ended = True
             if self.obs_trial:
                 self.Q[self.K,chose_side] += self.alpha * (reward - self.Q[self.K,chose_side])
+                self.Q[self.K,1-chose_side] = 1 - self.Q[self.K,chose_side]
 
         # Timeout
         if not trial_ended and self.steps_in_trial >= self.steps_per_trial:
