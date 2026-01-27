@@ -468,7 +468,7 @@ class RolloutWorker:
             session_K=session_K,
             session_N=session_N,
             trial_ms=3000,
-            randomize_sides=True,
+            randomize_sides=False,
             shuffle=True,
         )
 
@@ -498,36 +498,6 @@ class RolloutWorker:
                 worker_id=self.worker_id,
                 print_this_session=print_this_session
             )
-        
-    def collect_teacher_data(self, agent_state_dict, probs_this_session, print_this_session=False):
-        # implement if needed
-        hidden_size = 128
-        feature_dim = 128
-        input_size = feature_dim + 1
-
-        agent = bl.BanditLearner(
-            input_size=input_size,
-            feature_dim=feature_dim,
-            rnn_hidden_size=hidden_size,
-            action_dim=2,
-            num_pairs=self.session_K,
-            max_trials=self.session_N * self.session_K,
-        ).to(self.device)
-
-        agent.load_state_dict(agent_state_dict)
-        agent.eval()
-
-        # set pair probabilities for this worker's env
-        self.env.unwrapped.pair_probs = probs_this_session
-
-        with torch.no_grad():
-            return meta_ep_rollout(
-                self.env, agent, self.device,
-                self.session_K, self.session_N,
-                worker_id=self.worker_id,
-                print_this_session=print_this_session
-            )    
-
 
 
 if __name__ == "__main__":
@@ -646,8 +616,8 @@ if __name__ == "__main__":
                 # L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
                 # R = [1.0 - x for x in L]
 
-                # probs_this_session = [(0.8, 0.2) if np.random.rand() < 0.5 else (0.2, 0.8) for _ in range(session_K)]
-                probs_this_session = [(0.8, 0.2)] * session_K ## Sanity check
+                probs_this_session = [(0.8, 0.2) if np.random.rand() < 0.5 else (0.2, 0.8) for _ in range(session_K)]
+                # probs_this_session = [(0.8, 0.2)] * session_K ## Sanity check
                 probs_list.append(probs_this_session)
 
             # ---------- broadcast current weights (CPU) ----------
