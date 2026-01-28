@@ -562,8 +562,8 @@ class BanditLearner(nn.Module):
 
                     # pol_logits = torch.nan_to_num(pol_logits, nan=0.0, posinf=0.0, neginf=0.0)
                     # pol_logits = pol_logits.clamp(-20, 20)
-
-                    dist = torch.distributions.Categorical(logits=pol_logits)
+                    tau = 0.2
+                    dist = torch.distributions.Categorical(logits=pol_logits/tau)
                     logpi = dist.log_prob(act_final[t, b])
                     # val = rew_final.mean()
                     adv = (rew_final[t, b] - val).detach()
@@ -603,7 +603,7 @@ class BanditLearner(nn.Module):
             # -----------------------------
             contrast = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
             lambda_contrast = 0.05
-            w_ac = 5.0
+            w_ac = 1.0
             w_recon = 1.0
             w_kl = 0.05
 

@@ -10,7 +10,7 @@ import argparse
 
 
 import visual_bandit_env3 as vbe
-import var_bandit_learner2 as bl
+import var_bandit_learner3 as bl
 from bandit_train_batch import meta_ep_rollout
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
@@ -52,8 +52,6 @@ agent = bl.BanditLearner(
     feature_dim=feature_dim,
     rnn_hidden_size=hidden_size,
     action_dim=2,
-    num_pairs=session_K,
-    max_trials=session_N * session_K,
 )
 
 optim_bandit = torch.optim.Adam(agent.bandit_parameters(), lr=1e-3)
@@ -84,7 +82,7 @@ mean_cum_rew_il = 0.0
 mean_cum_rew_ao = 0.0
 mean_cum_rew_ol = 0.0
 
-num_eval_sessions = 500 # larger number for stable eval
+num_eval_sessions = 100 # larger number for stable eval
 weights_ref = {k: v.cpu() for k, v in agent.state_dict().items()}
 
 for i in range(num_eval_sessions):
@@ -105,7 +103,7 @@ for i in range(num_eval_sessions):
         session_K=session_K,
         session_N=session_N,
         trial_ms=3000,
-        randomize_sides=True,
+        randomize_sides=False,
         shuffle=True,
     )
 
@@ -117,8 +115,7 @@ for i in range(num_eval_sessions):
         input_size=input_size,
         feature_dim=feature_dim,
         rnn_hidden_size=hidden_size,
-        action_dim=2,
-        num_pairs=3,
+        action_dim=2
     ).to(device)
 
     agent.load_state_dict(weights_ref)
