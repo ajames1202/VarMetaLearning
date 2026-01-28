@@ -61,6 +61,37 @@ def subset_TBH_grouped(tensor_tbh, t_grid, b_grid):
     return tensor_tbh[t_grid, b_grid]
 
 
+def build_grouped_indices_from_mask(mask_TB: torch.Tensor):
+    """
+    mask_TB: (T,B) bool. True where the event belongs to the subsequence.
+    Returns:
+      t_idx: (Kmax,B) long, time indices (padded with 0)
+      b_idx: (Kmax,B) long, batch indices
+      valid: (Kmax,B) bool, True where (t_idx,b_idx) is real
+    """
+    assert mask_TB.dtype == torch.bool
+    T, B = mask_TB.shape
+    device = mask_TB.device
+
+    counts = mask_TB.sum(dim=0)              # (B,)
+    Kmax = int(counts.max().item()) if B > 0 else 0
+
+    # default padding indices
+    t_idx = torch.zeros((Kmax, B), dtype=torch.long, device=device)
+    b_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(0).expand(Kmax, B)
+    valid = torch.zeros((Kmax, B), dtype=torch.bool, device=device)
+
+    # Fill per batch element, preserving time order
+    for b in range(B):
+        t_list = torch.nonzero(mask_TB[:, b], as_tuple=False).squeeze(-1)  # sorted by time
+        k = t_list.numel()
+        if k > 0:
+            t_idx[:k, b] = t_list
+            valid[:k, b] = True
+
+    return t_idx, b_idx, valid
+
+
 # ----------------------------
 # Vision encoder
 # ----------------------------
@@ -90,7 +121,7 @@ class BanditLearner(nn.Module):
     """
     HiT-DVAE-style sequential latent model with:
       - 3 encoder MHAs (self, teacher_AO, teacher_OL) using key_padding_mask (no manual memory filtering)
-      - DVAE prior via z-space decoder MHA (dec_teacher) + prior_head
+      - DVAE prior via z-space decoder MHA (dec_z) + prior_head
       - Action reconstruction from z using action_dec (+ optional reward recon for OL)
       - Actor-critic policy learning using carried teacher latent (AO-o -> AO-s, OL-o -> OL-s)
       - Motor policy unchanged
@@ -131,8 +162,10 @@ class BanditLearner(nn.Module):
             nn.Linear(rnn_hidden_size, 2 * z_dim),
         )
 
+
+
         # z-space decoder for prior p(z_{t+1}|...)
-        self.dec_teacher = nn.MultiheadAttention(embed_dim=z_dim, num_heads=4, dropout=0.0)
+        self.dec_z = nn.MultiheadAttention(embed_dim=z_dim, num_heads=4, dropout=0.0)
         self.prior_head = nn.Sequential(
             nn.Linear(z_dim, z_dim),
             nn.ReLU(),
@@ -180,36 +213,57 @@ class BanditLearner(nn.Module):
             nn.Linear(128, 2),
         )
 
-        # Optional: predicted reward probs for rollout policy (kept from your code)
-        self.arm_reward_head = nn.Sequential(
-            nn.Linear(rnn_hidden_size + feature_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-        )
-
     # ----------------------------
     # Parameter groups
     # ----------------------------
     def bandit_parameters(self):
+        """
+        Parameters used by the bandit learner (policy/value + latent inference/decoding).
+        IMPORTANT: includes standalone nn.Parameters like bos_token.
+        """
         modules = [
+            # perception / backbone
             self.enc,
             self.inp_emb,
-            self.actor, self.action, self.rwd_in,
-            self.enc_self, self.enc_teacher_ao, self.enc_teacher_ol,
-            self.self_ln, self.teacher_ao_ln, self.teacher_ol_ln,
+            self.actor,
+            self.action,
+            self.rwd_in,
+
+
+            # posterior / encoders
             self.post_head,
-            self.dec_teacher, self.prior_head,
+            self.enc_self,
+            self.enc_teacher_ao,
+            self.enc_teacher_ol,
+            self.self_ln,
+            self.teacher_ao_ln,
+            self.teacher_ol_ln,
+
+            # DVAE prior/decoders
+            self.dec_z,
+            self.prior_head,
+            self.action_dec,
+            self.reward_dec,
+            self.a_logits,
+            self.r_logits,
             self.H_to_z,
-            self.action_dec, self.reward_dec,
-            self.a_logits, self.r_logits,
             self.attn_ln2,
-            self.policy_net_il, self.policy_net_obs,
-            self.critic_net_il, self.critic_net_obs,
-            self.arm_reward_head,
+
+            # actor-critic heads
+            self.policy_net_il,
+            self.critic_net_il,
+            self.policy_net_obs,
+            self.critic_net_obs
         ]
+
+        # Yield module parameters
         for m in modules:
-            for p in m.parameters():
-                yield p
+            yield from m.parameters()
+
+        # Yield standalone parameters (BOS token, etc.)
+        if hasattr(self, "bos_token") and isinstance(self.bos_token, torch.nn.Parameter):
+            yield self.bos_token
+
 
     def motor_parameters(self):
         modules = [self.mlp_pos, self.mlp_goal, self.mu_head, self.log_std_head]
@@ -223,17 +277,6 @@ class BanditLearner(nn.Module):
     def encode(self, obs_nchw):
         return self.enc(obs_nchw)
 
-    def reward_compute(self, h, left_feats, right_feats):
-        """
-        h: (1,1,H) or (T,B,H) context
-        left_feats/right_feats: (1,1,F) or (T,B,F)
-        Returns p_left, p_right each (...,1)
-        """
-        left_in = torch.cat([h, left_feats], dim=-1)
-        right_in = torch.cat([h, right_feats], dim=-1)
-        left_p = torch.sigmoid(self.arm_reward_head(left_in))
-        right_p = torch.sigmoid(self.arm_reward_head(right_in))
-        return left_p, right_p
 
     def motor_fwd(self, choice_target, xy_pos=None, goal_vec=None):
         pos_emb  = self.mlp_pos(xy_pos)
@@ -321,6 +364,13 @@ class BanditLearner(nn.Module):
         # indices for grouped subsequences (K,B)
         t_ao_o_idx, b_ao_o_idx, _, _ = get_time_batch_indices_for_label(trial_cond, "AO-o", device=device)
         t_ol_o_idx, b_ol_o_idx, _, _ = get_time_batch_indices_for_label(trial_cond, "OL-o", device=device)
+        t_il_idx, b_il_idx, _, _ = get_time_batch_indices_for_label(trial_cond, "IL", device=device)
+        t_ao_s_idx, b_ao_s_idx, _, _ = get_time_batch_indices_for_label(trial_cond, "AO-s", device=device)
+        t_ol_s_idx, b_ol_s_idx, _, _ = get_time_batch_indices_for_label(trial_cond, "OL-s", device=device)
+        t_self_idx = torch.concat([t_il_idx, t_ao_s_idx, t_ol_s_idx], dim = -1)
+        b_self_idx = torch.concat([b_il_idx, b_ao_s_idx, b_ol_s_idx], dim = -1)
+
+
 
         # final aligned buffers for policy loop
         z_final  = torch.zeros(T, B, self.z_dim, device=device)
@@ -425,8 +475,56 @@ class BanditLearner(nn.Module):
 
 
             # -----------------------------
-            # 6) AO-o / OL-o DVAE losses on grouped subsequences (K,B)
+            # 6) Self/ AO-o / OL-o DVAE losses on grouped subsequences (K,B)
             # -----------------------------
+            #Self
+            t_idx, b_idx, valid = build_grouped_indices_from_mask(mask_self)
+
+            x_self = x_all[t_idx, b_idx]   # (K,B,H)
+            action_self = action_all[t_idx, b_idx]
+            rewards_self = rewards_rnn[t_idx, b_idx]
+            z_selfK   = z_self[t_idx, b_idx]         # (K,B,z)
+            mu_selfK  = mu_self[t_idx, b_idx]        # (K,B,z)
+            ls_selfK  = log_std_self[t_idx, b_idx]   # (K,B,z)
+
+
+            K_self = x_self.size(0)
+            if K_self >= 2:
+                
+                attn_mask_Lm1 = torch.triu(torch.ones((K_self - 1, K_self - 1), device=device, dtype=torch.bool), diagonal=1)
+                u_self_tplus1, _ = self.dec_z(self.H_to_z(x_self[:-1]), z_selfK[:-1], z_selfK[:-1], attn_mask=attn_mask_Lm1)
+                u_self_tplus1 = self.attn_ln2(u_self_tplus1)
+
+                Dz = self.z_dim
+                p_params = self.prior_head(u_self_tplus1)
+                mu_prior, log_std_prior = p_params[..., :Dz], p_params[..., Dz:]
+                log_std_prior = log_std_prior.clamp(-5.0, 2.0)
+
+                mu_q_next = mu_selfK[1:]
+                log_std_q_next = ls_selfK[1:]
+                # kl = (log_std_q_next - log_std_prior +
+                #       (log_std_q_next.exp().pow(2) + (mu_q_next - mu_prior).pow(2)) /
+                #       (2.0 * log_std_prior.exp().pow(2)) - 0.5)
+                kl = self.kl_normal(mu_q_next, log_std_q_next, mu_prior, log_std_prior)
+                kl_err_self = kl.sum(-1).mean()
+            else:
+                kl_err_self = torch.zeros((), device=device)
+
+            x_self_z = self.H_to_z(x_self)
+            bos = torch.zeros(1, B, Dz, device=device)
+            kv = torch.cat([bos, x_self_z[:-1]], dim=0)
+            attn_mask_rec = torch.triu(torch.ones((K_self, K_self), device=device, dtype=torch.bool), diagonal=1)
+
+            out_a, _ = self.action_dec(z_selfK, kv, kv, attn_mask=attn_mask_rec)
+            logits_a = self.a_logits(out_a)
+            self_choice_loss = F.cross_entropy(logits_a.reshape(-1, 2), action_self.reshape(-1))
+
+            out_r, _ = self.reward_dec(z_selfK, kv, kv, attn_mask=attn_mask_rec)
+            logits_r = self.r_logits(out_r)
+            self_reward_loss = F.binary_cross_entropy_with_logits(logits_r, rewards_self.float())
+
+
+
             # AO-o
             x_ao_o = subset_TBH_grouped(x_all, t_ao_o_idx, b_ao_o_idx)                 # (K,B,H)
             z_ao_o = subset_TBH_grouped(z_ao, t_ao_o_idx, b_ao_o_idx)                  # (K,B,z)
@@ -440,7 +538,7 @@ class BanditLearner(nn.Module):
             # prior + KL
             if K_ao >= 2:
                 attn_mask_Lm1 = torch.triu(torch.ones((K_ao - 1, K_ao - 1), device=device, dtype=torch.bool), diagonal=1)
-                u_ao_tplus1, _ = self.dec_teacher(self.H_to_z(x_ao_o[:-1]), z_ao_o[:-1], z_ao_o[:-1], attn_mask=attn_mask_Lm1)
+                u_ao_tplus1, _ = self.dec_z(self.H_to_z(x_ao_o[:-1]), z_ao_o[:-1], z_ao_o[:-1], attn_mask=attn_mask_Lm1)
                 u_ao_tplus1 = self.attn_ln2(u_ao_tplus1)
 
                 p_params = self.prior_head(u_ao_tplus1)
@@ -480,7 +578,7 @@ class BanditLearner(nn.Module):
             K_ol = x_ol_o.size(0)
             if K_ol >= 2:
                 attn_mask_Lm1 = torch.triu(torch.ones((K_ol - 1, K_ol - 1), device=device, dtype=torch.bool), diagonal=1)
-                u_ol_tplus1, _ = self.dec_teacher(self.H_to_z(x_ol_o[:-1]), z_ol_o[:-1], z_ol_o[:-1], attn_mask=attn_mask_Lm1)
+                u_ol_tplus1, _ = self.dec_z(self.H_to_z(x_ol_o[:-1]), z_ol_o[:-1], z_ol_o[:-1], attn_mask=attn_mask_Lm1)
                 u_ol_tplus1 = self.attn_ln2(u_ol_tplus1)
 
                 p_params = self.prior_head(u_ol_tplus1)
@@ -609,8 +707,8 @@ class BanditLearner(nn.Module):
 
 
             beh_loss = (w_ac * (actor_loss + critic_loss) +
-            w_recon * (ao_choice_loss + ol_choice_loss + ol_reward_loss) +
-            w_kl * (kl_err_ao + kl_err_ol))
+            w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
+            w_kl * (kl_err_self+ kl_err_ao + kl_err_ol))
 
             print("actor_loss =",round(actor_loss.item(),2), ", critic_loss =", round(critic_loss.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2))
             bandit_total = beh_loss + lambda_contrast * contrast

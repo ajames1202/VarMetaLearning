@@ -169,7 +169,9 @@ class TwoChoiceReachingEnv(gym.Env):
         # Rendering
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
-        shuffle: bool = True
+        shuffle: bool = True,
+        alpha: Optional[List] = None,
+        tau: Optional[List] = None
     ):
         super().__init__()
 
@@ -215,6 +217,8 @@ class TwoChoiceReachingEnv(gym.Env):
         self.session_id = 0
 
         self.shuffle = shuffle
+        self.alpha = alpha  
+        self.tau = tau
 
         self._build_static_canvas()
 
@@ -408,8 +412,8 @@ class TwoChoiceReachingEnv(gym.Env):
         self.prev_cursor = self.cursor.copy()
 
         self.Q = np.zeros((3,2))  # Q-values for each condition and each side
-        self.alpha = 0.2886           # learning rate
-        self.tau = 0.3302              # softmax temperature
+        # self.alpha = self.alphas           # learning rate
+        # self.tau = self.taus              # softmax temperature
 
 
         # First frame
@@ -447,7 +451,7 @@ class TwoChoiceReachingEnv(gym.Env):
         if self.obs_trial:
             q_left = self.Q[self.K,self.curr_labels[0]]
             q_right = self.Q[self.K,self.curr_labels[1]]
-            prob_right = np.exp(q_right/self.tau) / (np.exp(q_left/self.tau) + np.exp(q_right/self.tau))
+            prob_right = np.exp(q_right/self.tau[self.K]) / (np.exp(q_left/self.tau[self.K]) + np.exp(q_right/self.tau[self.K]))
             chosen_side = None
             if np.random.rand() < prob_right:
                 chosen_side = "right"
@@ -516,7 +520,7 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.high_reward_choice_count_on_right += (1 if chose_side == 1 else 0)
             trial_ended = True
             if self.obs_trial:
-                self.Q[self.K,chose_side] += self.alpha * (reward - self.Q[self.K,chose_side])
+                self.Q[self.K,chose_side] += self.alpha[self.K] * (reward - self.Q[self.K,chose_side])
                 self.Q[self.K,1-chose_side] = 1 - self.Q[self.K,chose_side]
 
         # Timeout

@@ -408,7 +408,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 ", reward:", r_idx,
                 ", flipped =", flipped,
                 ", selected_high_reward = ", selected_high_reward,
-                ", probs = ", probs
+                ", probs = ", probs,
+                ", alpha =", env.unwrapped.alpha,
+                ", tau =", env.unwrapped.tau
             )
 
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
@@ -490,6 +492,8 @@ class RolloutWorker:
 
         # set pair probabilities for this worker's env
         self.env.unwrapped.pair_probs = probs_this_session
+        self.env.unwrapped.alpha = [0, np.random.choice([0.09, 0.2]), np.random.choice([0.09, 0.2])]
+        self.env.unwrapped.tau = [0.288, 0.288, 0.288]
 
         with torch.no_grad():
             return meta_ep_rollout(
@@ -531,7 +535,7 @@ if __name__ == "__main__":
     patience = 30
     min_delta = 0.1
     bad = 0
-    warmup_updates = 900
+    warmup_updates = 100
 
 
 
