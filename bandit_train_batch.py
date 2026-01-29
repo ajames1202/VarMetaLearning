@@ -532,10 +532,10 @@ if __name__ == "__main__":
     ema = None
     ema_beta = 0.9
     best_ema = -float("inf")
-    patience = 30
+    patience = 100
     min_delta = 0.1
     bad = 0
-    warmup_updates = 100
+    warmup_updates = 400
 
 
 
