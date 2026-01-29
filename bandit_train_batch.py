@@ -368,12 +368,12 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                     z_ol_s_tm1 = z_last_self
 
             elif curr_trial_condition == "AO-o":
-                z_last_ao = _infer_last_z(x_seq, keep_ao_teacher, agent.enc_teacher_ao, agent.teacher_ao_ln)
-                z_ao_o_last = z_last_ao
+                z_ao_o_last = _infer_last_z(x_seq, keep_ao_teacher, agent.enc_teacher_ao, agent.teacher_ao_ln)
+                # z_ao_o_last = z_last_ao
 
             elif curr_trial_condition == "OL-o":
-                z_last_ol = _infer_last_z(x_seq, keep_ol_teacher, agent.enc_teacher_ol, agent.teacher_ol_ln)
-                z_ol_o_last = z_last_ol
+                z_ol_o_last = _infer_last_z(x_seq, keep_ol_teacher, agent.enc_teacher_ol, agent.teacher_ol_ln)
+                # z_ol_o_last = z_last_ol
 
             # -----------------------------
             # Bookkeeping (unchanged)
