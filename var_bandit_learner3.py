@@ -213,6 +213,20 @@ class BanditLearner(nn.Module):
             nn.Linear(128, 2),
         )
 
+        # z-space attention to extract AO memory context
+        self.fuse_attn = nn.MultiheadAttention(embed_dim=self.z_dim, num_heads=4, dropout=0.0)
+
+        # produce a Gaussian posterior from [self_belief, ao_context]
+        self.fuse_post_head = nn.Sequential(
+            nn.Linear(2 * self.z_dim, 2 * self.z_dim),
+            nn.ReLU(),
+            nn.Linear(2 * self.z_dim, 2 * self.z_dim),
+        )
+
+        # Reward model / Q-function heads (predict reward prob for each action)
+        self.q_net  = nn.Sequential(nn.Linear(rnn_hidden_size + z_dim, 128), nn.ReLU(), nn.Linear(128, 2))
+
+
     # ----------------------------
     # Parameter groups
     # ----------------------------
@@ -253,8 +267,12 @@ class BanditLearner(nn.Module):
             self.policy_net_il,
             self.critic_net_il,
             self.policy_net_obs,
-            self.critic_net_obs
-        ]
+            self.critic_net_obs,
+
+            self.fuse_attn,
+            self.fuse_post_head,
+            self.q_net
+       ]
 
         # Yield module parameters
         for m in modules:
@@ -316,6 +334,39 @@ class BanditLearner(nn.Module):
         var_p = torch.exp(2 * log_std_p)
         return (log_std_p - log_std_q) + 0.5 * (var_q + (mu_q - mu_p).pow(2)) / var_p - 0.5
 
+
+    def fuse_ctx_causal_bos(self, query_tbz, key_tbz, key_padding_mask_bt):
+        """
+        query_tbz: (T,B,z)
+        key_tbz:   (T,B,z)
+        key_padding_mask_bt: (B,T) with True=mask/ignore
+        Returns: ctx (T,B,z) with BOS-safe causal attention (never all-masked).
+        """
+        T, B, Z = key_tbz.shape
+        dev = key_tbz.device
+        dtype = key_tbz.dtype
+
+        # BOS key/value (always valid)
+        bos = torch.zeros((1, B, Z), device=dev, dtype=dtype)
+        key2 = torch.cat([bos, key_tbz], dim=0)   # (T+1,B,Z)
+        val2 = key2
+
+        # prepend BOS to key padding mask (BOS is never masked)
+        bos_kpm = torch.zeros((B, 1), device=dev, dtype=torch.bool)
+        kpm2 = torch.cat([bos_kpm, key_padding_mask_bt], dim=1)  # (B,T+1)
+
+        # causal attn mask for (L=T queries, S=T+1 keys)
+        # allow keys up to current time index (+1 because of BOS at position 0)
+        attn_mask = torch.triu(torch.ones((T, T + 1), device=dev, dtype=torch.bool), diagonal=2)
+
+        ctx, _ = self.fuse_attn(
+            query=query_tbz,
+            key=key2,
+            value=val2,
+            attn_mask=attn_mask,
+            key_padding_mask=kpm2,
+        )
+        return ctx
 
 
 
@@ -608,92 +659,121 @@ class BanditLearner(nn.Module):
             logits_r = self.r_logits(out_r)
             ol_reward_loss = F.binary_cross_entropy_with_logits(logits_r, rewards_ol_o.float())
 
-            # -----------------------------
-            # 7) Actor-critic loss over aligned timeline
-            # -----------------------------
-            actor_loss = torch.zeros((), device=device)
-            critic_loss = torch.zeros((), device=device)
-            count = 0
+            ##########
+            #     FUSING z_ao_o & a_zo_s
+            ########
 
-            advs = []
-            logpis = []
-            entropies = []
-            values = []
-            rewards = []
+            # mask for AO entries (AO-o and AO-s)
+            mask_AOo = torch.as_tensor((trial_cond == "AO-o"), device=device)
+            mask_AOs = torch.as_tensor((trial_cond == "AO-s"), device=device)
+            mask_AO_entries = mask_AOo | mask_AOs            # (T,B)
 
+            # key padding mask in MHA wants shape (B,T) with True=PAD(ignored)
+            kpm_ao_entries = (~mask_AO_entries).T            # (B,T)
+
+            # causal mask (T,T) True = block future
+            attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=0)
+
+            # Q = mu_self,  K=V = z_ac (or could use mu_ao-only buffer; z_ac is easiest)
+          
+            ao_ctx = self.fuse_ctx_causal_bos(mu_self, z_ac, kpm_ao_entries)
+
+
+
+
+            # fused Gaussian params
+            fused_params = self.fuse_post_head(torch.cat([mu_self, ao_ctx], dim=-1))
+            mu_fused_ao = fused_params[..., :self.z_dim]
+            log_std_fused_ao = fused_params[..., self.z_dim:].clamp(-5.0, 2.0)
+
+            # IG_t = KL(q_fused || q_self)
+            # strong suggestion: detach the baseline so IG gradients push fusion/AO-use, not the self encoder
+            ig_t = self.kl_normal(mu_fused_ao, log_std_fused_ao,
+                                mu_self.detach(), log_std_self.detach()
+                                ).sum(-1)  # (T,B)
+            ig_ao_s = ig_t[mask_AOs].mean() if mask_AOs.any() else torch.zeros((), device=device)
+
+
+            ##########
+            #     FUSING z_ao_o & a_zo_s
+            ########
+
+            mask_OLo = torch.as_tensor((trial_cond == "OL-o"), device=device)
+            mask_OLs = torch.as_tensor((trial_cond == "OL-s"), device=device)
+            mask_OL_entries = mask_OLo | mask_OLs            # (T,B)
+
+            # key padding mask in MHA wants shape (B,T) with True=PAD(ignored)
+            kpm_ol_entries = (~mask_OL_entries).T            # (B,T)
+
+            # causal mask (T,T) True = block future
+            attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=0)
+
+            # Q = mu_self,  K=V = z_ac (or could use mu_ao-only buffer; z_ac is easiest)
+            ol_ctx = self.fuse_ctx_causal_bos(mu_self, z_ac, kpm_ol_entries)
+
+            # fused Gaussian params
+            fused_params = self.fuse_post_head(torch.cat([mu_self, ol_ctx], dim=-1))
+            mu_fused_ol = fused_params[..., :self.z_dim]
+            log_std_fused_ol = fused_params[..., self.z_dim:].clamp(-5.0, 2.0)
+
+            # IG_t = KL(q_fused || q_self)
+            # strong suggestion: detach the baseline so IG gradients push fusion/AO-use, not the self encoder
+            ig_t = self.kl_normal(mu_fused_ol, log_std_fused_ol,
+                                mu_self.detach(), log_std_self.detach()
+                                ).sum(-1)  # (T,B)
+            ig_ol_s = ig_t[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
+            beta_ig = 0.1
+            loss_ig = -beta_ig * (ig_ao_s + ig_ol_s)
+
+                        # -----------------------------
+            # 7) BCE loss over aligned timeline
+            # -----------------------------
+            q_bce_losses = []
 
             for b in range(B):
                 z_ao_o_last = torch.zeros(self.z_dim, device=device)
                 z_ol_o_last = torch.zeros(self.z_dim, device=device)
-                z_il_tm1 = torch.zeros(self.z_dim, device=device)
-                z_ao_s_tm1 = torch.zeros(self.z_dim, device=device)
-                z_ol_s_tm1 = torch.zeros(self.z_dim, device=device)
+                z_il_tm1    = torch.zeros(self.z_dim, device=device)
+                z_ao_s_tm1  = torch.zeros(self.z_dim, device=device)
+                z_ol_s_tm1  = torch.zeros(self.z_dim, device=device)
 
                 for t in range(T):
                     lab = trial_cond[t, b]
+
+                    # teacher-only AO observation has NO_FEEDBACK (=2), skip BCE target
                     if lab == "AO-o":
-                        # z_ao_o_last = z_final[t, b]
-                        z_ao_o_last = z_ac[t,b]
-                        continue
-                    if lab == "OL-o":
-                        # z_ol_o_last = z_final[t, b]
-                        z_ol_o_last = z_ac[t,b]
+                        z_ao_o_last = z_ac[t, b]
                         continue
 
+                    # teacher OL observation has feedback, can be used as training data
+                    if lab == "OL-o":
+                        z_ol_o_last = z_ac[t, b]
+                        # fall through to compute BCE using this step's action+reward
+
+                    # Build state and choose which Q head
                     if lab == "IL":
-                        pol_logits = self.policy_net_il(torch.cat([x_final[t, b], z_il_tm1], dim=-1))
-                        val = self.critic_net_il(torch.cat([x_final[t, b], z_il_tm1], dim=-1)).squeeze(-1)
-                        # z_il_tm1 = z_final[t, b]
-                        z_il_tm1 = z_ac[t,b]
+                        q_logits = self.q_net(torch.cat([x_final[t, b], mu_self[t,b]], dim=-1))
                     elif lab == "AO-s":
-                        pol_logits = self.policy_net_obs(torch.cat([x_final[t, b], z_ao_s_tm1, z_ao_o_last], dim=-1))
-                        val = self.critic_net_obs(torch.cat([x_final[t, b], z_ao_s_tm1, z_ao_o_last], dim=-1)).squeeze(-1)
-                        # z_ao_s_tm1 = z_final[t, b]
-                        z_ao_s_tm1 = z_ac[t,b]
+                        q_logits = self.q_net(torch.cat([x_final[t, b], mu_fused_ao[t,b]], dim=-1))
                     elif lab == "OL-s":
-                        pol_logits = self.policy_net_obs(torch.cat([x_final[t, b], z_ol_s_tm1, z_ol_o_last], dim=-1))
-                        val = self.critic_net_obs(torch.cat([x_final[t, b], z_ol_s_tm1, z_ol_o_last], dim=-1)).squeeze(-1)
-                        # z_ol_s_tm1 = z_final[t, b]
-                        z_ol_s_tm1 = z_ac[t,b]
+                        q_logits = self.q_net(torch.cat([x_final[t, b], mu_fused_ol[t,b]], dim=-1))
                     else:
                         continue
 
-                    # pol_logits = torch.nan_to_num(pol_logits, nan=0.0, posinf=0.0, neginf=0.0)
-                    # pol_logits = pol_logits.clamp(-20, 20)
-                    tau = 0.2
-                    dist = torch.distributions.Categorical(logits=pol_logits/tau)
-                    logpi = dist.log_prob(act_final[t, b])
-                    # val = rew_final.mean()
-                    adv = (rew_final[t, b] - val).detach()
-                    ent = dist.entropy()
+                    # reward target must be 0/1 (skip if something else)
+                    r = rew_final[t, b]
+                    # if not (r == 0.0 or r == 1.0):
+                    #     continue
 
-                    # adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                    a = act_final[t, b]                       # 0/1 chosen action
+                    chosen_logit = q_logits[a]                # scalar logit for chosen action
+                    q_bce_losses.append(
+                        F.binary_cross_entropy_with_logits(chosen_logit, r)
+                    )
 
-                    # actor_loss += (-(adv * logpi))
-                    # critic_loss += (rew_final[t, b] - val).pow(2)
-                    advs.append(adv)
-                    logpis.append(logpi)
-                    entropies.append(ent)
-                    values.append(val)
-                    rewards.append(rew_final[t, b])
+            q_bce = torch.stack(q_bce_losses).mean() if len(q_bce_losses) else torch.zeros((), device=device)
 
 
-            advs = torch.stack(advs)               # [N]
-            logpis = torch.stack(logpis)           # [N]
-            entropies = torch.stack(entropies)     # [N]
-
-            adv_mean = advs.mean()
-            adv_std  = advs.std(unbiased=False) + 1e-8
-            advs_n = (advs - adv_mean) / adv_std
-
-            # actor loss with normalized advantage
-            entropy_coef = 0.01
-            actor_loss = -(advs_n * logpis).mean() - entropy_coef * entropies.mean()
-
-            # critic loss (MSE)
-            values = torch.stack(values)
-            rewards = torch.stack(rewards)
-            critic_loss = 0.5 * (rewards - values).pow(2).mean()
 
 
             # -----------------------------
@@ -701,16 +781,16 @@ class BanditLearner(nn.Module):
             # -----------------------------
             contrast = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
             lambda_contrast = 0.05
-            w_ac = 5.0
+            w_ac = 1.0
             w_recon = 1.0
             w_kl = 0.05
 
 
-            beh_loss = (w_ac * (actor_loss + critic_loss) +
+            beh_loss = (w_ac * (q_bce) +
             w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
-            w_kl * (kl_err_self+ kl_err_ao + kl_err_ol))
+            w_kl * (kl_err_self+ kl_err_ao + kl_err_ol)+ loss_ig)
 
-            print("actor_loss =",round(actor_loss.item(),2), ", critic_loss =", round(critic_loss.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2))
+            print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2))
             bandit_total = beh_loss + lambda_contrast * contrast
             bandit_total.backward()
 

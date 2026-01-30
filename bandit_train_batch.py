@@ -118,39 +118,58 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if L == 0:
             return torch.zeros(agent.z_dim, device=device)
 
-        # key_padding_mask: True = ignore. Shape (1,L)
+        # key_padding_mask wants (B,T) True=ignore. Here B=1.
         kpm = (~keep_mask_tb).view(1, L)
 
-        # If no allowed keys exist in the whole sequence, return zeros
-        if (~kpm).sum() == 0:
-            return torch.zeros(agent.z_dim, device=device)
-
+        # causal mask (same shape as x_seq length)
         attn_mask = torch.triu(
             torch.ones((L, L), device=device, dtype=torch.bool),
             diagonal=1
         )
 
-        # --- safe attention: bypass rows with zero valid keys in prefix ---
-        valid_query = ((~kpm).cumsum(dim=1) > 0)        # (1,L)
-        valid_query_T = valid_query.T.unsqueeze(-1)     # (L,1,1)
-
-        h, _ = encoder(x_seq, x_seq, x_seq,
-                       attn_mask=attn_mask,
-                       key_padding_mask=kpm)
-
-        # kill NaNs/Infs coming from attention kernel
-        # h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # fallback to residual (skip attention) where query had no valid keys
-        h = torch.where(valid_query_T, h, x_seq)
-
-        # apply residual + LN
+        # IMPORTANT: match update2(): BOS-safe attention + residual + LN
+        h = agent.safe_attn(encoder, x_seq, attn_mask, kpm)   # (L,1,H), BOS handled inside
         h = ln(h + x_seq)
 
-        q = agent.post_head(h[-1])             # (1, 2*zdim)
-        mu = q[..., :agent.z_dim].squeeze(0)   # (zdim,)
-        # mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        q = agent.post_head(h[-1])                            # (1,2*z)
+        mu = q[..., :agent.z_dim].squeeze(0)                  # (z,)
         return mu
+    
+    @torch.no_grad()
+    def fuse_belief(mu_self_q: torch.Tensor, which: str) -> torch.Tensor:
+        """
+        mu_self_q: (z_dim,)
+        which: "AO" or "OL"
+        Returns fused mean mu_fused_* (z_dim,)
+        """
+        L = len(z_ac_tokens)
+        if L == 0:
+            return mu_self_q
+
+        # keys/values are all past z_ac means: (L,1,z)
+        kv = torch.stack(z_ac_tokens, dim=0).unsqueeze(1)
+
+        if which == "AO":
+            keep = torch.as_tensor([c in ("AO-o", "AO-s") for c in cond_ids],
+                                device=device, dtype=torch.bool)
+        else:
+            keep = torch.as_tensor([c in ("OL-o", "OL-s") for c in cond_ids],
+                                device=device, dtype=torch.bool)
+
+        # If no valid entries, skip fusion (prevents all-masked attention NaNs)
+        if keep.sum() == 0:
+            return mu_self_q
+
+        # key_padding_mask: (B,L) True=ignore
+        kpm = (~keep).view(1, L)
+
+        q = mu_self_q.view(1, 1, -1)             # (1,1,z)
+        ctx, _ = agent.fuse_attn(q, kv, kv, key_padding_mask=kpm)  # (1,1,z) :contentReference[oaicite:4]{index=4}
+        fused = agent.fuse_post_head(torch.cat([q, ctx], dim=-1))   # (1,1,2z) :contentReference[oaicite:5]{index=5}
+        mu_fused = fused[..., :agent.z_dim].view(-1)               # (z,)
+        return mu_fused
+
+
 
 
     # -----------------------------
@@ -159,6 +178,9 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     x_tokens = []  # list of (1,H) event tokens in time order
     actor_ids = [] # list of int: 0=self,1=teacher
     cond_ids = []  # list of str: "IL","AO-s","AO-o","OL-s","OL-o"
+    z_ac_tokens = []  # list of (z_dim,) posterior means aligned with x_tokens
+    mu_self_last = torch.zeros(agent.z_dim, device=device)  # last self-stream belief (mean)
+
 
     # -----------------------------
     # Latent state vars used by update2 policy loop
@@ -233,48 +255,34 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             # training uses x_dec = inp + actor_emb
             actor_self = agent.actor(torch.tensor([0], device=device, dtype=torch.long))  # (1,H)
             x_dec = inp_pair + actor_self  # (1,H)
-            tau = 0.2
+            tau = 0.2  # keep your sampling temp
 
-            # Choose action ONLY on self-choice trials (IL, AO-s, OL-s).
-            if (curr_trial_condition == "IL"):
-                logits = agent.policy_net_il(torch.cat([x_dec.squeeze(0), z_il_tm1], dim=-1)).view(1, 2)
-                # logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-                # logits = logits.clamp(-20, 20)
-                logits = logits/tau
-                dist = torch.distributions.Categorical(logits=logits)
-                probs = dist.probs.detach().cpu().numpy()
-                a_t = dist.sample().squeeze().to(torch.long)    # scalar
-                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+            if curr_trial_condition in ("IL", "AO-s", "OL-s"):
 
-            elif (curr_trial_condition == "AO-s"):
-                logits = agent.policy_net_obs(torch.cat([x_dec.squeeze(0), z_ao_s_tm1, z_ao_o_last], dim=-1)).view(1, 2)
-                # logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-                # logits = logits.clamp(-20, 20)
-                logits = logits/tau
-                dist = torch.distributions.Categorical(logits=logits)
-                probs = dist.probs.detach().cpu().numpy()
-                a_t = dist.sample().squeeze().to(torch.long)  
-                choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+                if curr_trial_condition == "IL":
+                    belief = mu_self_last
+                elif curr_trial_condition == "AO-s":
+                    belief = fuse_belief(mu_self_last, which="AO")
+                else:  # "OL-s"
+                    belief = fuse_belief(mu_self_last, which="OL")
 
-            elif (curr_trial_condition == "OL-s"):
-                logits = agent.policy_net_obs(torch.cat([x_dec.squeeze(0), z_ol_s_tm1, z_ol_o_last], dim=-1)).view(1, 2)
-                # logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-                # logits = logits.clamp(-20, 20)
-                logits = logits/tau
-                dist = torch.distributions.Categorical(logits=logits)
+                q_logits = agent.q_net(torch.cat([x_dec.squeeze(0), belief], dim=-1)).view(1, 2)  # :contentReference[oaicite:8]{index=8}
+                q_logits = q_logits / tau
+
+                dist = torch.distributions.Categorical(logits=q_logits)
                 probs = dist.probs.detach().cpu().numpy()
-                a_t = dist.sample().squeeze().to(torch.long)  
+                a_t = dist.sample().squeeze().to(torch.long)
                 choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
 
             else:
-                # Observational trials: AO-o / OL-o
-                # If env reveals selected_target early, use it; otherwise placeholder until trial end.
+                # AO-o / OL-o : teacher acts
                 a_env = info.get("selected_target", None)
                 if a_env is not None and int(a_env) in (0, 1):
                     a_t = torch.tensor(int(a_env), device=device, dtype=torch.long)
                 else:
                     a_t = torch.tensor(0, device=device, dtype=torch.long)
                 choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+
 
             meta_ep_len += 1
             ep_start_flag = 0.0
@@ -374,6 +382,19 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             elif curr_trial_condition == "OL-o":
                 z_ol_o_last = _infer_last_z(x_seq, keep_ol_teacher, agent.enc_teacher_ol, agent.teacher_ol_ln)
                 # z_ol_o_last = z_last_ol
+
+            
+            if curr_trial_condition in ("IL", "AO-s", "OL-s"):
+                # your _infer_last_z(...) for keep_self should have produced the mean for this just-finished self event
+                mu_event = _infer_last_z(x_seq, keep_self, agent.enc_self, agent.self_ln)
+                mu_self_last = mu_event
+            elif curr_trial_condition == "AO-o":
+                mu_event = z_ao_o_last
+            else:  # "OL-o"
+                mu_event = z_ol_o_last
+
+            z_ac_tokens.append(mu_event.detach())
+    
 
             # -----------------------------
             # Bookkeeping (unchanged)
@@ -556,6 +577,7 @@ if __name__ == "__main__":
     # local: ray.init()
     # cluster: ray.init(address="auto")
     # ray.init(ignore_reinit_error=True)
+    ray.init(include_dashboard=False)
 
     # ---------- rollout workers ----------
     workers = [
@@ -564,9 +586,6 @@ if __name__ == "__main__":
     ]
 
     # ---------- Collect teacher data ----------
-
-
-
 
     num_updates = args.num_updates
     B = args.episodes_per_update
