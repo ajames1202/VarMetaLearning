@@ -781,7 +781,7 @@ class BanditLearner(nn.Module):
             # -----------------------------
             contrast = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
             lambda_contrast = 0.05
-            w_ac = 1.0
+            w_ac = 5.0
             w_recon = 1.0
             w_kl = 0.05
 
