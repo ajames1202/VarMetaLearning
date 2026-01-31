@@ -675,21 +675,22 @@ class BanditLearner(nn.Module):
             attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=0)
 
             # Q = mu_self,  K=V = z_ac (or could use mu_ao-only buffer; z_ac is easiest)
-          
-            ao_ctx = self.fuse_ctx_causal_bos(mu_self, z_ac, kpm_ao_entries)
+            
+            ao_ctx = self.fuse_ctx_causal_bos(mu_self.detach(), z_ac.detach(), kpm_ao_entries)
 
 
 
 
             # fused Gaussian params
-            fused_params = self.fuse_post_head(torch.cat([mu_self, ao_ctx], dim=-1))
+            fused_params = self.fuse_post_head(torch.cat([mu_self.detach(), ao_ctx], dim=-1))
             mu_fused_ao = fused_params[..., :self.z_dim]
             log_std_fused_ao = fused_params[..., self.z_dim:].clamp(-5.0, 2.0)
 
             # IG_t = KL(q_fused || q_self)
             # strong suggestion: detach the baseline so IG gradients push fusion/AO-use, not the self encoder
+            log_std_self_ig = log_std_self.clamp(min=-2.0)  
             ig_t = self.kl_normal(mu_fused_ao, log_std_fused_ao,
-                                mu_self.detach(), log_std_self.detach()
+                                mu_self.detach(), log_std_self_ig.detach()
                                 ).sum(-1)  # (T,B)
             ig_ao_s = ig_t[mask_AOs].mean() if mask_AOs.any() else torch.zeros((), device=device)
 
@@ -709,17 +710,17 @@ class BanditLearner(nn.Module):
             attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=0)
 
             # Q = mu_self,  K=V = z_ac (or could use mu_ao-only buffer; z_ac is easiest)
-            ol_ctx = self.fuse_ctx_causal_bos(mu_self, z_ac, kpm_ol_entries)
+            ol_ctx = self.fuse_ctx_causal_bos(mu_self.detach(), z_ac.detach(), kpm_ol_entries)
 
             # fused Gaussian params
-            fused_params = self.fuse_post_head(torch.cat([mu_self, ol_ctx], dim=-1))
+            fused_params = self.fuse_post_head(torch.cat([mu_self.detach(), ol_ctx], dim=-1))
             mu_fused_ol = fused_params[..., :self.z_dim]
             log_std_fused_ol = fused_params[..., self.z_dim:].clamp(-5.0, 2.0)
 
             # IG_t = KL(q_fused || q_self)
-            # strong suggestion: detach the baseline so IG gradients push fusion/AO-use, not the self encoder
+            log_std_self_ig = log_std_self.clamp(min=-2.0)  # floor at exp(2*-2)=exp(-4) ≈ 0.018
             ig_t = self.kl_normal(mu_fused_ol, log_std_fused_ol,
-                                mu_self.detach(), log_std_self.detach()
+                                mu_self.detach(), log_std_self_ig.detach()
                                 ).sum(-1)  # (T,B)
             ig_ol_s = ig_t[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
             beta_ig = 0.1
@@ -782,7 +783,6 @@ class BanditLearner(nn.Module):
 
 
 
-
             # -----------------------------
             # 8) Total bandit loss
             # -----------------------------
@@ -797,7 +797,7 @@ class BanditLearner(nn.Module):
             w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
             w_kl * (kl_err_self+ kl_err_ao + kl_err_ol)+ loss_ig)
 
-            w_kl_fused = 1e-3  # start tiny
+            w_kl_fused = 1e-2  # start tiny
             beh_loss = beh_loss + w_kl_fused * (kl_fused_ao + kl_fused_ol)
 
             print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2), ", loss_ig=", round(loss_ig.item(),2))
