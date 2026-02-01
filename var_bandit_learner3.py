@@ -723,8 +723,6 @@ class BanditLearner(nn.Module):
                                 mu_self.detach(), log_std_self_ig.detach()
                                 ).sum(-1)  # (T,B)
             ig_ol_s = ig_t[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
-            beta_ig = 0.1
-            loss_ig = -beta_ig * (ig_ao_s + ig_ol_s)
 
             zeros = torch.zeros_like(mu_fused_ao)
             zeros_ls = torch.zeros_like(log_std_fused_ao)  # log_std=0 => std=1
@@ -795,10 +793,15 @@ class BanditLearner(nn.Module):
 
             beh_loss = (w_ac * (q_bce) +
             w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
-            w_kl * (kl_err_self+ kl_err_ao + kl_err_ol)+ loss_ig)
+            w_kl * (kl_err_self+ kl_err_ao + kl_err_ol))
 
-            w_kl_fused = 1e-2  # start tiny
-            beh_loss = beh_loss + w_kl_fused * (kl_fused_ao + kl_fused_ol)
+            beta_ig = 0.01
+            loss_ig = beta_ig * (ig_ao_s + ig_ol_s)
+            beh_loss = beh_loss + loss_ig
+
+
+            # w_kl_fused = 1e-2  # start tiny
+            # beh_loss = beh_loss + w_kl_fused * (kl_fused_ao + kl_fused_ol)
 
             print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2), ", loss_ig=", round(loss_ig.item(),2))
             bandit_total = beh_loss + lambda_contrast * contrast
