@@ -513,7 +513,7 @@ class RolloutWorker:
 
         # set pair probabilities for this worker's env
         self.env.unwrapped.pair_probs = probs_this_session
-        self.env.unwrapped.alpha = [0, np.random.choice([0.09, 0.2]), np.random.choice([0.09, 0.2])]
+        self.env.unwrapped.alpha = [0, np.random.choice([0.2, 0.2]), np.random.choice([0.2, 0.2])]
         self.env.unwrapped.tau = [0.288, 0.288, 0.288]
 
         with torch.no_grad():

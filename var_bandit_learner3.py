@@ -803,7 +803,7 @@ class BanditLearner(nn.Module):
             # w_kl_fused = 1e-2  # start tiny
             # beh_loss = beh_loss + w_kl_fused * (kl_fused_ao + kl_fused_ol)
 
-            print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2), ", loss_ig=", round(loss_ig.item(),2))
+            print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2))
             bandit_total = beh_loss + lambda_contrast * contrast
             bandit_total.backward()
 
