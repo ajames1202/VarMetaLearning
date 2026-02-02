@@ -795,9 +795,9 @@ class BanditLearner(nn.Module):
             w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
             w_kl * (kl_err_self+ kl_err_ao + kl_err_ol))
 
-            beta_ig = 0.01
-            loss_ig = beta_ig * (ig_ao_s + ig_ol_s)
-            beh_loss = beh_loss + loss_ig
+            # beta_ig = 0.01
+            # loss_ig = beta_ig * (ig_ao_s + ig_ol_s)
+            # beh_loss = beh_loss + loss_ig
 
 
             # w_kl_fused = 1e-2  # start tiny
