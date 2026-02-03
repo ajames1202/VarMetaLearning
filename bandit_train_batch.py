@@ -556,7 +556,7 @@ if __name__ == "__main__":
     patience = 100
     min_delta = 0.1
     bad = 0
-    warmup_updates = 600
+    warmup_updates = 800
 
 
 
