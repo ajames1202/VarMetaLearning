@@ -711,54 +711,76 @@ class BanditLearner(nn.Module):
             # ig_ol_s = ig_ol[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
 
            
-            # -----------------------------
-            # 7) BCE loss over aligned timeline
-            # -----------------------------
-            q_bce_losses = []
+        # -----------------------------
+        # 7) BCE loss over aligned timeline  (ROLLOUT-MATCHING)
+        # -----------------------------
+        q_bce_losses = []
 
-            for b in range(B):
-                z_ao_o_last = torch.zeros(self.z_dim, device=device)
-                z_ol_o_last = torch.zeros(self.z_dim, device=device)
-                z_il_tm1    = torch.zeros(self.z_dim, device=device)
-                z_ao_s_tm1  = torch.zeros(self.z_dim, device=device)
-                z_ol_s_tm1  = torch.zeros(self.z_dim, device=device)
+        for b in range(B):
+            # Single self belief (matches rollout's mu_self_last)
+            z_self_tm1 = torch.zeros(self.z_dim, device=device)
 
-                for t in range(T):
-                    lab = trial_cond[t, b]
+            # History used for fusion (matches rollout's z_ac_tokens + cond_ids)
+            z_hist = []     # list of (z_dim,) tensors
+            cond_hist = []  # list of strings
 
-                    # teacher-only AO observation has NO_FEEDBACK (=2), skip BCE target
-                    if lab == "AO-o":
-                        z_ao_o_last = z_ac[t, b]
-                        continue
+            def fuse_prefix(mu_self_q: torch.Tensor, which: str) -> torch.Tensor:
+                """Match bandit_train_batch.py fuse_belief() but using prefix-only history."""
+                L = len(z_hist)
+                if L == 0:
+                    return mu_self_q
 
-                    # teacher OL observation has feedback, can be used as training data
-                    if lab == "OL-o":
-                        z_ol_o_last = z_ac[t, b]
-                        # fall through to compute BCE using this step's action+reward
+                kv = torch.stack(z_hist, dim=0).unsqueeze(1)  # (L,1,z)
 
-                    # Build state and choose which Q head
-                    if lab == "IL":
-                        q_logits = self.q_net(torch.cat([x_final[t, b], mu_self[t,b]], dim=-1))
-                    elif lab == "AO-s":
-                        q_logits = self.q_net(torch.cat([x_final[t, b], mu_fused_ao[t,b]], dim=-1))
-                    elif lab == "OL-s":
-                        q_logits = self.q_net(torch.cat([x_final[t, b], mu_fused_ol[t,b]], dim=-1))
-                    else:
-                        continue
+                if which == "AO":
+                    keep = torch.as_tensor([c in ("AO-o", "AO-s") for c in cond_hist],
+                                        device=device, dtype=torch.bool)
+                else:  # "OL"
+                    keep = torch.as_tensor([c in ("OL-o", "OL-s") for c in cond_hist],
+                                        device=device, dtype=torch.bool)
 
-                    # reward target must be 0/1 (skip if something else)
-                    r = rew_final[t, b]
-                    # if not (r == 0.0 or r == 1.0):
-                    #     continue
+                if keep.sum() == 0:
+                    return mu_self_q
 
-                    a = act_final[t, b]                       # 0/1 chosen action
-                    chosen_logit = q_logits[a]                # scalar logit for chosen action
-                    q_bce_losses.append(
-                        F.binary_cross_entropy_with_logits(chosen_logit, r)
-                    )
+                kpm = (~keep).view(1, L)  # True = ignore
+                q = mu_self_q.view(1, 1, -1)
 
-            q_bce = torch.stack(q_bce_losses).mean() if len(q_bce_losses) else torch.zeros((), device=device)
+                ctx, _ = self.fuse_attn(q, kv, kv, key_padding_mask=kpm)
+                fused = self.fuse_post_head(torch.cat([q, ctx], dim=-1))
+                return fused[..., :self.z_dim].view(-1)
 
+            for t in range(T):
+                lab = trial_cond[t, b]
+
+                # ---- belief BEFORE seeing outcome at t (this prevents reward leakage) ----
+                if lab == "IL":
+                    belief = z_self_tm1
+                elif lab == "AO-s":
+                    belief = fuse_prefix(z_self_tm1, which="AO")
+                elif lab == "OL-s":
+                    belief = fuse_prefix(z_self_tm1, which="OL")
+                else:
+                    # teacher trials don't contribute BCE target, but SHOULD enter history for future fusion
+                    if lab in ("AO-o", "OL-o"):
+                        z_hist.append(z_ac[t, b].detach())
+                        cond_hist.append(lab)
+                    continue
+
+                # ---- BCE computed using rollout-matching belief ----
+                q_logits = self.q_net(torch.cat([x_final[t, b], belief], dim=-1))
+                r = rew_final[t, b]
+                a = act_final[t, b]
+                q_bce_losses.append(F.binary_cross_entropy_with_logits(q_logits[a], r))
+
+                # ---- AFTER outcome: update self belief only on self-choice trials ----
+                # z_ac[t,b] is the posterior mean for the just-finished event (ok to use now)
+                z_self_tm1 = z_ac[t, b].detach()
+
+                # history for future fusion (prefix for later timesteps)
+                z_hist.append(z_ac[t, b].detach())
+                cond_hist.append(lab)
+
+        q_bce = torch.stack(q_bce_losses).mean() if len(q_bce_losses) else torch.zeros((), device=device)
 
 
             # -----------------------------
