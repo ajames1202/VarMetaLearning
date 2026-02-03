@@ -783,82 +783,82 @@ class BanditLearner(nn.Module):
         q_bce = torch.stack(q_bce_losses).mean() if len(q_bce_losses) else torch.zeros((), device=device)
 
 
-            # -----------------------------
-            # 8) Total bandit loss
-            # -----------------------------
-            contrast = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
-            lambda_contrast = 0.05
-            w_ac = 5.0
-            w_recon = 1.0
-            w_kl = 0.05
+        # -----------------------------
+        # 8) Total bandit loss
+        # -----------------------------
+        contrast = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
+        lambda_contrast = 0.05
+        w_ac = 5.0
+        w_recon = 1.0
+        w_kl = 0.05
 
 
-            beh_loss = (w_ac * (q_bce) +
-            w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
-            w_kl * (kl_err_self+ kl_err_ao + kl_err_ol))
+        beh_loss = (w_ac * (q_bce) +
+        w_recon * (self_choice_loss+ ao_choice_loss + ol_choice_loss + self_reward_loss + ol_reward_loss) +
+        w_kl * (kl_err_self+ kl_err_ao + kl_err_ol))
 
-            # beta_ig = 0.01
-            # loss_ig = beta_ig * (ig_ao_s + ig_ol_s)
-            # beh_loss = beh_loss + loss_ig
+        # beta_ig = 0.01
+        # loss_ig = beta_ig * (ig_ao_s + ig_ol_s)
+        # beh_loss = beh_loss + loss_ig
 
 
-            # w_kl_fused = 1e-2  # start tiny
-            # beh_loss = beh_loss + w_kl_fused * (kl_fused_ao + kl_fused_ol)
+        # w_kl_fused = 1e-2  # start tiny
+        # beh_loss = beh_loss + w_kl_fused * (kl_fused_ao + kl_fused_ol)
 
-            print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2))
-            bandit_total = beh_loss + lambda_contrast * contrast
-            bandit_total.backward()
+        print("q_bce =",round(q_bce.item(),2), "ao_choice_loss =", round(ao_choice_loss.item(),2), ", ol_choice_loss =", round(ol_choice_loss.item(),2), ", kl_err_ao =", round(kl_err_ao.item(),2), ", kl_err_ol=", round(kl_err_ol.item(),2))
+        bandit_total = beh_loss + lambda_contrast * contrast
+        bandit_total.backward()
 
-            var_loss_sum += float(beh_loss.item())
-            var_slices += 1
+        var_loss_sum += float(beh_loss.item())
+        var_slices += 1
 
-            # -----------------------------
-            # 9) Motor loss (unchanged)
-            # -----------------------------
-            mini_batch_size = 16384
-            total_steps = len(xy_pos_buf)
+        # -----------------------------
+        # 9) Motor loss (unchanged)
+        # -----------------------------
+        mini_batch_size = 16384
+        total_steps = len(xy_pos_buf)
 
-            # -----------------------------
-            # 4) MOTOR loss (unchanged, flat over all steps)
-            # -----------------------------
-            mini_batch_size = 16384
-            total_steps = len(xy_pos_buf)
+        # -----------------------------
+        # 4) MOTOR loss (unchanged, flat over all steps)
+        # -----------------------------
+        mini_batch_size = 16384
+        total_steps = len(xy_pos_buf)
 
-            for start in range(0, total_steps, mini_batch_size):
-                end = min(start + mini_batch_size, total_steps)
+        for start in range(0, total_steps, mini_batch_size):
+            end = min(start + mini_batch_size, total_steps)
 
-                xy_slice = xy_pos[start:end]
-                goal_slice = goalvec[start:end]
-                chosen_slice = chosen_bandits_motor[start:end]
+            xy_slice = xy_pos[start:end]
+            goal_slice = goalvec[start:end]
+            chosen_slice = chosen_bandits_motor[start:end]
 
-                mu, log_std = self.motor_fwd(
-                    chosen_slice,
-                    xy_slice,
-                    goal_slice
-                )
+            mu, log_std = self.motor_fwd(
+                chosen_slice,
+                xy_slice,
+                goal_slice
+            )
 
-                dist = goal_slice.norm(dim=-1, keepdim=True) + 1e-6
-                g_hat = goal_slice / dist
-                speed = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
-                target = (g_hat * speed).clamp(-0.999, 0.999)
-                u_target = atanh(target)
+            dist = goal_slice.norm(dim=-1, keepdim=True) + 1e-6
+            g_hat = goal_slice / dist
+            speed = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
+            target = (g_hat * speed).clamp(-0.999, 0.999)
+            u_target = atanh(target)
 
-                motor_loss_mini = F.mse_loss(mu, u_target)
-                motor_loss_mini.backward()
+            motor_loss_mini = F.mse_loss(mu, u_target)
+            motor_loss_mini.backward()
 
-                motor_loss_sum += float(motor_loss_mini.item())
-                motor_slices += 1
+            motor_loss_sum += float(motor_loss_mini.item())
+            motor_slices += 1
 
-            torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), 1.0)
-            torch.nn.utils.clip_grad_norm_(list(self.motor_parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(list(self.motor_parameters()), 1.0)
 
-            optim_bandit.step()
-            optim_motor.step()
-            with torch.no_grad():
-                for n, p in self.named_parameters():
-                    if not torch.isfinite(p).all():
-                        print("NON-FINITE WEIGHT AFTER STEP:", n)
-                        return float("nan"), float("nan")
+        optim_bandit.step()
+        optim_motor.step()
+        with torch.no_grad():
+            for n, p in self.named_parameters():
+                if not torch.isfinite(p).all():
+                    print("NON-FINITE WEIGHT AFTER STEP:", n)
+                    return float("nan"), float("nan")
 
 
 
