@@ -660,78 +660,58 @@ class BanditLearner(nn.Module):
             ol_reward_loss = F.binary_cross_entropy_with_logits(logits_r, rewards_ol_o.float())
 
             ##########
-            #     FUSING z_ao_o & a_zo_s
-            ########
-
-            # mask for AO entries (AO-o and AO-s)
-            mask_AOo = torch.as_tensor((trial_cond == "AO-o"), device=device)
-            mask_AOs = torch.as_tensor((trial_cond == "AO-s"), device=device)
-            mask_AO_entries = mask_AOo | mask_AOs            # (T,B)
-
-            # key padding mask in MHA wants shape (B,T) with True=PAD(ignored)
-            kpm_ao_entries = (~mask_AO_entries).T            # (B,T)
-
-            # causal mask (T,T) True = block future
-            attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=0)
-
-            # Q = mu_self,  K=V = z_ac (or could use mu_ao-only buffer; z_ac is easiest)
-            
-            ao_ctx = self.fuse_ctx_causal_bos(mu_self.detach(), z_ac.detach(), kpm_ao_entries)
-
-
-
-
-            # fused Gaussian params
-            fused_params = self.fuse_post_head(torch.cat([mu_self.detach(), ao_ctx], dim=-1))
-            mu_fused_ao = fused_params[..., :self.z_dim]
-            log_std_fused_ao = fused_params[..., self.z_dim:].clamp(-5.0, 2.0)
-
-            # IG_t = KL(q_fused || q_self)
-            # strong suggestion: detach the baseline so IG gradients push fusion/AO-use, not the self encoder
-            log_std_self_ig = log_std_self.clamp(min=-2.0)  
-            ig_t = self.kl_normal(mu_fused_ao, log_std_fused_ao,
-                                mu_self.detach(), log_std_self_ig.detach()
-                                ).sum(-1)  # (T,B)
-            ig_ao_s = ig_t[mask_AOs].mean() if mask_AOs.any() else torch.zeros((), device=device)
-
-
+            # PREFIX-FUSE (rollout-matching)
+            # Carry last teacher latent forward (AO-o -> AO-s, OL-o -> OL-s)
             ##########
-            #     FUSING z_ao_o & a_zo_s
-            ########
 
+            mask_AOo = torch.as_tensor((trial_cond == "AO-o"), device=device)  # (T,B)
+            mask_AOs = torch.as_tensor((trial_cond == "AO-s"), device=device)
             mask_OLo = torch.as_tensor((trial_cond == "OL-o"), device=device)
             mask_OLs = torch.as_tensor((trial_cond == "OL-s"), device=device)
-            mask_OL_entries = mask_OLo | mask_OLs            # (T,B)
 
-            # key padding mask in MHA wants shape (B,T) with True=PAD(ignored)
-            kpm_ol_entries = (~mask_OL_entries).T            # (B,T)
+            Z = self.z_dim
 
-            # causal mask (T,T) True = block future
-            attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=0)
+            # prefix buffers: at time t, contains "most recent teacher latent strictly before t"
+            ao_prefix = torch.zeros((T, B, Z), device=device)
+            ol_prefix = torch.zeros((T, B, Z), device=device)
 
-            # Q = mu_self,  K=V = z_ac (or could use mu_ao-only buffer; z_ac is easiest)
-            ol_ctx = self.fuse_ctx_causal_bos(mu_self.detach(), z_ac.detach(), kpm_ol_entries)
+            ao_last = torch.zeros((B, Z), device=device)
+            ol_last = torch.zeros((B, Z), device=device)
 
-            # fused Gaussian params
-            fused_params = self.fuse_post_head(torch.cat([mu_self.detach(), ol_ctx], dim=-1))
-            mu_fused_ol = fused_params[..., :self.z_dim]
-            log_std_fused_ol = fused_params[..., self.z_dim:].clamp(-5.0, 2.0)
+            for t in range(T):
+                # expose last teacher belief to this timestep (this is the "prefix" part)
+                ao_prefix[t] = ao_last
+                ol_prefix[t] = ol_last
 
-            # IG_t = KL(q_fused || q_self)
-            log_std_self_ig = log_std_self.clamp(min=-2.0)  # floor at exp(2*-2)=exp(-4) ≈ 0.018
-            ig_t = self.kl_normal(mu_fused_ol, log_std_fused_ol,
-                                mu_self.detach(), log_std_self_ig.detach()
-                                ).sum(-1)  # (T,B)
-            ig_ol_s = ig_t[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
+                # update memory AFTER writing prefix so AO-o/OL-o affects future timesteps only
+                if mask_AOo[t].any():
+                    ao_last = torch.where(mask_AOo[t].unsqueeze(-1), z_ac[t], ao_last)
+                if mask_OLo[t].any():
+                    ol_last = torch.where(mask_OLo[t].unsqueeze(-1), z_ac[t], ol_last)
 
-            zeros = torch.zeros_like(mu_fused_ao)
-            zeros_ls = torch.zeros_like(log_std_fused_ao)  # log_std=0 => std=1
+            # Fuse params from [self belief, carried teacher belief]
+            # (Detach mu_self to keep fusion learning isolated if you want; matches your current detach usage.)
+            fused_ao_params = self.fuse_post_head(torch.cat([mu_self.detach(), ao_prefix.detach()], dim=-1))
+            mu_fused_ao = fused_ao_params[..., :Z]
+            log_std_fused_ao = fused_ao_params[..., Z:].clamp(-5.0, 2.0)
 
-            kl_fused_ao = self.kl_normal(mu_fused_ao, log_std_fused_ao, zeros, zeros_ls).sum(-1).mean()
-            kl_fused_ol = self.kl_normal(mu_fused_ol, log_std_fused_ol, zeros, zeros_ls).sum(-1).mean()
+            fused_ol_params = self.fuse_post_head(torch.cat([mu_self.detach(), ol_prefix.detach()], dim=-1))
+            mu_fused_ol = fused_ol_params[..., :Z]
+            log_std_fused_ol = fused_ol_params[..., Z:].clamp(-5.0, 2.0)
+
+            # # Optional IG (same as you had, but now using prefix teacher memory instead of attention ctx)
+            # log_std_self_ig = log_std_self.clamp(min=-2.0)
+
+            # ig_ao = self.kl_normal(mu_fused_ao, log_std_fused_ao,
+            #                     mu_self.detach(), log_std_self_ig.detach()).sum(-1)  # (T,B)
+            # ig_ol = self.kl_normal(mu_fused_ol, log_std_fused_ol,
+            #                     mu_self.detach(), log_std_self_ig.detach()).sum(-1)  # (T,B)
+
+            # ig_ao_s = ig_ao[mask_AOs].mean() if mask_AOs.any() else torch.zeros((), device=device)
+            # ig_ol_s = ig_ol[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
 
            
-                        # -----------------------------
+            # -----------------------------
             # 7) BCE loss over aligned timeline
             # -----------------------------
             q_bce_losses = []
