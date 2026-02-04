@@ -740,11 +740,11 @@ class BanditLearner(nn.Module):
 
             # Fuse params from [self belief, carried teacher belief]
             # (Detach mu_self to keep fusion learning isolated if you want; matches your current detach usage.)
-            fused_ao_params = self.fuse_post_head(torch.cat([mu_self.detach(), ao_prefix.detach()], dim=-1))
+            fused_ao_params = self.fuse_post_head(torch.cat([mu_self, ao_prefix], dim=-1))
             mu_fused_ao = fused_ao_params[..., :Z]
             log_std_fused_ao = fused_ao_params[..., Z:].clamp(-5.0, 2.0)
 
-            fused_ol_params = self.fuse_post_head(torch.cat([mu_self.detach(), ol_prefix.detach()], dim=-1))
+            fused_ol_params = self.fuse_post_head(torch.cat([mu_self, ol_prefix], dim=-1))
             mu_fused_ol = fused_ol_params[..., :Z]
             log_std_fused_ol = fused_ol_params[..., Z:].clamp(-5.0, 2.0)
 
@@ -778,7 +778,7 @@ class BanditLearner(nn.Module):
         for t in range(T):
             mu_self_tm1[t] = self_last
             upd = mask_self_choice[t].unsqueeze(-1)  # update after self-choice trials only
-            self_last = torch.where(upd, z_ac[t].detach(), self_last)
+            self_last = torch.where(upd, z_ac[t], self_last)
 
         # (B) determine whether AO/OL has any history strictly before t (to match rollout fallback)
         keep_ao = (mask_AOo | mask_AOs).int()
@@ -794,13 +794,13 @@ class BanditLearner(nn.Module):
         kpm_ao_bt = ~(mask_AOo | mask_AOs).T  # (B,T) True=ignore
         kpm_ol_bt = ~(mask_OLo | mask_OLs).T
         ctx_ao = self.fuse_ctx_causal_bos(
-            query_tbz=mu_self_tm1.detach(),
-            key_tbz=z_ac.detach(),
+            query_tbz=mu_self_tm1,
+            key_tbz=z_ac,
             key_padding_mask_bt=kpm_ao_bt
         )  # (T,B,Z)
         ctx_ol = self.fuse_ctx_causal_bos(
-            query_tbz=mu_self_tm1.detach(),
-            key_tbz=z_ac.detach(),
+            query_tbz=mu_self_tm1,
+            key_tbz=z_ac,
             key_padding_mask_bt=kpm_ol_bt
         )
 
