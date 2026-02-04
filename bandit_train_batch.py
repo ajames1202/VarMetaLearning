@@ -113,41 +113,48 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     # Helpers: compute last-step z using masked MHA over full history tokens
     # -----------------------------
     @torch.no_grad()
-    def _infer_last_z(x_seq, keep_mask_tb, encoder, ln):
-        L = x_seq.size(0)
+    def _infer_last_z(inp_seq, xval_seq, keep_mask_tb, encoder, ln):
+        """
+        Posterior inference consistent with update2() (stimulus-addressed encoders):
+
+          Q,K = stimulus tokens inp_seq
+          V   = xval_seq = action_emb + actor_emb + rwd_emb
+          residual/LN uses full event token x_full = inp + xval
+
+        Shapes:
+          inp_seq: (L,1,H), xval_seq: (L,1,H), keep_mask_tb: (L,)
+        """
+        L = inp_seq.size(0)
         if L == 0:
             return torch.zeros(agent.z_dim, device=device)
 
         # key_padding_mask wants (B,T) True=ignore. Here B=1.
         kpm = (~keep_mask_tb).view(1, L)
 
-        # causal mask (same shape as x_seq length)
-        attn_mask = torch.triu(
-            torch.ones((L, L), device=device, dtype=torch.bool),
-            diagonal=1
-        )
+        h = agent.safe_attn(encoder, inp_seq, xval_seq, kpm)   # (L,1,H), BOS-safe causal inside
 
-        # IMPORTANT: match update2(): BOS-safe attention + residual + LN
-        h = agent.safe_attn(encoder, x_seq, attn_mask, kpm)   # (L,1,H), BOS handled inside
-        h = ln(h + x_seq)
+        x_full = inp_seq + xval_seq
+        h = ln(h + x_full)
 
-        q = agent.post_head(h[-1])                            # (1,2*z)
-        mu = q[..., :agent.z_dim].squeeze(0)                  # (z,)
+        q = agent.post_head(h[-1])                              # (1,2*z)
+        mu = q[..., :agent.z_dim].squeeze(0)                    # (z,)
         return mu
+
+    
     
     @torch.no_grad()
-    def fuse_belief(mu_self_q: torch.Tensor, which: str) -> torch.Tensor:
+    def teacher_ctx(mu_self_q: torch.Tensor, which: str):
         """
-        mu_self_q: (z_dim,)
-        which: "AO" or "OL"
-        Returns fused mean mu_fused_* (z_dim,)
+        Compute teacher context vector (z_dim,) via attention over past z_ac_tokens.
+        Returns: (ctx, present_flag)
+        - ctx: (z_dim,)
+        - present_flag: bool, True if there is any relevant history (AO or OL) to attend to
         """
         L = len(z_ac_tokens)
         if L == 0:
-            return mu_self_q
+            return torch.zeros(agent.z_dim, device=device), False
 
-        # keys/values are all past z_ac means: (L,1,z)
-        kv = torch.stack(z_ac_tokens, dim=0).unsqueeze(1)
+        kv = torch.stack(z_ac_tokens, dim=0).unsqueeze(1)  # (L,1,z)
 
         if which == "AO":
             keep = torch.as_tensor([c in ("AO-o", "AO-s") for c in cond_ids],
@@ -156,29 +163,26 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             keep = torch.as_tensor([c in ("OL-o", "OL-s") for c in cond_ids],
                                 device=device, dtype=torch.bool)
 
-        # If no valid entries, skip fusion (prevents all-masked attention NaNs)
         if keep.sum() == 0:
-            return mu_self_q
+            return torch.zeros(agent.z_dim, device=device), False
 
-        # key_padding_mask: (B,L) True=ignore
-        kpm = (~keep).view(1, L)
+        kpm = (~keep).view(1, L)  # True=ignore
+        q = mu_self_q.view(1, 1, -1)  # (1,1,z)
 
-        q = mu_self_q.view(1, 1, -1)             # (1,1,z)
-        ctx, _ = agent.fuse_attn(q, kv, kv, key_padding_mask=kpm)  # (1,1,z) :contentReference[oaicite:4]{index=4}
-        fused = agent.fuse_post_head(torch.cat([q, ctx], dim=-1))   # (1,1,2z) :contentReference[oaicite:5]{index=5}
-        mu_fused = fused[..., :agent.z_dim].view(-1)               # (z,)
-        return mu_fused
+        ctx, _ = agent.fuse_attn(q, kv, kv, key_padding_mask=kpm)  # (1,1,z)
+        return ctx.view(-1), True
 
 
 
 
     # -----------------------------
-    # Memory: store full event tokens so encoder inference matches training x_all
+    # Memory: store stimulus tokens + value tokens so encoder inference matches training encoder
     # -----------------------------
-    x_tokens = []  # list of (1,H) event tokens in time order
+    inp_tokens = []   # list of (1,H) stimulus tokens (inp_emb) in time order
+    xval_tokens = []  # list of (1,H) value tokens (action+actor+reward) in time order
     actor_ids = [] # list of int: 0=self,1=teacher
     cond_ids = []  # list of str: "IL","AO-s","AO-o","OL-s","OL-o"
-    z_ac_tokens = []  # list of (z_dim,) posterior means aligned with x_tokens
+    z_ac_tokens = []  # list of (z_dim,) posterior means aligned with event sequence
     mu_self_last = torch.zeros(agent.z_dim, device=device)  # last self-stream belief (mean)
 
 
@@ -257,16 +261,37 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             x_dec = inp_pair + actor_self  # (1,H)
             tau = 0.2  # keep your sampling temp
 
+            
+
             if curr_trial_condition in ("IL", "AO-s", "OL-s"):
 
-                if curr_trial_condition == "IL":
-                    belief = mu_self_last
-                elif curr_trial_condition == "AO-s":
-                    belief = fuse_belief(mu_self_last, which="AO")
-                else:  # "OL-s"
-                    belief = fuse_belief(mu_self_last, which="OL")
+                z_self = mu_self_last
 
-                q_logits = agent.q_net(torch.cat([x_dec.squeeze(0), belief], dim=-1)).view(1, 2)  # :contentReference[oaicite:8]{index=8}
+                # baseline always available
+                q_base = agent.q_base(torch.cat([x_dec.squeeze(0), z_self], dim=-1)).view(1, 2)
+
+                # residual correction only if relevant teacher history exists
+                if curr_trial_condition == "AO-s":
+                    ctx, present = teacher_ctx(z_self, which="AO")
+                    if present:
+                        inp_res = torch.cat([x_dec.squeeze(0), z_self, ctx], dim=-1)           # (H+2Z,)
+                        delta = agent.q_delta_ao(inp_res).view(1, 2)
+                        g = torch.sigmoid(agent.gate_ao(inp_res.unsqueeze(0))).view(1, 1)     # (1,1)
+                        q_logits = q_base + g * delta
+                    else:
+                        q_logits = q_base
+                elif curr_trial_condition == "OL-s":
+                    ctx, present = teacher_ctx(z_self, which="OL")
+                    if present:
+                        inp_res = torch.cat([x_dec.squeeze(0), z_self, ctx], dim=-1)
+                        delta = agent.q_delta_ol(inp_res).view(1, 2)
+                        g = torch.sigmoid(agent.gate_ol(inp_res.unsqueeze(0))).view(1, 1)
+                        q_logits = q_base + g * delta
+                    else:
+                        q_logits = q_base
+                else:
+                    q_logits = q_base  # IL
+
                 q_logits = q_logits / tau
 
                 dist = torch.distributions.Categorical(logits=q_logits)
@@ -282,6 +307,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 else:
                     a_t = torch.tensor(0, device=device, dtype=torch.long)
                 choice_target = F.one_hot(a_t, num_classes=2).unsqueeze(0).float()
+
+
 
 
             meta_ep_len += 1
@@ -340,22 +367,24 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             if curr_trial_condition == "AO-o":
                 r_idx = 2
 
-            # Build event token x_all = inp + action + actor + reward  (matches training x_all)
+            # Build value token xval = action + actor + reward, keep stimulus token inp_pair separately
             action_emb = agent.action(a_t.view(1))  # (1,H)
             actor_emb  = agent.actor(torch.tensor([actor_id], device=device, dtype=torch.long))  # (1,H)
             reward_emb = agent.rwd_in(torch.tensor([r_idx], device=device, dtype=torch.long))    # (1,H)
 
-            x_event = inp_pair + action_emb + actor_emb + reward_emb  # (1,H)
+            x_val_event = action_emb + actor_emb + reward_emb  # (1,H)
 
-            x_tokens.append(x_event)
+            inp_tokens.append(inp_pair)
+            xval_tokens.append(x_val_event)
             actor_ids.append(actor_id)
             cond_ids.append(curr_trial_condition)
 
             # -----------------------------
             # Latent updates via 3 MHAs with masking (no manual filtering)
             # -----------------------------
-            x_seq = torch.stack(x_tokens, dim=0)  # (L,1,H)
-            L = x_seq.size(0)
+            inp_seq = torch.stack(inp_tokens, dim=0)    # (L,1,H)
+            xval_seq = torch.stack(xval_tokens, dim=0)  # (L,1,H)
+            L = inp_seq.size(0)
 
             actor_t = torch.as_tensor(actor_ids, device=device, dtype=torch.long)  # (L,)
             cond_list = cond_ids  # python list
@@ -367,7 +396,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
 
             # infer last-step posterior mean z for relevant stream
             if curr_trial_condition in ("IL", "AO-s", "OL-s"):
-                z_last_self = _infer_last_z(x_seq, keep_self, agent.enc_self, agent.self_ln)
+                z_last_self = _infer_last_z(inp_seq, xval_seq, keep_self, agent.enc_self, agent.self_ln)
                 if curr_trial_condition == "IL":
                     z_il_tm1 = z_last_self
                 elif curr_trial_condition == "AO-s":
@@ -376,17 +405,17 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                     z_ol_s_tm1 = z_last_self
 
             elif curr_trial_condition == "AO-o":
-                z_ao_o_last = _infer_last_z(x_seq, keep_ao_teacher, agent.enc_teacher_ao, agent.teacher_ao_ln)
+                z_ao_o_last = _infer_last_z(inp_seq, xval_seq, keep_ao_teacher, agent.enc_teacher_ao, agent.teacher_ao_ln)
                 # z_ao_o_last = z_last_ao
 
             elif curr_trial_condition == "OL-o":
-                z_ol_o_last = _infer_last_z(x_seq, keep_ol_teacher, agent.enc_teacher_ol, agent.teacher_ol_ln)
+                z_ol_o_last = _infer_last_z(inp_seq, xval_seq, keep_ol_teacher, agent.enc_teacher_ol, agent.teacher_ol_ln)
                 # z_ol_o_last = z_last_ol
 
             
             if curr_trial_condition in ("IL", "AO-s", "OL-s"):
                 # your _infer_last_z(...) for keep_self should have produced the mean for this just-finished self event
-                mu_event = _infer_last_z(x_seq, keep_self, agent.enc_self, agent.self_ln)
+                mu_event = _infer_last_z(inp_seq, xval_seq, keep_self, agent.enc_self, agent.self_ln)
                 mu_self_last = mu_event
             elif curr_trial_condition == "AO-o":
                 mu_event = z_ao_o_last
@@ -851,5 +880,3 @@ if __name__ == "__main__":
 
     ray.shutdown()
     writer.close()
-
-

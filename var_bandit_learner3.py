@@ -224,7 +224,29 @@ class BanditLearner(nn.Module):
         )
 
         # Reward model / Q-function heads (predict reward prob for each action)
-        self.q_net  = nn.Sequential(nn.Linear(rnn_hidden_size + z_dim, 128), nn.ReLU(), nn.Linear(128, 2))
+        # Residual decomposition: baseline self-only + teacher residual corrections
+        self.q_base = nn.Sequential(
+            nn.Linear(rnn_hidden_size + z_dim, 128), nn.ReLU(),
+            nn.Linear(128, 2)
+        )
+        self.q_delta_ao = nn.Sequential(
+            nn.Linear(rnn_hidden_size + 2 * z_dim, 128), nn.ReLU(),
+            nn.Linear(128, 2)
+        )
+        self.q_delta_ol = nn.Sequential(
+            nn.Linear(rnn_hidden_size + 2 * z_dim, 128), nn.ReLU(),
+            nn.Linear(128, 2)
+        )
+
+        # Learned reliability gates for teacher residuals (0..1)
+        self.gate_ao = nn.Sequential(
+            nn.Linear(rnn_hidden_size + 2 * z_dim, 64), nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self.gate_ol = nn.Sequential(
+            nn.Linear(rnn_hidden_size + 2 * z_dim, 64), nn.ReLU(),
+            nn.Linear(64, 1)
+        )
 
 
     # ----------------------------
@@ -271,7 +293,11 @@ class BanditLearner(nn.Module):
 
             self.fuse_attn,
             self.fuse_post_head,
-            self.q_net
+            self.q_base,
+            self.q_delta_ao,
+            self.q_delta_ol,
+            self.gate_ao,
+            self.gate_ol
        ]
 
         # Yield module parameters
@@ -305,28 +331,50 @@ class BanditLearner(nn.Module):
         mu      = self.mu_head(motor_inp)
         log_std = self.log_std_head(motor_inp).clamp(self.log_std_min, self.log_std_max)
         return mu, log_std
-    
-    def safe_attn(self, enc, x_all, attn_mask_T, kpm):
-        # x_all: (T,B,D)
-        T, B, D = x_all.shape
+    def safe_attn(self, enc, inp_all, x_val, kpm):
+        """
+        BOS-safe *causal* cross-attention:
+          Q = stimulus tokens (inp_all)
+          K = stimulus tokens (with BOS prepended so keys are never all-masked)
+          V = value tokens x_val = action_emb + actor_emb + rwd_emb (with BOS prepended)
 
-        # BOS token (must exist as a parameter)
-        bos = self.bos_token.expand(1, B, D)     # (1,B,D)
-        x2 = torch.cat([bos, x_all], dim=0)      # (T+1,B,D)
+        Shapes:
+          inp_all: (T,B,H)
+          x_val:   (T,B,H)
+          kpm:     (B,T)   True = ignore
+        Returns:
+          out: (T,B,H) aligned with query timesteps.
+        """
+        T, B, H = inp_all.shape
+        dev = inp_all.device
+        dtype = inp_all.dtype
 
-        # new causal mask for (T+1)
-        attn_mask2 = torch.triu(
-            torch.ones((T+1, T+1), device=x_all.device, dtype=torch.bool),
-            diagonal=1
-        )
+        # BOS key/value (always valid)
+        bos_k = self.bos_token.expand(1, B, H)                # (1,B,H)
+        bos_v = torch.zeros((1, B, H), device=dev, dtype=dtype)
+
+        key2 = torch.cat([bos_k, inp_all], dim=0)             # (T+1,B,H)
+        val2 = torch.cat([bos_v, x_val], dim=0)               # (T+1,B,H)
 
         # prepend BOS to key padding mask: BOS is always valid => False
-        bos_kpm = torch.zeros((kpm.size(0), 1), device=kpm.device, dtype=torch.bool)
-        kpm2 = torch.cat([bos_kpm, kpm], dim=1)  # (B,T+1)
+        bos_kpm = torch.zeros((B, 1), device=dev, dtype=torch.bool)
+        kpm2 = torch.cat([bos_kpm, kpm], dim=1)               # (B,T+1)
 
-        out2, _ = enc(x2, x2, x2, attn_mask=attn_mask2, key_padding_mask=kpm2)
+        # causal mask for (tgt_len=T queries, src_len=T+1 keys)
+        # query t can attend to keys {BOS, 1..t+1}; disallow anything beyond t+1
+        attn_mask = torch.triu(
+            torch.ones((T, T + 1), device=dev, dtype=torch.bool),
+            diagonal=2
+        )
 
-        return out2[1:]  # drop BOS output -> (T,B,D)
+        out, _ = enc(
+            query=inp_all,
+            key=key2,
+            value=val2,
+            attn_mask=attn_mask,
+            key_padding_mask=kpm2
+        )
+        return out
 
     def kl_normal(self, mu_q, log_std_q, mu_p, log_std_p):
         # log_std = log(sigma)
@@ -463,7 +511,8 @@ class BanditLearner(nn.Module):
             reward_idx_all = torch.where(mask_AOo, torch.full_like(reward_idx_all, 2), reward_idx_all)
             rwd_emb_all = self.rwd_in(reward_idx_all)
 
-            x_all = inp_all + action_emb_all + actor_emb_all + rwd_emb_all            # (T,B,H)
+            x_val = action_emb_all + actor_emb_all + rwd_emb_all                # (T,B,H) values
+            x_all = inp_all + x_val                                      # (T,B,H) full event token
             x_dec_all = inp_all + actor_emb_all                                       # (T,B,H)
 
             # -----------------------------
@@ -480,13 +529,13 @@ class BanditLearner(nn.Module):
 
             attn_mask_T = torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=1)
 
-            h_self = self.safe_attn(self.enc_self, x_all, attn_mask_T, kpm_self)
+            h_self = self.safe_attn(self.enc_self, inp_all, x_val, kpm_self)
             h_self = self.self_ln(h_self + x_all)
 
-            h_ao = self.safe_attn(self.enc_teacher_ao, x_all, attn_mask_T, kpm_ao)
+            h_ao = self.safe_attn(self.enc_teacher_ao, inp_all, x_val, kpm_ao)
             h_ao = self.teacher_ao_ln(h_ao + x_all)
 
-            h_ol = self.safe_attn(self.enc_teacher_ol, x_all, attn_mask_T, kpm_ol)
+            h_ol = self.safe_attn(self.enc_teacher_ol, inp_all, x_val, kpm_ol)
             h_ol = self.teacher_ol_ln(h_ol + x_all)
 
 
@@ -710,77 +759,91 @@ class BanditLearner(nn.Module):
             # ig_ao_s = ig_ao[mask_AOs].mean() if mask_AOs.any() else torch.zeros((), device=device)
             # ig_ol_s = ig_ol[mask_OLs].mean() if mask_OLs.any() else torch.zeros((), device=device)
 
-           
         # -----------------------------
-        # 7) BCE loss over aligned timeline  (ROLLOUT-MATCHING)
+        # 7) BCE (rollout-matching belief) + Residual teacher correction
+        #     Teacher ctx is BOS-safe causal z-attn over AO/OL history.
         # -----------------------------
-        q_bce_losses = []
+        mask_IL  = torch.as_tensor(trial_cond == "IL",   device=device)
+        mask_AOo = torch.as_tensor(trial_cond == "AO-o", device=device)
+        mask_AOs = torch.as_tensor(trial_cond == "AO-s", device=device)
+        mask_OLo = torch.as_tensor(trial_cond == "OL-o", device=device)
+        mask_OLs = torch.as_tensor(trial_cond == "OL-s", device=device)
 
-        for b in range(B):
-            # Single self belief (matches rollout's mu_self_last)
-            z_self_tm1 = torch.zeros(self.z_dim, device=device)
+        mask_self_choice = mask_IL | mask_AOs | mask_OLs
+        Z = self.z_dim
 
-            # History used for fusion (matches rollout's z_ac_tokens + cond_ids)
-            z_hist = []     # list of (z_dim,) tensors
-            cond_hist = []  # list of strings
+        # (A) rollout-matching self belief BEFORE each trial t
+        mu_self_tm1 = torch.zeros((T, B, Z), device=device)
+        self_last = torch.zeros((B, Z), device=device)
+        for t in range(T):
+            mu_self_tm1[t] = self_last
+            upd = mask_self_choice[t].unsqueeze(-1)  # update after self-choice trials only
+            self_last = torch.where(upd, z_ac[t].detach(), self_last)
 
-            def fuse_prefix(mu_self_q: torch.Tensor, which: str) -> torch.Tensor:
-                """Match bandit_train_batch.py fuse_belief() but using prefix-only history."""
-                L = len(z_hist)
-                if L == 0:
-                    return mu_self_q
+        # (B) determine whether AO/OL has any history strictly before t (to match rollout fallback)
+        keep_ao = (mask_AOo | mask_AOs).int()
+        keep_ol = (mask_OLo | mask_OLs).int()
+        ao_cum = keep_ao.cumsum(dim=0)
+        ol_cum = keep_ol.cumsum(dim=0)
+        ao_before = torch.zeros_like(ao_cum); ao_before[1:] = ao_cum[:-1]
+        ol_before = torch.zeros_like(ol_cum); ol_before[1:] = ol_cum[:-1]
+        use_ao_corr = mask_AOs & (ao_before > 0)
+        use_ol_corr = mask_OLs & (ol_before > 0)
 
-                kv = torch.stack(z_hist, dim=0).unsqueeze(1)  # (L,1,z)
+        # (C) BOS-safe causal teacher context in z-space
+        kpm_ao_bt = ~(mask_AOo | mask_AOs).T  # (B,T) True=ignore
+        kpm_ol_bt = ~(mask_OLo | mask_OLs).T
+        ctx_ao = self.fuse_ctx_causal_bos(
+            query_tbz=mu_self_tm1.detach(),
+            key_tbz=z_ac.detach(),
+            key_padding_mask_bt=kpm_ao_bt
+        )  # (T,B,Z)
+        ctx_ol = self.fuse_ctx_causal_bos(
+            query_tbz=mu_self_tm1.detach(),
+            key_tbz=z_ac.detach(),
+            key_padding_mask_bt=kpm_ol_bt
+        )
 
-                if which == "AO":
-                    keep = torch.as_tensor([c in ("AO-o", "AO-s") for c in cond_hist],
-                                        device=device, dtype=torch.bool)
-                else:  # "OL"
-                    keep = torch.as_tensor([c in ("OL-o", "OL-s") for c in cond_hist],
-                                        device=device, dtype=torch.bool)
+        # (D) value logits: baseline + residual corrections
+        q_base_logits = self.q_base(torch.cat([x_final, mu_self_tm1], dim=-1))           # (T,B,2)
+        delta_ao_logits = self.q_delta_ao(torch.cat([x_final, mu_self_tm1, ctx_ao], dim=-1))
+        delta_ol_logits = self.q_delta_ol(torch.cat([x_final, mu_self_tm1, ctx_ol], dim=-1))
 
-                if keep.sum() == 0:
-                    return mu_self_q
+        # Learned gates g in (0,1) to scale teacher residual strength
+        g_ao = torch.sigmoid(self.gate_ao(torch.cat([x_final, mu_self_tm1, ctx_ao], dim=-1))).clamp(0.0, 1.0)  # (T,B,1)
+        g_ol = torch.sigmoid(self.gate_ol(torch.cat([x_final, mu_self_tm1, ctx_ol], dim=-1))).clamp(0.0, 1.0)  # (T,B,1)
+        delta_ao_logits = delta_ao_logits * g_ao
+        delta_ol_logits = delta_ol_logits * g_ol
 
-                kpm = (~keep).view(1, L)  # True = ignore
-                q = mu_self_q.view(1, 1, -1)
+        # (E) BCE losses
+        # Baseline trains on all self-choice trials
+        q_base_chosen = q_base_logits.gather(-1, act_final.unsqueeze(-1)).squeeze(-1)   # (T,B)
+        base_loss = F.binary_cross_entropy_with_logits(
+            q_base_chosen[mask_self_choice],
+            rew_final[mask_self_choice]
+        )
 
-                ctx, _ = self.fuse_attn(q, kv, kv, key_padding_mask=kpm)
-                fused = self.fuse_post_head(torch.cat([q, ctx], dim=-1))
-                return fused[..., :self.z_dim].view(-1)
+        # Correction trains residuals only (protect baseline with detach)
+        q_total_ao = q_base_logits.detach() + delta_ao_logits
+        q_total_ol = q_base_logits.detach() + delta_ol_logits
+        q_total_ao_chosen = q_total_ao.gather(-1, act_final.unsqueeze(-1)).squeeze(-1)
+        q_total_ol_chosen = q_total_ol.gather(-1, act_final.unsqueeze(-1)).squeeze(-1)
 
-            for t in range(T):
-                lab = trial_cond[t, b]
+        corr_losses = []
+        if use_ao_corr.any():
+            corr_losses.append(F.binary_cross_entropy_with_logits(
+                q_total_ao_chosen[use_ao_corr],
+                rew_final[use_ao_corr]
+            ))
+        if use_ol_corr.any():
+            corr_losses.append(F.binary_cross_entropy_with_logits(
+                q_total_ol_chosen[use_ol_corr],
+                rew_final[use_ol_corr]
+            ))
+        corr_loss = torch.stack(corr_losses).mean() if len(corr_losses) else torch.zeros((), device=device)
 
-                # ---- belief BEFORE seeing outcome at t (this prevents reward leakage) ----
-                if lab == "IL":
-                    belief = z_self_tm1
-                elif lab == "AO-s":
-                    belief = fuse_prefix(z_self_tm1, which="AO")
-                elif lab == "OL-s":
-                    belief = fuse_prefix(z_self_tm1, which="OL")
-                else:
-                    # teacher trials don't contribute BCE target, but SHOULD enter history for future fusion
-                    if lab in ("AO-o", "OL-o"):
-                        z_hist.append(z_ac[t, b].detach())
-                        cond_hist.append(lab)
-                    continue
+        q_bce = base_loss + corr_loss
 
-                # ---- BCE computed using rollout-matching belief ----
-                q_logits = self.q_net(torch.cat([x_final[t, b], belief], dim=-1))
-                r = rew_final[t, b]
-                a = act_final[t, b]
-                q_bce_losses.append(F.binary_cross_entropy_with_logits(q_logits[a], r))
-
-                # ---- AFTER outcome: update self belief only on self-choice trials ----
-                # z_ac[t,b] is the posterior mean for the just-finished event (ok to use now)
-                z_self_tm1 = z_ac[t, b].detach()
-
-                # history for future fusion (prefix for later timesteps)
-                z_hist.append(z_ac[t, b].detach())
-                cond_hist.append(lab)
-
-        q_bce = torch.stack(q_bce_losses).mean() if len(q_bce_losses) else torch.zeros((), device=device)
 
 
         # -----------------------------
