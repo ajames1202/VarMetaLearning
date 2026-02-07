@@ -734,7 +734,7 @@ if __name__ == "__main__":
         writer.add_scalar("Reward/MeanCumSession_OL", mean_cum_rew_ol, global_step)
 
 
-    ckpt = torch.load(os.path.join(args.save_dir, "best.pt"), map_location=device)
+    ckpt = torch.load(os.path.join(args.save_dir, "best.pt"), map_location=device, weights_only=False)
     print(f"Loaded best checkpoint from update {ckpt['extra']['update']}, ema_score={ckpt['extra']['ema_score']:.2f}")
     agent.load_state_dict(ckpt["model_state"])
     agent.eval()
@@ -753,7 +753,7 @@ if __name__ == "__main__":
         res = ray.get(
             workers[0].run_session.remote(
                 {k: v.cpu() for k, v in agent.state_dict().items()},
-                probs_this_session=[(0.8, 0.2)] * session_K,
+                probs_this_session = [(0.8, 0.2) if np.random.rand() < 0.5 else (0.2, 0.8) for _ in range(session_K)],
                 print_this_session=False
             )
         )
