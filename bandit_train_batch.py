@@ -747,7 +747,7 @@ if __name__ == "__main__":
     mean_cum_rew_ao = 0.0
     mean_cum_rew_ol = 0.0
 
-    num_eval_sessions = 32  # small but stable
+    num_eval_sessions = 200  # small but stable
 
     for i in range(num_eval_sessions):
         res = ray.get(
