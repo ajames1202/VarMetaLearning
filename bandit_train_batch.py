@@ -603,7 +603,7 @@ if __name__ == "__main__":
                 # L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
                 # R = [1.0 - x for x in L]
 
-                probs_this_session = [(0.4, 0.6) if np.random.rand() < 0.5 else (0.6, 0.4) for _ in range(session_K)]
+                probs_this_session = [(0.8, 0.5) if np.random.rand() < 0.5 else (0.5, 0.8) for _ in range(session_K)]
                 # probs_this_session = [(0.8, 0.2)] * session_K ## Sanity check
                 probs_list.append(probs_this_session)
 
@@ -753,7 +753,7 @@ if __name__ == "__main__":
         res = ray.get(
             workers[0].run_session.remote(
                 {k: v.cpu() for k, v in agent.state_dict().items()},
-                probs_this_session = [(0.4, 0.6) if np.random.rand() < 0.5 else (0.6, 0.4) for _ in range(session_K)],
+                probs_this_session = [(0.5, 0.8) if np.random.rand() < 0.5 else (0.8, 0.5) for _ in range(session_K)],
                 print_this_session=False
             )
         )
