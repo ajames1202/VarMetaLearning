@@ -83,7 +83,7 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
 # Rollout
 # -----------------------------
 
-def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False):
+def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False, return_obs: bool = True):
     """One full session rollout producing buffers used by update2.
 
     Returns a tuple:
@@ -121,8 +121,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     chosen_bandits_motor_buf: List[np.ndarray] = []
 
     # bandit buffers (per trial)
-    left_obs = []
-    right_obs = []
+    left_obs = [] if return_obs else None
+    right_obs = [] if return_obs else None
+
     chosen_bandits_buf = []
     bandit_rewards_buf = []
     meta_ep_start_buf = []
@@ -234,8 +235,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             left_feats = agent.encode(left_view)    # (1,F)
             right_feats = agent.encode(right_view)  # (1,F)
 
-            left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
-            right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
+            if return_obs:
+                left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
+                right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
 
             # Self-choice trials
             if curr_trial_condition not in ("AO-o", "OL-o"):
@@ -387,10 +389,14 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     high_reward_choices_ao = np.array(high_reward_choice_ao, dtype=np.int32)
     high_reward_choices_ol = np.array(high_reward_choice_ol, dtype=np.int32)
 
-    obs_bandit = {
-        "left":  np.stack(left_obs,  axis=0),
-        "right": np.stack(right_obs, axis=0),
-    }
+    if return_obs:
+        obs_bandit = {
+            "left":  np.stack(left_obs, axis=0),
+            "right": np.stack(right_obs, axis=0),
+        }
+    else:
+        obs_bandit = None
+
 
     return (
         xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
@@ -426,7 +432,7 @@ class RolloutWorker:
             shuffle=True,
         )
 
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_eps: float = 0.0):
+    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_eps: float = 0.0, return_obs: bool = True):
         """Run one session with given pair probs. teacher_eps is optional (only used if env supports it)."""
         hidden_size = 128
         feature_dim = 128
@@ -456,7 +462,8 @@ class RolloutWorker:
                 self.env, agent, self.device,
                 self.session_K, self.session_N,
                 worker_id=self.worker_id,
-                print_this_session=print_this_session
+                print_this_session=print_this_session,
+                return_obs=return_obs
             )
 
 
@@ -507,7 +514,7 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--episodes-per-update', type=int, default=8)  # B
     parser.add_argument('--num-updates', type=int, default=1000)
-    parser.add_argument('--warmup-updates', type=int, default=900)
+    parser.add_argument('--warmup-updates', type=int, default=2)
     parser.add_argument('--patience', type=int, default=30)
     parser.add_argument('--min-delta', type=float, default=0.1)
     parser.add_argument('--eval-sessions', type=int, default=200)
@@ -724,7 +731,8 @@ def main():
             workers[i % len(workers)].run_session.remote(
                 agent_state_cpu,
                 probs_this_session=probs_eval,
-                print_this_session=False
+                print_this_session=False,
+                return_obs=False
             )
         )
     results = ray.get(futures)
@@ -801,9 +809,11 @@ def main():
                     workers[i % len(workers)].run_session.remote(
                         agent_state_cpu,
                         probs_this_session=probs_this_session,
-                        print_this_session=False
+                        print_this_session=False,
+                        return_obs=False
                     )
                 )
+                print(f"[GapSweep] launching p_lo={p_lo:.2f} ...")
             results = ray.get(futures)
 
             for res in results:
