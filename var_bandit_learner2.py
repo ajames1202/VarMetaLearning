@@ -320,6 +320,7 @@ class BanditLearner(nn.Module):
         meta_ep_start_buf: List[torch.Tensor],
         actor_buf: List[torch.Tensor],
         trial_cond_buf,
+        teacher_correct_buf: List[torch.Tensor],
         device,
     ):
         # -----------------------------
@@ -341,6 +342,7 @@ class BanditLearner(nn.Module):
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)     # (B,T,2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device)    # (B,T)
         actor = torch.stack(actor_buf, dim=0).to(device)                       # (B,T)
+        teacher_correct = torch.stack(teacher_correct_buf, dim=0).to(device)   # (B,T)
         trial_cond = np.stack(trial_cond_buf, axis=0)                           # (B,T) strings
 
         B, T, C, H, W = left_obs.shape
@@ -349,6 +351,7 @@ class BanditLearner(nn.Module):
         chosen_bandits = chosen_bandits.permute(1, 0, 2)   # (T,B,2)
         rewards_bandits = rewards_bandits.permute(1, 0)    # (T,B)
         actor = actor.permute(1, 0).long().clamp(0, 1)      # (T,B)
+        teacher_correct = teacher_correct.permute(1, 0).float()  # (T,B) in {-1,0,1}
         trial_cond = trial_cond.transpose(1, 0)             # (T,B)
 
         rwd_idx = rewards_bandits.long().clamp(0, 2)        # (T,B)
@@ -428,7 +431,12 @@ class BanditLearner(nn.Module):
                 ctx_left_ol_o = cond_ctx(q_left_q, q_left_all, mask_OLo)
                 ctx_right_ol_o = cond_ctx(q_right_q, q_right_all, mask_OLo)
 
-                # Baseline logits depend on the self-context of each condition.
+                # -----------------------------
+                # Self expert (q_base) + teacher experts (q_delta_*) + reliability gates (g_*)
+                # Compose AO/OL predictions using a probability-mixture so g is an identifiable mixing weight.
+                # -----------------------------
+
+                # Self logits depend on the self-context of each condition.
                 base_l = (
                     self._head(self.q_base, ctx_left_il, left_feats) * mask_IL.unsqueeze(-1).float()
                     + self._head(self.q_base, ctx_left_ao_s, left_feats) * mask_AOs.unsqueeze(-1).float()
@@ -439,62 +447,104 @@ class BanditLearner(nn.Module):
                     + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
                     + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
                 )
-                q_base_logits = torch.cat([base_l, base_r], dim=-1)  # (T,B,2)
+                q_self_logits = torch.cat([base_l, base_r], dim=-1)  # (T,B,2)
 
-                # Residual logits
-                delta_ao_l = self._head(self.q_delta_ao, ctx_left_ao_o, left_feats)
-                delta_ao_r = self._head(self.q_delta_ao, ctx_right_ao_o, right_feats)
-                delta_ao_logits = torch.cat([delta_ao_l, delta_ao_r], dim=-1)
+                # Teacher experts (logits) from observation contexts
+                q_teacher_ao = torch.cat(
+                    [
+                        self._head(self.q_delta_ao, ctx_left_ao_o, left_feats),
+                        self._head(self.q_delta_ao, ctx_right_ao_o, right_feats),
+                    ],
+                    dim=-1,
+                )  # (T,B,2)
+                q_teacher_ol = torch.cat(
+                    [
+                        self._head(self.q_delta_ol, ctx_left_ol_o, left_feats),
+                        self._head(self.q_delta_ol, ctx_right_ol_o, right_feats),
+                    ],
+                    dim=-1,
+                )  # (T,B,2)
 
-                delta_ol_l = self._head(self.q_delta_ol, ctx_left_ol_o, left_feats)
-                delta_ol_r = self._head(self.q_delta_ol, ctx_right_ol_o, right_feats)
-                delta_ol_logits = torch.cat([delta_ol_l, delta_ol_r], dim=-1)
-
-                # Gates
+                # Reliability gates (0..1)
                 g_ao_in = torch.cat([ctx_left_ao_s, ctx_right_ao_s, ctx_left_ao_o, ctx_right_ao_o], dim=-1)
                 g_ol_in = torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1)
-                g_ao = torch.sigmoid(self.gate_ao(g_ao_in)).clamp(0.0, 1.0)
+                g_ao = torch.sigmoid(self.gate_ao(g_ao_in)).clamp(0.0, 1.0)  # (T,B,1)
                 g_ol = torch.sigmoid(self.gate_ol(g_ol_in)).clamp(0.0, 1.0)
-                delta_ao_logits = delta_ao_logits * g_ao
-                delta_ol_logits = delta_ol_logits * g_ol
 
-                # BCE losses
-                q_base_chosen = q_base_logits.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
+                # Mixture in probability space so g is identifiable as a mixing weight
+                eps = 1e-5
+                p_self = torch.sigmoid(q_self_logits.detach())  # detach keeps the self expert mostly trained by base_loss
+                p_teacher_ao = torch.sigmoid(q_teacher_ao)
+                p_teacher_ol = torch.sigmoid(q_teacher_ol)
+                p_mix_ao = (1.0 - g_ao) * p_self + g_ao * p_teacher_ao
+                p_mix_ol = (1.0 - g_ol) * p_self + g_ol * p_teacher_ol
+                p_mix_ao = p_mix_ao.clamp(eps, 1.0 - eps)
+                p_mix_ol = p_mix_ol.clamp(eps, 1.0 - eps)
+                q_mix_ao = torch.log(p_mix_ao / (1.0 - p_mix_ao))
+                q_mix_ol = torch.log(p_mix_ol / (1.0 - p_mix_ol))
+
+                # Base loss trains self expert on self-choice trials (IL/AO-s/OL-s) when reward is observed.
+                q_self_chosen = q_self_logits.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
                 base_mask = mask_self_choice & rwd_obs
                 base_loss = (
-                    F.binary_cross_entropy_with_logits(q_base_chosen[base_mask], rwd01[base_mask])
+                    F.binary_cross_entropy_with_logits(q_self_chosen[base_mask], rwd01[base_mask])
                     if base_mask.any()
                     else torch.zeros((), device=device)
                 )
 
-                # Only apply residuals once there is at least one earlier AO/OL trial.
-                keep_ao = (mask_AOo | mask_AOs).int()
-                keep_ol = (mask_OLo | mask_OLs).int()
-                ao_cum = keep_ao.cumsum(dim=0)
-                ol_cum = keep_ol.cumsum(dim=0)
-                ao_before = torch.zeros_like(ao_cum)
-                ol_before = torch.zeros_like(ol_cum)
-                ao_before[1:] = ao_cum[:-1]
-                ol_before[1:] = ol_cum[:-1]
-                use_ao_corr = mask_AOs & (ao_before > 0) & rwd_obs
-                use_ol_corr = mask_OLs & (ol_before > 0) & rwd_obs
+                # Mix loss trains teacher experts + gates, but only once at least one AO-o/OL-o exists in history.
+                ao_o_cum = mask_AOo.float().cumsum(dim=0)
+                ol_o_cum = mask_OLo.float().cumsum(dim=0)
+                ao_o_before = torch.zeros_like(ao_o_cum)
+                ol_o_before = torch.zeros_like(ol_o_cum)
+                ao_o_before[1:] = ao_o_cum[:-1]
+                ol_o_before[1:] = ol_o_cum[:-1]
+                use_ao_mix = mask_AOs & (ao_o_before > 0) & rwd_obs
+                use_ol_mix = mask_OLs & (ol_o_before > 0) & rwd_obs
 
-                q_total_ao = q_base_logits.detach() + delta_ao_logits
-                q_total_ol = q_base_logits.detach() + delta_ol_logits
-                q_total_ao_chosen = q_total_ao.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
-                q_total_ol_chosen = q_total_ol.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
+                q_mix_ao_chosen = q_mix_ao.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
+                q_mix_ol_chosen = q_mix_ol.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
 
-                corr_losses = []
-                if use_ao_corr.any():
-                    corr_losses.append(F.binary_cross_entropy_with_logits(q_total_ao_chosen[use_ao_corr], rwd01[use_ao_corr]))
-                if use_ol_corr.any():
-                    corr_losses.append(F.binary_cross_entropy_with_logits(q_total_ol_chosen[use_ol_corr], rwd01[use_ol_corr]))
-                corr_loss = torch.stack(corr_losses).mean() if corr_losses else torch.zeros((), device=device)
+                mix_losses = []
+                if use_ao_mix.any():
+                    mix_losses.append(
+                        F.binary_cross_entropy_with_logits(q_mix_ao_chosen[use_ao_mix], rwd01[use_ao_mix])
+                    )
+                if use_ol_mix.any():
+                    mix_losses.append(
+                        F.binary_cross_entropy_with_logits(q_mix_ol_chosen[use_ol_mix], rwd01[use_ol_mix])
+                    )
+                mix_loss = torch.stack(mix_losses).mean() if mix_losses else torch.zeros((), device=device)
 
-                q_bce = base_loss + corr_loss
+                # Gate supervision (simulation-only): teach g to track running teacher correctness.
+                # teacher_correct is 1/0 on AO-o/OL-o, and -1 elsewhere.
+                tc = teacher_correct.clamp(0.0, 1.0)
+                ao_sum = (tc * mask_AOo.float()).cumsum(dim=0)
+                ao_cnt = (mask_AOo.float()).cumsum(dim=0)
+                ol_sum = (tc * mask_OLo.float()).cumsum(dim=0)
+                ol_cnt = (mask_OLo.float()).cumsum(dim=0)
+
+                ao_rel = ao_sum / (ao_cnt + 1e-6)
+                ol_rel = ol_sum / (ol_cnt + 1e-6)
+                ao_rel_prev = torch.zeros_like(ao_rel)
+                ol_rel_prev = torch.zeros_like(ol_rel)
+                ao_rel_prev[1:] = ao_rel[:-1]
+                ol_rel_prev[1:] = ol_rel[:-1]
+
+                mask_gate_ao = mask_AOs & (ao_o_before > 0)
+                mask_gate_ol = mask_OLs & (ol_o_before > 0)
+                gate_losses = []
+                if mask_gate_ao.any():
+                    gate_losses.append(F.mse_loss(g_ao.squeeze(-1)[mask_gate_ao], ao_rel_prev[mask_gate_ao]))
+                if mask_gate_ol.any():
+                    gate_losses.append(F.mse_loss(g_ol.squeeze(-1)[mask_gate_ol], ol_rel_prev[mask_gate_ol]))
+                gate_loss = torch.stack(gate_losses).mean() if gate_losses else torch.zeros((), device=device)
+
+                lam_gate = 0.1
+                q_bce = base_loss + mix_loss
 
                 contrast_loss = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
-                bandit_total = q_bce + 0.05 * contrast_loss
+                bandit_total = q_bce + lam_gate * gate_loss + 0.05 * contrast_loss
 
             bandit_total.backward()
             bandit_loss_sum += float(q_bce.item())
