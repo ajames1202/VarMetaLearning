@@ -511,7 +511,7 @@ def main():
     parser.add_argument('--patience', type=int, default=30)
     parser.add_argument('--min-delta', type=float, default=0.1)
     parser.add_argument('--eval-sessions', type=int, default=200)
-    parser.add_argument('--gap-sweep', action='store_true', help='Run gap sweep after training.')
+    parser.add_argument('--gap-sweep', action='store_true', help='Run gap sweep after training.', default=True)
     parser.add_argument('--p-hi', type=float, default=0.8)
     parser.add_argument('--p-lo-min', type=float, default=0.10)
     parser.add_argument('--p-lo-max', type=float, default=0.75)
