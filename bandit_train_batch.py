@@ -514,7 +514,7 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--episodes-per-update', type=int, default=8)  # B
     parser.add_argument('--num-updates', type=int, default=1000)
-    parser.add_argument('--warmup-updates', type=int, default=2)
+    parser.add_argument('--warmup-updates', type=int, default=900)
     parser.add_argument('--patience', type=int, default=30)
     parser.add_argument('--min-delta', type=float, default=0.1)
     parser.add_argument('--eval-sessions', type=int, default=200)
