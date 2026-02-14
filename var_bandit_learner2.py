@@ -8,12 +8,7 @@ import torch.nn.functional as F
 
 
 class CNNEncoder(nn.Module):
-    """Small CNN for processing visual inputs (expects NCHW).
-
-    The original version hard-coded the flatten size (32*14*14), which only
-    works for one specific input resolution. This version uses
-    AdaptiveAvgPool2d so it works for any HxW.
-    """
+    """Small CNN for visual inputs (NCHW). Uses AdaptiveAvgPool2d to be resolution-agnostic."""
 
     def __init__(self, feature_dim: int):
         super().__init__()
@@ -34,7 +29,6 @@ class CNNEncoder(nn.Module):
 
 
 def atanh(x: torch.Tensor) -> torch.Tensor:
-    """Numerically-safe inverse tanh."""
     return 0.5 * (torch.log1p(x + 1e-6) - torch.log1p(-x + 1e-6))
 
 
@@ -44,73 +38,28 @@ def log_prob_tanh_normal(
     log_std: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Log-prob under a tanh-squashed Normal.
-
-    Kept for backward compatibility with your original file.
-    """
     std = torch.exp(log_std)
-    # undo tanh
     pre = torch.atanh(action.clamp(-1 + eps, 1 - eps))
     normal = torch.distributions.Normal(mean, std)
     logp = normal.log_prob(pre).sum(dim=-1)
-    # change-of-variables correction
     corr = torch.log(1 - torch.tanh(pre).pow(2) + eps).sum(dim=-1)
     return logp - corr
 
 
-def report_param_set(params, label: str) -> None:
-    """Utility: print how many params received non-zero grads."""
-    params = list(params)
-    touched = 0
-    total = 0
-    for p in params:
-        total += 1
-        if p.grad is not None and float(p.grad.abs().sum()) != 0.0:
-            touched += 1
-    print(f"{label}: touched {touched}/{total} params")
-
-
-def debug_left_right_feats(left_feats: torch.Tensor, right_feats: torch.Tensor, tag: str = "") -> None:
-    """Quick sanity check for encoder collapse vs random pairing baseline."""
-    with torch.no_grad():
-        lf = left_feats.reshape(-1, left_feats.size(-1))
-        rf = right_feats.reshape(-1, right_feats.size(-1))
-        lf_n = F.normalize(lf, dim=-1)
-        rf_n = F.normalize(rf, dim=-1)
-
-        cos_pair = (lf_n * rf_n).sum(dim=-1)
-        l2_pair = (lf - rf).norm(dim=-1)
-
-        perm = torch.randperm(rf.size(0), device=rf.device)
-        cos_rand = (lf_n * rf_n[perm]).sum(dim=-1)
-        l2_rand = (lf - rf[perm]).norm(dim=-1)
-
-        print(f"[{tag}] cosine paired   mean/std: {cos_pair.mean():.3f} / {cos_pair.std():.3f}")
-        print(f"[{tag}] cosine random   mean/std: {cos_rand.mean():.3f} / {cos_rand.std():.3f}")
-        print(f"[{tag}] L2 paired       mean/std: {l2_pair.mean():.3f} / {l2_pair.std():.3f}")
-        print(f"[{tag}] L2 random       mean/std: {l2_rand.mean():.3f} / {l2_rand.std():.3f}")
-
-
-def lr_repulsion_loss(left_feats: torch.Tensor, right_feats: torch.Tensor, margin: float = 0.2) -> torch.Tensor:
-    """Penalize left/right encodings being too similar (cosine similarity > margin)."""
-    lf = F.normalize(left_feats.reshape(-1, left_feats.size(-1)), dim=-1)
-    rf = F.normalize(right_feats.reshape(-1, right_feats.size(-1)), dim=-1)
-    sim = (lf * rf).sum(dim=-1)
-    return F.relu(sim - margin).mean()
-
-
 class BanditLearner(nn.Module):
-    """Bandit learner with
-    - vision encoder
-    - causal attention memory
-    - reward baseline + residual corrections
-    - motor head
+    """Sequential DVAE with two distinct latents and joint low-rank cross-correlation.
 
-    This file is a *fixed* version of the original:
-    - removes torchvision dependency (torchvision import can fail in many envs)
-    - fixes broken shapes (q_base/q_delta/gates)
-    - removes undefined variables / duplicated dead code
-    - makes attention BOS-safe when all keys are masked
+    Design goals (per your request):
+      - z_t = [z_self_t, z_obs_t]
+      - Decode *self* reward/policy from z_self
+      - Decode teacher behavior (action + optional teacher reward when available) from z_obs
+      - Keep *joint* (low-rank) covariance so teacher evidence can influence z_self
+      - Remove extra hand-designed posterior blending/gating; posterior is computed directly
+        via dedicated post-heads for IL/AO/OL.
+
+    Notes:
+      - This is a training-time inference model (uses q(z|h,x)). For rollout/action selection,
+        you typically sample from the prior p(z|h) before observing reward.
     """
 
     def __init__(
@@ -128,49 +77,89 @@ class BanditLearner(nn.Module):
 
         self.enc = CNNEncoder(feature_dim)
 
-        # Causal cross-attention over past trials.
+        # Causal attention memory
         self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, dropout=0.1, batch_first=False)
-        self.q_in = nn.Linear(feature_dim, rnn_hidden_size, bias=False)
         self.attn_ln = nn.LayerNorm(rnn_hidden_size)
+        self.inp_emb = nn.Linear(2 * feature_dim, rnn_hidden_size, bias=False)
 
-        # BOS token prevents NaNs when key_padding_mask masks all keys for some batch elements.
+        # BOS token prevents NaNs when key_padding_mask masks all keys
         self.bos_token = nn.Parameter(torch.zeros(1, 1, rnn_hidden_size))
 
-        # Event/value embeddings
+        # Token feature embeddings
         self.actor = nn.Embedding(2, rnn_hidden_size)   # 0=self, 1=teacher
         self.action = nn.Embedding(2, rnn_hidden_size)  # 0=left, 1=right
         self.rwd_in = nn.Embedding(3, rnn_hidden_size)  # 0,1,2(no_feedback)
 
-        # Reward heads: return 1 logit per arm.
-        self.q_base = nn.Sequential(
-            nn.Linear(rnn_hidden_size + feature_dim, 128),
+        # -------------------------
+        # Two-latent sequential DVAE (joint low-rank Gaussian)
+        # -------------------------
+        self.z_self_dim = 6
+        self.z_obs_dim = 6
+        self.z_dim = self.z_self_dim + self.z_obs_dim
+        self.z_rank = 3  # set to 0 for diagonal Normal + analytic KL
+
+        D, r = self.z_dim, self.z_rank
+        self._z_out = (2 * D) + (D * r if r > 0 else 0)
+
+        # Prior p(z_t | h_{t-1}) over the *joint* latent
+        self.prior_net = nn.Sequential(
+            nn.Linear(rnn_hidden_size, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1),
+            nn.Linear(128, self._z_out),
         )
-        self.q_delta_ao = nn.Sequential(
-            nn.Linear(rnn_hidden_size + feature_dim, 128),
+
+        # Condition-specific amortized posteriors q(z_t | h_{t-1}, x_t, cond)
+        # Dedicated heads for IL / AO / OL as requested.
+        self.post_IL = nn.Sequential(
+            nn.Linear(2 * rnn_hidden_size, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1),
+            nn.Linear(128, self._z_out),
         )
-        self.q_delta_ol = nn.Sequential(
-            nn.Linear(rnn_hidden_size + feature_dim, 128),
+        self.post_AO = nn.Sequential(
+            nn.Linear(2 * rnn_hidden_size, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self._z_out),
+        )
+        self.post_OL = nn.Sequential(
+            nn.Linear(2 * rnn_hidden_size, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self._z_out),
+        )
+
+        # -------------------------
+        # Decoders
+        # -------------------------
+        # Self reward decoder: p(r_self_t | z_self_t, h_{t-1}, s_t, a_t)
+        self.self_reward_dec = nn.Sequential(
+            nn.Linear(self.z_self_dim + rnn_hidden_size + 2 * feature_dim + 2, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 1),
         )
 
-        # Gates for residual strength.
-        self.gate_ao = nn.Sequential(
-            nn.Linear(4 * rnn_hidden_size, 64),
+        # Self policy decoder: p(a_self_t | z_self_t, h_{t-1}, s_t)
+        self.self_policy_dec = nn.Sequential(
+            nn.Linear(self.z_self_dim + rnn_hidden_size + 2 * feature_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 1),
-        )
-        self.gate_ol = nn.Sequential(
-            nn.Linear(4 * rnn_hidden_size, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1),
+            nn.Linear(128, 2),
         )
 
-        # Motor policy
+        # Teacher behavior decoder: p(a_teacher_t | z_obs_t, h_{t-1}, s_t)
+        self.teacher_action_dec = nn.Sequential(
+            nn.Linear(self.z_obs_dim + rnn_hidden_size + 2 * feature_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 2),
+        )
+
+        # Optional: teacher reward decoder when teacher feedback is observed (e.g., OL-o)
+        self.teacher_reward_dec = nn.Sequential(
+            nn.Linear(self.z_obs_dim + rnn_hidden_size + 2 * feature_dim + 2, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+        )
+
+        # -------------------------
+        # Motor policy (unchanged)
+        # -------------------------
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
 
@@ -206,16 +195,19 @@ class BanditLearner(nn.Module):
         modules = [
             self.enc,
             self.attn,
-            self.q_in,
             self.attn_ln,
+            self.inp_emb,
             self.actor,
             self.action,
             self.rwd_in,
-            self.q_base,
-            self.q_delta_ao,
-            self.q_delta_ol,
-            self.gate_ao,
-            self.gate_ol,
+            self.prior_net,
+            self.post_IL,
+            self.post_AO,
+            self.post_OL,
+            self.self_reward_dec,
+            self.self_policy_dec,
+            self.teacher_action_dec,
+            self.teacher_reward_dec,
         ]
         for m in modules:
             for p in m.parameters():
@@ -242,11 +234,6 @@ class BanditLearner(nn.Module):
         log_std = self.log_std_head(motor_inp).clamp(self.log_std_min, self.log_std_max)
         return mu, log_std
 
-    @staticmethod
-    def _head(head: nn.Module, ctx: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
-        """head([ctx, feats]) -> (T,B,1)"""
-        return head(torch.cat([ctx, feats], dim=-1))
-
     def _safe_causal_attn(
         self,
         query: torch.Tensor,  # (L,B,H)
@@ -255,35 +242,24 @@ class BanditLearner(nn.Module):
         key_padding_mask: torch.Tensor,  # (B,L) True=ignore
     ) -> torch.Tensor:
         """Causal attention with a BOS token so we never softmax over all-masked keys."""
-
-        L, B, H = query.shape
-        dev = query.device
-        dtype = query.dtype
-        
+        Lq, B, H = query.shape
+        dev, dtype = query.device, query.dtype
 
         bos_k = self.bos_token.expand(1, B, H)
         bos_v = torch.zeros((1, B, H), device=dev, dtype=dtype)
-
         key2 = torch.cat([bos_k, key], dim=0)   # (L+1,B,H)
         val2 = torch.cat([bos_v, value], dim=0)
-
-        Lq, B, H = query.shape
-        key_len = key.shape[0]          # past tokens
-        src_len = key_len + 1           # + BOS
-
 
         bos_kpm = torch.zeros((B, 1), device=dev, dtype=torch.bool)
         kpm2 = torch.cat([bos_kpm, key_padding_mask], dim=1)  # (B,L+1)
 
-        # Query i may attend to BOS and keys up to i (history).
-        # With BOS prepended, disallow keys >= i+2.
-        # attn_mask = torch.triu(torch.ones((L, L + 1), device=dev, dtype=torch.bool), diagonal=2)
+        key_len = key.shape[0]
+        src_len = key_len + 1
         offset = max(0, key_len - Lq)
         attn_mask = torch.triu(
             torch.ones((Lq, src_len), device=dev, dtype=torch.bool),
-            diagonal=offset + 2
+            diagonal=offset + 2,
         )
-
 
         out, _ = self.attn(
             query=query,
@@ -295,14 +271,36 @@ class BanditLearner(nn.Module):
         )
         return out
 
-    def _build_ctx(self, q_all: torch.Tensor, ctx_q: torch.Tensor) -> torch.Tensor:
-        """Assemble full-length ctx with t=0 handled."""
-        T, B, H = q_all.shape
-        out = q_all.new_zeros(T, B, H)
-        out[0] = self.attn_ln(q_all[0])
-        if T > 1:
-            out[1:] = ctx_q
-        return out
+    def _rep_all(self, x_tok: torch.Tensor) -> torch.Tensor:
+        """rep[t] is a causal representation that depends on x_{<=t}.
+
+        The DVAE prior uses h_prev[t] = rep[t-1] so p(z_t|h_{t-1}) never sees x_t.
+        """
+        T, B, H = x_tok.shape
+        if T == 1:
+            return self.attn_ln(x_tok)
+
+        q = x_tok[1:]     # (T-1,B,H)
+        k = x_tok[:-1]
+        v = x_tok[:-1]
+        kpm = torch.zeros((B, T - 1), device=x_tok.device, dtype=torch.bool)
+        attn_out = self._safe_causal_attn(q, k, v, kpm)
+
+        rep = x_tok.new_zeros(T, B, H)
+        rep[0] = self.attn_ln(x_tok[0])
+        rep[1:] = self.attn_ln(attn_out + q)
+        return rep
+
+    def _unpack_joint_lr(self, out: torch.Tensor, T: int, B: int):
+        """Unpack (mu, diag_raw, U) from a joint output."""
+        D, r = self.z_dim, self.z_rank
+        mu = out[..., :D]
+        diag_raw = out[..., D: 2 * D]
+        if r > 0:
+            U = out[..., 2 * D :].view(T, B, D, r)
+        else:
+            U = None
+        return mu, diag_raw, U
 
     # -------------------------
     # Main update
@@ -323,24 +321,20 @@ class BanditLearner(nn.Module):
         device,
     ):
         # -----------------------------
-        # 1) MOTOR data: keep flat (no batch)
+        # 1) MOTOR data: keep flat
         # -----------------------------
         xy_pos = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
         goalvec = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
         chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
         # -----------------------------
-        # 2) BANDIT data: batched (B, T, ...)
+        # 2) BANDIT data: batched (B,T,...)
         # -----------------------------
-        left_obs = torch.stack(
-            [torch.as_tensor(b["left"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0
-        )  # (B,T,C,H,W)
-        right_obs = torch.stack(
-            [torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0
-        )  # (B,T,C,H,W)
-        chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)     # (B,T,2)
-        rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device)    # (B,T)
-        actor = torch.stack(actor_buf, dim=0).to(device)                       # (B,T)
+        left_obs = torch.stack([torch.as_tensor(b["left"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
+        right_obs = torch.stack([torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
+        chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)      # (B,T,2)
+        rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device)     # (B,T)
+        actor = torch.stack(actor_buf, dim=0).to(device)                        # (B,T)
         trial_cond = np.stack(trial_cond_buf, axis=0)                           # (B,T) strings
 
         B, T, C, H, W = left_obs.shape
@@ -351,9 +345,10 @@ class BanditLearner(nn.Module):
         actor = actor.permute(1, 0).long().clamp(0, 1)      # (T,B)
         trial_cond = trial_cond.transpose(1, 0)             # (T,B)
 
-        rwd_idx = rewards_bandits.long().clamp(0, 2)        # (T,B)
-        rwd_obs = rwd_idx != 2                               # (T,B)
-        rwd01 = rwd_idx.float().clamp(0.0, 1.0)             # (T,B)
+        # Reward index: 0/1 observed, 2 is NO_FEEDBACK
+        rwd_idx = rewards_bandits.long().clamp(0, 2)
+        rwd_obs = (rwd_idx != 2)
+        rwd01 = rwd_idx.float().clamp(0.0, 1.0)
 
         num_epochs = 1
         bandit_loss_sum, bandit_slices = 0.0, 0
@@ -371,137 +366,156 @@ class BanditLearner(nn.Module):
 
             left_feats = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)    # (T,B,F)
             right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)  # (T,B,F)
+            lr_concat = torch.cat([left_feats, right_feats], dim=-1)               # (T,B,2F)
 
-            aL = chosen_bandits[..., 0:1]
-            aR = chosen_bandits[..., 1:2]
-            chosen_feat = aL * left_feats + aR * right_feats
+            stim_tok = self.inp_emb(lr_concat)                                     # (T,B,H)
 
+            # action indices / embeddings
             a_t = torch.argmax(chosen_bandits, dim=-1)  # (T,B)
             action_emb = self.action(a_t)
             actor_emb = self.actor(actor)
             rwd_emb = self.rwd_in(rwd_idx)
-            x_val = action_emb + actor_emb + rwd_emb
 
-            q_left_all = self.q_in(left_feats)
-            q_right_all = self.q_in(right_feats)
-            k_all = self.q_in(chosen_feat)
+            # x_t for the posterior can include reward (observed or NO_FEEDBACK)
+            x_tok = stim_tok + actor_emb + action_emb + rwd_emb
 
-            if T < 2:
-                q_bce = torch.zeros((), device=device)
-                contrast_loss = torch.zeros((), device=device)
+            if T < 1:
                 bandit_total = torch.zeros((), device=device)
             else:
-                q_left_q = q_left_all[1:]
-                q_right_q = q_right_all[1:]
-                k_hist = k_all[:-1]
-                v_hist = x_val[:-1]
-                L = T - 1
-
-                # Masks per timestep (T,B)
+                # -----------------------------
+                # Condition masks (T,B) -> choose posterior head
+                # -----------------------------
                 mask_IL = torch.as_tensor(trial_cond == "IL", device=device)
                 mask_AOo = torch.as_tensor(trial_cond == "AO-o", device=device)
                 mask_AOs = torch.as_tensor(trial_cond == "AO-s", device=device)
                 mask_OLo = torch.as_tensor(trial_cond == "OL-o", device=device)
                 mask_OLs = torch.as_tensor(trial_cond == "OL-s", device=device)
-                mask_self_choice = mask_IL | mask_AOs | mask_OLs
 
-                def cond_ctx(q_q: torch.Tensor, q_all: torch.Tensor, hist_keep_mask: torch.Tensor) -> torch.Tensor:
-                    # Align history mask to keys length L using :-1
-                    kpm = ~(hist_keep_mask[:-1].T)  # (B,L)
-                    ctx_q = self._safe_causal_attn(q_q, k_hist, v_hist, kpm)
-                    ctx_q = self.attn_ln(ctx_q + q_q)
-                    return self._build_ctx(q_all, ctx_q)
+                mask_AO = mask_AOo | mask_AOs
+                mask_OL = mask_OLo | mask_OLs
 
-                # Contexts (all (T,B,H))
-                ctx_left_il = cond_ctx(q_left_q, q_left_all, mask_IL)
-                ctx_right_il = cond_ctx(q_right_q, q_right_all, mask_IL)
+                # -----------------------------
+                # Causal representation rep[t] over full history
+                # -----------------------------
+                rep = self._rep_all(x_tok)   # (T,B,H)
+                h_prev = rep.new_zeros(rep.shape)
+                if T > 1:
+                    h_prev[1:] = rep[:-1]
 
-                ctx_left_ao_s = cond_ctx(q_left_q, q_left_all, mask_AOs)
-                ctx_right_ao_s = cond_ctx(q_right_q, q_right_all, mask_AOs)
+                # -----------------------------
+                # DVAE: joint prior / posterior (low-rank)
+                # -----------------------------
+                D, r = self.z_dim, self.z_rank
+                eps = 1e-4
 
-                ctx_left_ol_s = cond_ctx(q_left_q, q_left_all, mask_OLs)
-                ctx_right_ol_s = cond_ctx(q_right_q, q_right_all, mask_OLs)
+                prior_out = self.prior_net(h_prev)  # (T,B,*)
+                mu_p, diag_p_raw, U_p = self._unpack_joint_lr(prior_out, T, B)
 
-                ctx_left_ao_o = cond_ctx(q_left_q, q_left_all, mask_AOo)
-                ctx_right_ao_o = cond_ctx(q_right_q, q_right_all, mask_AOo)
+                post_in = torch.cat([h_prev, x_tok], dim=-1)
+                out_il = self.post_IL(post_in)
+                out_ao = self.post_AO(post_in)
+                out_ol = self.post_OL(post_in)
 
-                ctx_left_ol_o = cond_ctx(q_left_q, q_left_all, mask_OLo)
-                ctx_right_ol_o = cond_ctx(q_right_q, q_right_all, mask_OLo)
+                # Select head per timestep
+                w_il = mask_IL.float().unsqueeze(-1)
+                w_ao = mask_AO.float().unsqueeze(-1)
+                w_ol = mask_OL.float().unsqueeze(-1)
+                out_q = out_il * w_il + out_ao * w_ao + out_ol * w_ol
 
-                # Baseline logits depend on the self-context of each condition.
-                base_l = (
-                    self._head(self.q_base, ctx_left_il, left_feats) * mask_IL.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_left_ao_s, left_feats) * mask_AOs.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_left_ol_s, left_feats) * mask_OLs.unsqueeze(-1).float()
+                mu_q, diag_q_raw, U_q = self._unpack_joint_lr(out_q, T, B)
+
+                if r > 0:
+                    cov_diag_p = F.softplus(diag_p_raw) + eps
+                    cov_diag_q = F.softplus(diag_q_raw) + eps
+
+                    p_dist = torch.distributions.LowRankMultivariateNormal(mu_p, U_p, cov_diag_p)
+                    q_dist = torch.distributions.LowRankMultivariateNormal(mu_q, U_q, cov_diag_q)
+
+                    z = q_dist.rsample()  # (T,B,D)
+                    kl_tb = q_dist.log_prob(z) - p_dist.log_prob(z)  # (T,B) MC KL
+                else:
+                    sig_p = F.softplus(diag_p_raw) + eps
+                    sig_q = F.softplus(diag_q_raw) + eps
+
+                    q_dist = torch.distributions.Normal(mu_q, sig_q)
+                    z = q_dist.rsample()
+
+                    kl_dim = torch.log(sig_p / sig_q) + (sig_q.pow(2) + (mu_q - mu_p).pow(2)) / (2.0 * sig_p.pow(2)) - 0.5
+                    kl_tb = kl_dim.sum(dim=-1)
+
+                kl_loss = kl_tb.mean()
+
+                # Split latents
+                z_self = z[..., : self.z_self_dim]
+                z_obs = z[..., self.z_self_dim :]
+
+                # -----------------------------
+                # Decode: self reward + self policy from z_self
+                # -----------------------------
+                self_evt = (actor == 0)
+                teacher_evt = (actor == 1)
+
+                # self policy loss
+                pol_in = torch.cat([z_self, h_prev, lr_concat], dim=-1)  # (T,B,*)
+                pol_logits = self.self_policy_dec(pol_in)                # (T,B,2)
+
+                if self_evt.any():
+                    pol_loss = F.cross_entropy(pol_logits[self_evt], a_t[self_evt])
+                else:
+                    pol_loss = torch.zeros((), device=device)
+
+                # self reward loss (only when reward is observed)
+                sr_in = torch.cat([z_self, h_prev, lr_concat, chosen_bandits.float()], dim=-1)
+                sr_logits = self.self_reward_dec(sr_in).squeeze(-1)  # (T,B)
+
+                mask_self_r = self_evt & rwd_obs
+                if mask_self_r.any():
+                    self_rwd_loss = F.binary_cross_entropy_with_logits(sr_logits[mask_self_r], rwd01[mask_self_r])
+                else:
+                    self_rwd_loss = torch.zeros((), device=device)
+
+                # -----------------------------
+                # Decode: teacher behavior from z_obs
+                # -----------------------------
+                ta_in = torch.cat([z_obs, h_prev, lr_concat], dim=-1)
+                teach_logits = self.teacher_action_dec(ta_in)  # (T,B,2)
+                if teacher_evt.any():
+                    teach_act_loss = F.cross_entropy(teach_logits[teacher_evt], a_t[teacher_evt])
+                else:
+                    teach_act_loss = torch.zeros((), device=device)
+
+                # Optional teacher reward loss (only teacher events with observed reward; typically OL-o)
+                tr_in = torch.cat([z_obs, h_prev, lr_concat, chosen_bandits.float()], dim=-1)
+                tr_logits = self.teacher_reward_dec(tr_in).squeeze(-1)
+
+                mask_teacher_r = teacher_evt & rwd_obs
+                if mask_teacher_r.any():
+                    teach_rwd_loss = F.binary_cross_entropy_with_logits(tr_logits[mask_teacher_r], rwd01[mask_teacher_r])
+                else:
+                    teach_rwd_loss = torch.zeros((), device=device)
+
+                # -----------------------------
+                # Total
+                # -----------------------------
+                beta_kl = 0.1
+                lambda_self_pol = 0.1
+                lambda_teacher_act = 0.1
+                lambda_teacher_rwd = 0.1
+
+                bandit_total = (
+                    self_rwd_loss
+                    + lambda_self_pol * pol_loss
+                    + lambda_teacher_act * teach_act_loss
+                    + lambda_teacher_rwd * teach_rwd_loss
+                    + beta_kl * kl_loss
                 )
-                base_r = (
-                    self._head(self.q_base, ctx_right_il, right_feats) * mask_IL.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
-                )
-                q_base_logits = torch.cat([base_l, base_r], dim=-1)  # (T,B,2)
-
-                # Residual logits
-                delta_ao_l = self._head(self.q_delta_ao, ctx_left_ao_o, left_feats)
-                delta_ao_r = self._head(self.q_delta_ao, ctx_right_ao_o, right_feats)
-                delta_ao_logits = torch.cat([delta_ao_l, delta_ao_r], dim=-1)
-
-                delta_ol_l = self._head(self.q_delta_ol, ctx_left_ol_o, left_feats)
-                delta_ol_r = self._head(self.q_delta_ol, ctx_right_ol_o, right_feats)
-                delta_ol_logits = torch.cat([delta_ol_l, delta_ol_r], dim=-1)
-
-                # Gates
-                g_ao_in = torch.cat([ctx_left_ao_s, ctx_right_ao_s, ctx_left_ao_o, ctx_right_ao_o], dim=-1)
-                g_ol_in = torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1)
-                g_ao = torch.sigmoid(self.gate_ao(g_ao_in)).clamp(0.0, 1.0)
-                g_ol = torch.sigmoid(self.gate_ol(g_ol_in)).clamp(0.0, 1.0)
-                delta_ao_logits = delta_ao_logits * g_ao
-                delta_ol_logits = delta_ol_logits * g_ol
-
-                # BCE losses
-                q_base_chosen = q_base_logits.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
-                base_mask = mask_self_choice & rwd_obs
-                base_loss = (
-                    F.binary_cross_entropy_with_logits(q_base_chosen[base_mask], rwd01[base_mask])
-                    if base_mask.any()
-                    else torch.zeros((), device=device)
-                )
-
-                # Only apply residuals once there is at least one earlier AO/OL trial.
-                keep_ao = (mask_AOo | mask_AOs).int()
-                keep_ol = (mask_OLo | mask_OLs).int()
-                ao_cum = keep_ao.cumsum(dim=0)
-                ol_cum = keep_ol.cumsum(dim=0)
-                ao_before = torch.zeros_like(ao_cum)
-                ol_before = torch.zeros_like(ol_cum)
-                ao_before[1:] = ao_cum[:-1]
-                ol_before[1:] = ol_cum[:-1]
-                use_ao_corr = mask_AOs & (ao_before > 0) & rwd_obs
-                use_ol_corr = mask_OLs & (ol_before > 0) & rwd_obs
-
-                q_total_ao = q_base_logits.detach() + delta_ao_logits
-                q_total_ol = q_base_logits.detach() + delta_ol_logits
-                q_total_ao_chosen = q_total_ao.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
-                q_total_ol_chosen = q_total_ol.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
-
-                corr_losses = []
-                if use_ao_corr.any():
-                    corr_losses.append(F.binary_cross_entropy_with_logits(q_total_ao_chosen[use_ao_corr], rwd01[use_ao_corr]))
-                if use_ol_corr.any():
-                    corr_losses.append(F.binary_cross_entropy_with_logits(q_total_ol_chosen[use_ol_corr], rwd01[use_ol_corr]))
-                corr_loss = torch.stack(corr_losses).mean() if corr_losses else torch.zeros((), device=device)
-
-                q_bce = base_loss + corr_loss
-
-                contrast_loss = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
-                bandit_total = q_bce + 0.05 * contrast_loss
 
             bandit_total.backward()
-            bandit_loss_sum += float(q_bce.item())
+            bandit_loss_sum += float(bandit_total.item())
             bandit_slices += 1
 
             # -----------------------------
-            # 4) MOTOR loss (flat over all steps)
+            # 4) MOTOR loss (flat)
             # -----------------------------
             mini_batch_size = 16384
             total_steps = len(xy_pos_buf)

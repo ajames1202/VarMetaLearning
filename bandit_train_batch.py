@@ -13,7 +13,7 @@ import argparse
 
 
 import visual_bandit_env3 as vbe
-import var_bandit_learner2 as bl
+import var_bandit_learner2_dvae_2latents_jointlowrank as bl
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
 import pygame
@@ -99,12 +99,11 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         if print_this_session and worker_id == 0:
             print(*args, **kwargs)
 
-    # -----------------------------
-    # Attention memory (past trials)
-    # -----------------------------
-    k_tokens = []      # list[(1,H)]  keys: q_in(chosen_feat)
-    v_tokens = []      # list[(1,H)]  values: action+actor+reward embeddings
-    cond_tokens = []   # list[str]    trial condition per past trial
+    # --------------------------------------
+    # DVAE history tokens: x_tau = stim + actor + action + reward_idx
+    # (reward_idx is 0/1 or 2=no_feedback)
+    # --------------------------------------
+    x_tokens = []  # list[(1,1,H)] in time order
 
     obs, info = env.reset()
     done = False
@@ -135,6 +134,8 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
 
     # state for the current trial
     curr_trial_condition = None
+    left_view = None
+    right_view = None
     left_feats = None
     right_feats = None
     choice_target = None
@@ -143,85 +144,49 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
     p_left = torch.tensor(0.5)
     p_right = torch.tensor(0.5)
 
-    def _ctx_for(q_tok: torch.Tensor, keep_conds: set) -> torch.Tensor:
-        """Return ctx for a single query token, attending only to past trials in keep_conds.
+    def _h_prev_cur() -> torch.Tensor:
+        """Return h_{t-1} = rep[t-1] where rep is computed causally from past x_tokens.
 
-        q_tok: (1,1,H)
-        returns: (1,1,H)
+        Shape: (1,1,H). If no history, returns zeros (like training h_prev[0]=0).
         """
-        if len(k_tokens) == 0:
-            return agent.attn_ln(q_tok)
+        Hh = agent.attn_ln.normalized_shape[0]
+        if len(x_tokens) == 0:
+            return torch.zeros((1, 1, Hh), device=device, dtype=torch.float32)
+        x_hist = torch.cat(x_tokens, dim=0)  # (t,1,H)
+        rep = agent._rep_all(x_hist)         # (t,1,H)
+        return rep[-1:].to(torch.float32)
 
-        k = torch.stack(k_tokens, dim=0)  # (Lpast,1,H)
-        v = torch.stack(v_tokens, dim=0)  # (Lpast,1,H)
-        keep = torch.as_tensor([c in keep_conds for c in cond_tokens], device=device, dtype=torch.bool)  # (Lpast,)
-        kpm = (~keep).unsqueeze(0)  # (1,Lpast) True=mask
-        ctx_attn = agent._safe_causal_attn(q_tok, k, v, kpm)  # (1,1,H)
-        return agent.attn_ln(ctx_attn + q_tok)
+    def _sample_prior(h_prev: torch.Tensor) -> torch.Tensor:
+        """Sample z_t ~ p(z_t | h_{t-1}). Shape: (1,1,D)."""
+        out = agent.prior_net(h_prev)  # (1,1, outdim)
+        D = agent.z_dim
+        r = agent.z_rank
+        eps = 1e-4
+        mu = out[..., :D]
+        diag_raw = out[..., D: 2 * D]
+        if r > 0:
+            U = out[..., 2 * D :].view(1, 1, D, r)
+            cov_diag = F.softplus(diag_raw) + eps
+            dist = torch.distributions.LowRankMultivariateNormal(mu, U, cov_diag)
+            return dist.rsample()
+        else:
+            sig = F.softplus(diag_raw) + eps
+            dist = torch.distributions.Normal(mu, sig)
+            return dist.rsample()
 
-    def _choice_logits(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
-        """Compute (1,1,2) action logits for self-choice trials."""
-        ql = agent.q_in(lf).unsqueeze(0)  # (1,1,H)
-        qr = agent.q_in(rf).unsqueeze(0)  # (1,1,H)
+    def _self_reward_logits(z_self: torch.Tensor, h_prev: torch.Tensor, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
+        lr_concat = torch.cat([lf, rf], dim=-1).unsqueeze(0)  # (1,1,2F)
+        one_L = torch.tensor([[[1.0, 0.0]]], device=device, dtype=torch.float32)
+        one_R = torch.tensor([[[0.0, 1.0]]], device=device, dtype=torch.float32)
 
-        lf_seq = lf.unsqueeze(0)  # (1,1,F)
-        rf_seq = rf.unsqueeze(0)  # (1,1,F)
+        in_L = torch.cat([z_self, h_prev, lr_concat, one_L], dim=-1)
+        in_R = torch.cat([z_self, h_prev, lr_concat, one_R], dim=-1)
 
-        if curr_cond == "IL":
-            ctx_l = _ctx_for(ql, {"IL"})
-            ctx_r = _ctx_for(qr, {"IL"})
-            log_l = agent._head(agent.q_base, ctx_l, lf_seq)
-            log_r = agent._head(agent.q_base, ctx_r, rf_seq)
-            return torch.cat([log_l, log_r], dim=-1)
+        log_L = agent.self_reward_dec(in_L).squeeze(-1)  # (1,1)
+        log_R = agent.self_reward_dec(in_R).squeeze(-1)  # (1,1)
 
-        if curr_cond == "AO-s":
-            ctx_l_s = _ctx_for(ql, {"AO-s"})
-            ctx_r_s = _ctx_for(qr, {"AO-s"})
-            base_l = agent._head(agent.q_base, ctx_l_s, lf_seq)
-            base_r = agent._head(agent.q_base, ctx_r_s, rf_seq)
-            base = torch.cat([base_l, base_r], dim=-1)
+        return torch.stack([log_L, log_R], dim=-1)       # (1,1,2)  ✅
 
-            # correction from observed-teacher-action history
-            ctx_l_o = _ctx_for(ql, {"AO-o"})
-            ctx_r_o = _ctx_for(qr, {"AO-o"})
-            d_l = agent._head(agent.q_delta_ao, ctx_l_o, lf_seq)
-            d_r = agent._head(agent.q_delta_ao, ctx_r_o, rf_seq)
-            delta = torch.cat([d_l, d_r], dim=-1)
-
-            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
-            g = torch.sigmoid(agent.gate_ao(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta = delta * g
-
-            has_prev_ao = any(c in ("AO-s", "AO-o") for c in cond_tokens)
-            return base + delta if has_prev_ao else base
-
-        if curr_cond == "OL-s":
-            ctx_l_s = _ctx_for(ql, {"OL-s"})
-            ctx_r_s = _ctx_for(qr, {"OL-s"})
-            base_l = agent._head(agent.q_base, ctx_l_s, lf_seq)
-            base_r = agent._head(agent.q_base, ctx_r_s, rf_seq)
-            base = torch.cat([base_l, base_r], dim=-1)
-
-            # correction from observed-teacher-feedback history
-            ctx_l_o = _ctx_for(ql, {"OL-o"})
-            ctx_r_o = _ctx_for(qr, {"OL-o"})
-            d_l = agent._head(agent.q_delta_ol, ctx_l_o, lf_seq)
-            d_r = agent._head(agent.q_delta_ol, ctx_r_o, rf_seq)
-            delta = torch.cat([d_l, d_r], dim=-1)
-
-            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
-            g = torch.sigmoid(agent.gate_ol(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta = delta * g
-
-            has_prev_ol = any(c in ("OL-s", "OL-o") for c in cond_tokens)
-            return base + delta if has_prev_ol else base
-
-        # Fallback: treat unknown as IL
-        ctx_l = _ctx_for(ql, {"IL"})
-        ctx_r = _ctx_for(qr, {"IL"})
-        log_l = agent._head(agent.q_base, ctx_l, lf_seq)
-        log_r = agent._head(agent.q_base, ctx_r, rf_seq)
-        return torch.cat([log_l, log_r], dim=-1)
 
     while not done:
         obs_tensor = (
@@ -243,12 +208,16 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
             right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
 
-            # Self-choice trials
+            # Self-choice trials: choose using PRIOR (no reward leakage)
             if curr_trial_condition not in ("AO-o", "OL-o"):
-                logits = _choice_logits(curr_trial_condition, left_feats, right_feats)  # (1,1,2)
+                h_prev = _h_prev_cur()  # (1,1,H)
+                z = _sample_prior(h_prev)  # (1,1,D)
+                z_self = z[..., : agent.z_self_dim]  # (1,1,zs)
+
+                q_logits = _self_reward_logits(z_self, h_prev, left_feats, right_feats)  # (1,1,2)
 
                 tau = 0.2
-                p_choose = torch.softmax(logits / tau, dim=-1)  # (1,1,2)
+                p_choose = torch.softmax(q_logits / tau, dim=-1)  # (1,1,2)
                 p_left = p_choose[0, 0, 0]
                 p_right = p_choose[0, 0, 1]
 
@@ -297,7 +266,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         done = term
 
         # -----------------------------
-        # Trial ended => append memory token
+        # Trial ended => append DVAE token + log buffers
         # -----------------------------
         if info.get("trial_ended"):
             meta_ep_start = 0.0 if meta_ep_len > 1 else 1.0
@@ -309,29 +278,23 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
                 choice_target = F.one_hot(torch.tensor(a_t, device=device), num_classes=2).unsqueeze(0).float()
                 actor = 1
 
-            # reward index used by the model: 0/1 observed, 2 = no_feedback
+            # reward index: 0/1 observed, 2 = no_feedback
             if curr_trial_condition == "AO-o":
                 rwd_idx = 2
             else:
-                # env reward is typically 0/1 float
                 rwd_idx = int(round(float(reward)))
                 rwd_idx = 1 if rwd_idx >= 1 else 0
 
-            # key/value tokens (match update2)
-            aL = choice_target[..., 0:1]
-            aR = choice_target[..., 1:2]
-            chosen_feat = aL * left_feats + aR * right_feats
+            # append DVAE history token x_t (stim+actor+action+reward_idx)
+            lr_concat = torch.cat([left_feats, right_feats], dim=-1).unsqueeze(0)  # (1,1,2F)
+            stim_tok = agent.inp_emb(lr_concat)  # (1,1,H)
 
-            action_emb = agent.action(torch.tensor([a_t], device=device, dtype=torch.long))     # (1,H)
-            actor_emb  = agent.actor(torch.tensor([actor], device=device, dtype=torch.long))    # (1,H)
-            rwd_emb    = agent.rwd_in(torch.tensor([rwd_idx], device=device, dtype=torch.long)) # (1,H)
-            v_tok = action_emb + actor_emb + rwd_emb  # (1,H)
+            actor_emb = agent.actor(torch.tensor([actor], device=device, dtype=torch.long)).unsqueeze(0)    # (1,1,H)
+            action_emb = agent.action(torch.tensor([a_t], device=device, dtype=torch.long)).unsqueeze(0)   # (1,1,H)
+            rwd_emb = agent.rwd_in(torch.tensor([rwd_idx], device=device, dtype=torch.long)).unsqueeze(0)  # (1,1,H)
 
-            k_tok = agent.q_in(chosen_feat)  # (1,H)
-
-            v_tokens.append(v_tok)
-            k_tokens.append(k_tok)
-            cond_tokens.append(curr_trial_condition)
+            x_tok = stim_tok + actor_emb + action_emb + rwd_emb
+            x_tokens.append(x_tok)
 
             # perf stats
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
@@ -369,7 +332,7 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             )
 
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
-            bandit_rewards_buf.append(float(rwd_idx))  # store idx so update2 can mask AO-o with 2
+            bandit_rewards_buf.append(float(rwd_idx))
             meta_ep_start_buf.append(float(meta_ep_start))
             actor_buf.append(actor)
             trial_cond_buf.append(curr_trial_condition)
@@ -401,9 +364,6 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
         high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol
     )
-
-
-
 @ray.remote(num_cpus=1, num_gpus=0)
 class RolloutWorker:
     def __init__(self, session_K, session_N, seed=0, worker_id=0):
@@ -538,7 +498,7 @@ if __name__ == "__main__":
     # ---------- Ray init ----------
     # local: ray.init()
     # cluster: ray.init(address="auto")
-    # ray.init(ignore_reinit_error=True)
+    ray.init(ignore_reinit_error=True)
 
     # ---------- rollout workers ----------
     workers = [
@@ -815,5 +775,3 @@ if __name__ == "__main__":
 
     ray.shutdown()
     writer.close()
-
-
