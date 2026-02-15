@@ -13,7 +13,7 @@ import argparse
 
 
 import visual_bandit_env3 as vbe
-import var_bandit_learner2_dvae_2latents_jointlowrank as bl
+import var_bandit_learner2 as bl
 from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, pad_packed_sequence
 import math
 import pygame
