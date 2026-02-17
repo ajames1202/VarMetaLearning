@@ -449,8 +449,8 @@ class BanditLearner(nn.Module):
                 kl_loss = kl_tb.mean()
 
                 # Split latents
-                z_self = z_p[..., : self.z_self_dim]
-                z_obs = z_p[..., self.z_self_dim :]
+                z_self = z[..., : self.z_self_dim]
+                z_obs = z[..., self.z_self_dim :]
 
                 # -----------------------------
                 # Decode: self reward + self policy from z_self
