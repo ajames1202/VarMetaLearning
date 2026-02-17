@@ -375,6 +375,7 @@ class BanditLearner(nn.Module):
             action_emb = self.action(a_t)
             actor_emb = self.actor(actor)
             rwd_emb = self.rwd_in(rwd_idx)
+            
 
             # x_t for the posterior can include reward (observed or NO_FEEDBACK)
             x_tok = stim_tok + actor_emb + action_emb + rwd_emb
@@ -432,6 +433,7 @@ class BanditLearner(nn.Module):
                     q_dist = torch.distributions.LowRankMultivariateNormal(mu_q, U_q, cov_diag_q)
 
                     z = q_dist.rsample()  # (T,B,D)
+                    z_p = p_dist.rsample()  # (T,B,D)
                     kl_tb = q_dist.log_prob(z) - p_dist.log_prob(z)  # (T,B) MC KL
                 else:
                     sig_p = F.softplus(diag_p_raw) + eps
@@ -439,6 +441,7 @@ class BanditLearner(nn.Module):
 
                     q_dist = torch.distributions.Normal(mu_q, sig_q)
                     z = q_dist.rsample()
+                    z_p = p_dist.rsample()  # (T,B,D)
 
                     kl_dim = torch.log(sig_p / sig_q) + (sig_q.pow(2) + (mu_q - mu_p).pow(2)) / (2.0 * sig_p.pow(2)) - 0.5
                     kl_tb = kl_dim.sum(dim=-1)
@@ -446,8 +449,8 @@ class BanditLearner(nn.Module):
                 kl_loss = kl_tb.mean()
 
                 # Split latents
-                z_self = z[..., : self.z_self_dim]
-                z_obs = z[..., self.z_self_dim :]
+                z_self = z_p[..., : self.z_self_dim]
+                z_obs = z_p[..., self.z_self_dim :]
 
                 # -----------------------------
                 # Decode: self reward + self policy from z_self
@@ -455,14 +458,14 @@ class BanditLearner(nn.Module):
                 self_evt = (actor == 0)
                 teacher_evt = (actor == 1)
 
-                # self policy loss
-                pol_in = torch.cat([z_self, h_prev, lr_concat], dim=-1)  # (T,B,*)
-                pol_logits = self.self_policy_dec(pol_in)                # (T,B,2)
+                # # self policy loss
+                # pol_in = torch.cat([z_self, h_prev, lr_concat], dim=-1)  # (T,B,*)
+                # pol_logits = self.self_policy_dec(pol_in)                # (T,B,2)
 
-                if self_evt.any():
-                    pol_loss = F.cross_entropy(pol_logits[self_evt], a_t[self_evt])
-                else:
-                    pol_loss = torch.zeros((), device=device)
+                # if self_evt.any():
+                #     pol_loss = F.cross_entropy(pol_logits[self_evt], a_t[self_evt])
+                # else:
+                #     pol_loss = torch.zeros((), device=device)
 
                 # self reward loss (only when reward is observed)
                 sr_in = torch.cat([z_self, h_prev, lr_concat, chosen_bandits.float()], dim=-1)
@@ -498,13 +501,12 @@ class BanditLearner(nn.Module):
                 # Total
                 # -----------------------------
                 beta_kl = 0.1
-                lambda_self_pol = 0.1
+                # lambda_self_pol = 0.1
                 lambda_teacher_act = 0.1
                 lambda_teacher_rwd = 0.1
 
                 bandit_total = (
                     self_rwd_loss
-                    + lambda_self_pol * pol_loss
                     + lambda_teacher_act * teach_act_loss
                     + lambda_teacher_rwd * teach_rwd_loss
                     + beta_kl * kl_loss
