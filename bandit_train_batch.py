@@ -563,7 +563,7 @@ if __name__ == "__main__":
                 # L = [0.8] * session_K if np.random.rand() < 0.5 else [0.2] * session_K
                 # R = [1.0 - x for x in L]
 
-                probs_this_session = [(0.4, 0.6) if np.random.rand() < 0.5 else (0.6, 0.4) for _ in range(session_K)]
+                probs_this_session = [(0.8, 0.2) if np.random.rand() < 0.5 else (0.2, 0.8) for _ in range(session_K)]
                 # probs_this_session = [(0.8, 0.2)] * session_K ## Sanity check
                 probs_list.append(probs_this_session)
 
