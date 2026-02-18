@@ -500,7 +500,7 @@ class BanditLearner(nn.Module):
                 # -----------------------------
                 # Total
                 # -----------------------------
-                beta_kl = 1.0
+                beta_kl = 5.0
                 # lambda_self_pol = 0.1
                 lambda_teacher_act = 0.1
                 lambda_teacher_rwd = 0.1
