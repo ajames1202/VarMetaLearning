@@ -103,7 +103,7 @@ class BanditLearner(nn.Module):
 
         # Prior p(z_t | h_{t-1}) over the *joint* latent
         self.prior_net = nn.Sequential(
-            nn.Linear(rnn_hidden_size, 128),
+            nn.Linear(2*rnn_hidden_size, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, self._z_out),
         )
@@ -131,9 +131,9 @@ class BanditLearner(nn.Module):
         # -------------------------
         # Self reward decoder: p(r_self_t | z_self_t, h_{t-1}, s_t, a_t)
         self.self_reward_dec = nn.Sequential(
-            nn.Linear(self.z_self_dim + rnn_hidden_size + 2 * feature_dim + 2, 128),
+            nn.Linear(self.z_dim + rnn_hidden_size + 2 * feature_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1),
+            nn.Linear(128, 2),
         )
 
         # Self policy decoder: p(a_self_t | z_self_t, h_{t-1}, s_t)
@@ -152,9 +152,9 @@ class BanditLearner(nn.Module):
 
         # Optional: teacher reward decoder when teacher feedback is observed (e.g., OL-o)
         self.teacher_reward_dec = nn.Sequential(
-            nn.Linear(self.z_obs_dim + rnn_hidden_size + 2 * feature_dim + 2, 128),
+            nn.Linear(self.z_obs_dim + rnn_hidden_size + 2 * feature_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1),
+            nn.Linear(128, 2),
         )
 
         # -------------------------
@@ -379,6 +379,7 @@ class BanditLearner(nn.Module):
 
             # x_t for the posterior can include reward (observed or NO_FEEDBACK)
             x_tok = stim_tok + actor_emb + action_emb + rwd_emb
+            x_tok_st = stim_tok + actor_emb 
 
             if T < 1:
                 bandit_total = torch.zeros((), device=device)
@@ -409,7 +410,8 @@ class BanditLearner(nn.Module):
                 D, r = self.z_dim, self.z_rank
                 eps = 1e-4
 
-                prior_out = self.prior_net(h_prev)  # (T,B,*)
+                prior_in  = torch.cat([h_prev, x_tok_st], dim=-1)  # (1,1,2H)
+                prior_out = self.prior_net(prior_in)  # (T,B,*)
                 mu_p, diag_p_raw, U_p = self._unpack_joint_lr(prior_out, T, B)
 
                 post_in = torch.cat([h_prev, x_tok], dim=-1)
@@ -439,6 +441,7 @@ class BanditLearner(nn.Module):
                     sig_p = F.softplus(diag_p_raw) + eps
                     sig_q = F.softplus(diag_q_raw) + eps
 
+                    p_dist = torch.distributions.Normal(mu_p, sig_p)
                     q_dist = torch.distributions.Normal(mu_q, sig_q)
                     z = q_dist.rsample()
                     z_p = p_dist.rsample()  # (T,B,D)
@@ -450,7 +453,10 @@ class BanditLearner(nn.Module):
 
                 # Split latents
                 z_self = z[..., : self.z_self_dim]
-                z_obs = z[..., self.z_self_dim :]
+                z_obs  = z[..., self.z_self_dim :]
+
+                z_p_self = z_p[..., : self.z_self_dim]
+                z_p_obs  = z_p[..., self.z_self_dim :]
 
                 # -----------------------------
                 # Decode: self reward + self policy from z_self
@@ -468,14 +474,46 @@ class BanditLearner(nn.Module):
                 #     pol_loss = torch.zeros((), device=device)
 
                 # self reward loss (only when reward is observed)
-                sr_in = torch.cat([z_self, h_prev, lr_concat, chosen_bandits.float()], dim=-1)
-                sr_logits = self.self_reward_dec(sr_in).squeeze(-1)  # (T,B)
+                sr_in = torch.cat([z_self, z_obs, h_prev, lr_concat], dim=-1)      # (T,B, zD+H+2F)
+                sr_logits_lr = self.self_reward_dec(sr_in)                        # (T,B,2)
+                sr_logits_sel = sr_logits_lr.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)  # (T,B)
 
                 mask_self_r = self_evt & rwd_obs
                 if mask_self_r.any():
-                    self_rwd_loss = F.binary_cross_entropy_with_logits(sr_logits[mask_self_r], rwd01[mask_self_r])
+                    self_rwd_loss = F.binary_cross_entropy_with_logits(sr_logits_sel[mask_self_r], rwd01[mask_self_r])
                 else:
                     self_rwd_loss = torch.zeros((), device=device)
+
+                # prior-predictive self reward loss (bridge prior -> behavior)
+                sr_p_in = torch.cat([z_p_self, z_p_obs, h_prev, lr_concat], dim=-1)          # (T,B, zD+H+2F)
+                sr_p_logits_lr = self.self_reward_dec(sr_p_in)                                # (T,B,2)
+                sr_p_logits_sel = sr_p_logits_lr.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)    # (T,B)
+                if mask_self_r.any():
+                    self_prior_rwd_loss = F.binary_cross_entropy_with_logits(sr_p_logits_sel[mask_self_r], rwd01[mask_self_r])
+                else:
+                    self_prior_rwd_loss = torch.zeros((), device=device)
+
+                # --- DEBUG: posterior vs prior reward accuracy on same batch positions ---
+                with torch.no_grad():
+                    y = rwd01[mask_self_r]                       # (n,) float 0/1
+                    yb = (y > 0.5)                               # bool
+
+                    post_prob = torch.sigmoid(sr_logits_sel[mask_self_r])
+                    prior_prob = torch.sigmoid(sr_p_logits_sel[mask_self_r])
+
+                    post_pred = (post_prob > 0.5)
+                    prior_pred = (prior_prob > 0.5)
+
+                    post_acc = (post_pred == yb).float().mean().item()
+                    prior_acc = (prior_pred == yb).float().mean().item()
+
+                    post_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                        sr_logits_sel[mask_self_r], y
+                    ).item()
+                    prior_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                        sr_p_logits_sel[mask_self_r], y
+                    ).item()
+                
 
                 # -----------------------------
                 # Decode: teacher behavior from z_obs
@@ -488,25 +526,29 @@ class BanditLearner(nn.Module):
                     teach_act_loss = torch.zeros((), device=device)
 
                 # Optional teacher reward loss (only teacher events with observed reward; typically OL-o)
-                tr_in = torch.cat([z_obs, h_prev, lr_concat, chosen_bandits.float()], dim=-1)
-                tr_logits = self.teacher_reward_dec(tr_in).squeeze(-1)
+                tr_in = torch.cat([z_obs, h_prev, lr_concat], dim=-1)                 # (T,B, zo+H+2F)
+                tr_logits_lr = self.teacher_reward_dec(tr_in)                         # (T,B,2)
+                tr_logits_sel = tr_logits_lr.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)  # (T,B)
 
                 mask_teacher_r = teacher_evt & rwd_obs
                 if mask_teacher_r.any():
-                    teach_rwd_loss = F.binary_cross_entropy_with_logits(tr_logits[mask_teacher_r], rwd01[mask_teacher_r])
+                    teach_rwd_loss = F.binary_cross_entropy_with_logits(tr_logits_sel[mask_teacher_r], rwd01[mask_teacher_r])
                 else:
                     teach_rwd_loss = torch.zeros((), device=device)
 
                 # -----------------------------
                 # Total
                 # -----------------------------
-                beta_kl = 5.0
+                beta_kl = 0.5
                 # lambda_self_pol = 0.1
                 lambda_teacher_act = 0.1
                 lambda_teacher_rwd = 0.1
 
+                lambda_prior = 1.0
+
                 bandit_total = (
                     self_rwd_loss
+                    + lambda_prior * self_prior_rwd_loss
                     + lambda_teacher_act * teach_act_loss
                     + lambda_teacher_rwd * teach_rwd_loss
                     + beta_kl * kl_loss
@@ -548,4 +590,10 @@ class BanditLearner(nn.Module):
 
         bandit_loss = bandit_loss_sum / max(1, bandit_slices)
         motor_loss = motor_loss_sum / max(1, motor_slices)
-        return bandit_loss, motor_loss
+
+        dbg = dict(
+            self_post_acc=post_acc, self_prior_acc=prior_acc,
+            self_post_bce=post_bce, self_prior_bce=prior_bce
+        )
+
+        return bandit_loss, motor_loss, self_rwd_loss, self_prior_rwd_loss, teach_act_loss, teach_rwd_loss, kl_loss, dbg 

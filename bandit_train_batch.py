@@ -156,9 +156,11 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
         rep = agent._rep_all(x_hist)         # (t,1,H)
         return rep[-1:].to(torch.float32)
 
-    def _sample_prior(h_prev: torch.Tensor) -> torch.Tensor:
-        """Sample z_t ~ p(z_t | h_{t-1}). Shape: (1,1,D)."""
-        out = agent.prior_net(h_prev)  # (1,1, outdim)
+    def _sample_prior(prior_in: torch.Tensor) -> torch.Tensor:
+        """Sample z_t ~ p(z_t | h_{t-1}, stim_t). Shape: (1,1,D).
+        prior_in must be (1,1,2H): concat([h_prev, x_tok_st]).
+        """
+        out = agent.prior_net(prior_in)  # (1,1,outdim)
         D = agent.z_dim
         r = agent.z_rank
         eps = 1e-4
@@ -174,21 +176,20 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             dist = torch.distributions.Normal(mu, sig)
             return dist.rsample()
 
-    def _self_reward_logits(z_self: torch.Tensor, h_prev: torch.Tensor, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
+    def _self_reward_logits(
+        z_self: torch.Tensor,
+        z_obs: torch.Tensor,
+        h_prev: torch.Tensor,
+        lf: torch.Tensor,
+        rf: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return reward logits for left/right: shape (1,1,2)."""
         lr_concat = torch.cat([lf, rf], dim=-1).unsqueeze(0)  # (1,1,2F)
-        one_L = torch.tensor([[[1.0, 0.0]]], device=device, dtype=torch.float32)
-        one_R = torch.tensor([[[0.0, 1.0]]], device=device, dtype=torch.float32)
-
-        in_L = torch.cat([z_self, h_prev, lr_concat, one_L], dim=-1)
-        in_R = torch.cat([z_self, h_prev, lr_concat, one_R], dim=-1)
-
-        log_L = agent.self_reward_dec(in_L).squeeze(-1)  # (1,1)
-        log_R = agent.self_reward_dec(in_R).squeeze(-1)  # (1,1)
-
-        return torch.stack([log_L, log_R], dim=-1)       # (1,1,2)  ✅
-
+        sr_in = torch.cat([z_self, z_obs, h_prev, lr_concat], dim=-1)  # (1,1, zD+H+2F)
+        return agent.self_reward_dec(sr_in)  # (1,1,2)
 
     while not done:
+
         obs_tensor = (
             torch.as_tensor(obs, device=device)
             .permute(2, 0, 1).unsqueeze(0)
@@ -208,13 +209,24 @@ def meta_ep_rollout(env, agent, device, session_K, session_N, worker_id=0, print
             left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
             right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
 
+            # Build stimulus+actor token for the prior (prior sees stim_t, not reward_t)
+            lr_concat = torch.cat([left_feats, right_feats], dim=-1).unsqueeze(0)  # (1,1,2F)
+            stim_tok = agent.inp_emb(lr_concat)  # (1,1,H)
+
+            actor = 1 if curr_trial_condition in ("AO-o", "OL-o") else 0
+            actor_emb = agent.actor(torch.tensor([actor], device=device, dtype=torch.long)).unsqueeze(0)  # (1,1,H)
+            x_tok_st = stim_tok + actor_emb  # (1,1,H)  (no reward embedding)
+
             # Self-choice trials: choose using PRIOR (no reward leakage)
             if curr_trial_condition not in ("AO-o", "OL-o"):
                 h_prev = _h_prev_cur()  # (1,1,H)
-                z = _sample_prior(h_prev)  # (1,1,D)
-                z_self = z[..., : agent.z_self_dim]  # (1,1,zs)
+                prior_in = torch.cat([h_prev, x_tok_st], dim=-1)  # (1,1,2H)
+                z = _sample_prior(prior_in)  # (1,1,D)
 
-                q_logits = _self_reward_logits(z_self, h_prev, left_feats, right_feats)  # (1,1,2)
+                z_self = z[..., : agent.z_self_dim]         # (1,1,zs)
+                z_obs  = z[..., agent.z_self_dim :]         # (1,1,zo)
+
+                q_logits = _self_reward_logits(z_self, z_obs, h_prev, left_feats, right_feats)  # (1,1,2)
 
                 tau = 0.2
                 p_choose = torch.softmax(q_logits / tau, dim=-1)  # (1,1,2)
@@ -625,7 +637,7 @@ if __name__ == "__main__":
         # before = {n: p.detach().clone() for n, p in agent.named_parameters()}
 
 
-        var_loss, motor_loss = agent.update2(
+        var_loss, motor_loss, self_rwd_loss, self_prior_rwd_loss, teach_act_loss, teach_rwd_loss, kl_loss, dbg = agent.update2(
             optim_bandit, optim_motor,
             batch_xy_pos,
             batch_goal_vec,
@@ -661,7 +673,9 @@ if __name__ == "__main__":
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"mean_cum_rew_il={mean_cum_rew_il:.1f} "
                   f"mean_cum_rew_ao={mean_cum_rew_ao:.1f} "
-                  f"mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
+                  f"mean_cum_rew_ol={mean_cum_rew_ol:.1f} "
+                  f"post_acc={dbg['self_post_acc']:.2f} prior_acc={dbg['self_prior_acc']:.2f} "
+                  f"post_bce={dbg['self_post_bce']:.2f} prior_bce={dbg['self_prior_bce']:.2f}")
             
 
         if update_idx >= warmup_updates:
@@ -687,6 +701,11 @@ if __name__ == "__main__":
         # scalar losses
         writer.add_scalar("Loss/ChoiceLoss", var_loss, global_step)
         writer.add_scalar("Loss/MotorLoss", motor_loss, global_step)
+        writer.add_scalar("Loss/SelfRwdLoss", self_rwd_loss, global_step)
+        writer.add_scalar("Loss/SelfPriorRwdLoss", self_prior_rwd_loss, global_step)
+        writer.add_scalar("Loss/TeachActLoss", teach_act_loss, global_step)
+        writer.add_scalar("Loss/TeachRwdLoss", teach_rwd_loss, global_step)
+        writer.add_scalar("Loss/KLLoss", kl_loss, global_step)
 
         # rewards
         writer.add_scalar("Reward/MeanCumSession_IL", mean_cum_rew_il, global_step)
