@@ -611,7 +611,10 @@ def main():
 
     # Ray init
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, include_dashboard=False)
+        tmp_dir = os.path.expanduser("~/tmp/ray")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        ray.init(_temp_dir=tmp_dir, include_dashboard=False, ignore_reinit_error=True)
 
     # rollout workers
     workers = [
