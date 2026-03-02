@@ -129,7 +129,7 @@ class BanditLearner(nn.Module):
         self.enc = CNNEncoder(feature_dim)
 
         # Causal cross-attention over past trials.
-        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, dropout=0.1, batch_first=False)
+        self.attn = nn.MultiheadAttention(embed_dim=rnn_hidden_size, num_heads=4, dropout=0.0, batch_first=False)
         self.q_in = nn.Linear(feature_dim, rnn_hidden_size, bias=False)
         self.attn_ln = nn.LayerNorm(rnn_hidden_size)
 
@@ -168,6 +168,14 @@ class BanditLearner(nn.Module):
             nn.Linear(4 * rnn_hidden_size, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
+        )
+
+
+        # value head
+        self.v_head = nn.Sequential(
+            nn.Linear(4 * rnn_hidden_size + 2 * feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
         )
 
         # Motor policy
@@ -216,6 +224,7 @@ class BanditLearner(nn.Module):
             self.q_delta_ol,
             self.gate_ao,
             self.gate_ol,
+            self.v_head,
         ]
         for m in modules:
             for p in m.parameters():
@@ -314,258 +323,234 @@ class BanditLearner(nn.Module):
         xy_pos_buf,
         goal_vec_buf,
         chosen_bandits_motor_buf,
-        bandit_obs: List[Dict[str, Any]],
-        chosen_bandits_buf: List[torch.Tensor],
-        bandit_rewards_buf: List[torch.Tensor],
-        meta_ep_start_buf: List[torch.Tensor],
-        actor_buf: List[torch.Tensor],
+        bandit_obs,
+        chosen_bandits_buf,
+        bandit_rewards_buf,
+        meta_ep_start_buf,   # unused (kept for signature compat)
+        actor_buf,
         trial_cond_buf,
-        teacher_correct_buf: List[torch.Tensor],
+        teacher_correct_buf, # unused for pure PPO (kept for compat)
+        # PPO extras:
+        bandit_logp_buf,
+        bandit_value_buf,
         device,
+        # PPO hyperparams:
+        ppo_epochs: int = 4,
+        clip_eps: float = 0.2,
+        vf_coef: float = 0.5,
+        ent_coef: float = 0.01,
+        gamma: float = 1.0,
+        gae_lambda: float = 0.95,
+        tau: float = 1.0,
     ):
-        # -----------------------------
-        # 1) MOTOR data: keep flat (no batch)
-        # -----------------------------
+        # ---------- motor data (same as update2) ----------
         xy_pos = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
         goalvec = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
         chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
-        # -----------------------------
-        # 2) BANDIT data: batched (B, T, ...)
-        # -----------------------------
-        left_obs = torch.stack(
-            [torch.as_tensor(b["left"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0
-        )  # (B,T,C,H,W)
-        right_obs = torch.stack(
-            [torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0
-        )  # (B,T,C,H,W)
+        # ---------- bandit data (same as update2) ----------
+        left_obs = torch.stack([torch.as_tensor(b["left"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
+        right_obs = torch.stack([torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)     # (B,T,2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device)    # (B,T)
         actor = torch.stack(actor_buf, dim=0).to(device)                       # (B,T)
-        teacher_correct = torch.stack(teacher_correct_buf, dim=0).to(device)   # (B,T)
-        trial_cond = np.stack(trial_cond_buf, axis=0)                           # (B,T) strings
+        trial_cond = np.stack(trial_cond_buf, axis=0)                          # (B,T) strings
+
+        # PPO extras from rollout
+        logp_old_bt = torch.stack(bandit_logp_buf, dim=0).to(device)           # (B,T)
+        v_old_bt = torch.stack(bandit_value_buf, dim=0).to(device)             # (B,T)
+        # pm_bt = torch.stack(bandit_policy_mask_buf, dim=0).to(device)          # (B,T)
 
         B, T, C, H, W = left_obs.shape
 
         # time-major
-        chosen_bandits = chosen_bandits.permute(1, 0, 2)   # (T,B,2)
-        rewards_bandits = rewards_bandits.permute(1, 0)    # (T,B)
-        actor = actor.permute(1, 0).long().clamp(0, 1)      # (T,B)
-        teacher_correct = teacher_correct.permute(1, 0).float()  # (T,B) in {-1,0,1}
-        trial_cond = trial_cond.transpose(1, 0)             # (T,B)
+        chosen_bandits = chosen_bandits.permute(1, 0, 2)  # (T,B,2)
+        rewards_bandits = rewards_bandits.permute(1, 0)   # (T,B)
+        actor = actor.permute(1, 0).long().clamp(0, 1)    # (T,B)
+        trial_cond = trial_cond.transpose(1, 0)           # (T,B)
 
-        rwd_idx = rewards_bandits.long().clamp(0, 2)        # (T,B)
-        rwd_obs = rwd_idx != 2                               # (T,B)
-        rwd01 = rwd_idx.float().clamp(0.0, 1.0)             # (T,B)
+        actions = chosen_bandits.argmax(dim=-1)  # (T,B) int64
+        logp_old = logp_old_bt.permute(1, 0).float()      # (T,B)
+        v_old = v_old_bt.permute(1, 0).float()            # (T,B)
+        # policy_mask = pm_bt.permute(1, 0).float()         # (T,B)
 
-        num_epochs = 1
-        bandit_loss_sum, bandit_slices = 0.0, 0
-        motor_loss_sum, motor_slices = 0.0, 0
+        rwd_idx = rewards_bandits.long().clamp(0, 2)
+        rwd_obs = (rwd_idx != 2)
+        rwd01 = rwd_idx.float().clamp(0.0, 1.0)
 
-        for _ in range(num_epochs):
-            optim_motor.zero_grad(set_to_none=True)
+        # Only count SELF-choice rewards toward return (AO-o/OL-o do not give policy credit)
+        # (Your masks exist exactly like update2) :contentReference[oaicite:8]{index=8}
+        mask_IL  = torch.as_tensor(trial_cond == "IL",   device=device)
+        mask_AOo = torch.as_tensor(trial_cond == "AO-o", device=device)
+        mask_AOs = torch.as_tensor(trial_cond == "AO-s", device=device)
+        mask_OLo = torch.as_tensor(trial_cond == "OL-o", device=device)
+        mask_OLs = torch.as_tensor(trial_cond == "OL-s", device=device)
+        mask_self_choice = (mask_IL | mask_AOs | mask_OLs)
+
+        rew = (rwd01 * (mask_self_choice & rwd_obs).float())  # (T,B)
+
+        # ---------- GAE using v_old from rollout ----------
+        adv = torch.zeros_like(rew)
+        gae = torch.zeros((B,), device=device)
+        next_v = torch.zeros((B,), device=device)
+        for t in reversed(range(T)):
+            delta = rew[t] + gamma * next_v - v_old[t]
+            gae = delta + gamma * gae_lambda * gae
+            adv[t] = gae
+            next_v = v_old[t]
+        ret = adv + v_old
+        # normalize advantages over the (masked) policy steps
+        m = mask_self_choice
+        adv_mean = (adv * m).sum() / (m.sum() + 1e-8)
+        adv_var = ((adv - adv_mean).pow(2) * m).sum() / (m.sum() + 1e-8)
+        adv = (adv - adv_mean) / (adv_var.sqrt() + 1e-8)
+
+        # ---------- PPO epochs ----------
+        bandit_loss_sum = 0.0
+        motor_loss_sum = 0.0
+        motor_slices = 0
+
+        for _ in range(ppo_epochs):
             optim_bandit.zero_grad(set_to_none=True)
+            optim_motor.zero_grad(set_to_none=True)
 
-            # -----------------------------
-            # 3) BANDIT loss
-            # -----------------------------
+            # encode features
             left_flat = left_obs.reshape(B * T, C, H, W)
             right_flat = right_obs.reshape(B * T, C, H, W)
+            left_feats = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)   # (T,B,F)
+            right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)
 
-            left_feats = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)    # (T,B,F)
-            right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)  # (T,B,F)
-
+            # build history tokens exactly like update2 :contentReference[oaicite:9]{index=9}
             aL = chosen_bandits[..., 0:1]
             aR = chosen_bandits[..., 1:2]
             chosen_feat = aL * left_feats + aR * right_feats
 
-            a_t = torch.argmax(chosen_bandits, dim=-1)  # (T,B)
-            action_emb = self.action(a_t)
-            actor_emb = self.actor(actor)
-            rwd_emb = self.rwd_in(rwd_idx)
-            x_val = action_emb + actor_emb + rwd_emb
+            a_t = torch.argmax(chosen_bandits, dim=-1)  # (T,B) (teacher on obs trials, but masked later)
+            x_val = self.action(a_t) + self.actor(actor) + self.rwd_in(rwd_idx)
 
             q_left_all = self.q_in(left_feats)
             q_right_all = self.q_in(right_feats)
             k_all = self.q_in(chosen_feat)
 
             if T < 2:
-                q_bce = torch.zeros((), device=device)
-                contrast_loss = torch.zeros((), device=device)
-                bandit_total = torch.zeros((), device=device)
+                loss = torch.zeros((), device=device)
             else:
                 q_left_q = q_left_all[1:]
                 q_right_q = q_right_all[1:]
                 k_hist = k_all[:-1]
                 v_hist = x_val[:-1]
-                L = T - 1
 
-                # Masks per timestep (T,B)
-                mask_IL = torch.as_tensor(trial_cond == "IL", device=device)
-                mask_AOo = torch.as_tensor(trial_cond == "AO-o", device=device)
-                mask_AOs = torch.as_tensor(trial_cond == "AO-s", device=device)
-                mask_OLo = torch.as_tensor(trial_cond == "OL-o", device=device)
-                mask_OLs = torch.as_tensor(trial_cond == "OL-s", device=device)
-                mask_self_choice = mask_IL | mask_AOs | mask_OLs
-
-                def cond_ctx(q_q: torch.Tensor, q_all: torch.Tensor, hist_keep_mask: torch.Tensor) -> torch.Tensor:
-                    # Align history mask to keys length L using :-1
-                    kpm = ~(hist_keep_mask[:-1].T)  # (B,L)
+                def cond_ctx(q_q, q_all, hist_keep_mask):
+                    kpm = ~(hist_keep_mask[:-1].T)  # (B,T-1)
                     ctx_q = self._safe_causal_attn(q_q, k_hist, v_hist, kpm)
                     ctx_q = self.attn_ln(ctx_q + q_q)
                     return self._build_ctx(q_all, ctx_q)
 
-                # Contexts (all (T,B,H))
-                ctx_left_il = cond_ctx(q_left_q, q_left_all, mask_IL)
-                ctx_right_il = cond_ctx(q_right_q, q_right_all, mask_IL)
-
+                ctx_left_il   = cond_ctx(q_left_q, q_left_all, mask_IL)
+                ctx_right_il  = cond_ctx(q_right_q, q_right_all, mask_IL)
                 ctx_left_ao_s = cond_ctx(q_left_q, q_left_all, mask_AOs)
-                ctx_right_ao_s = cond_ctx(q_right_q, q_right_all, mask_AOs)
-
+                ctx_right_ao_s= cond_ctx(q_right_q, q_right_all, mask_AOs)
                 ctx_left_ol_s = cond_ctx(q_left_q, q_left_all, mask_OLs)
-                ctx_right_ol_s = cond_ctx(q_right_q, q_right_all, mask_OLs)
-
+                ctx_right_ol_s= cond_ctx(q_right_q, q_right_all, mask_OLs)
                 ctx_left_ao_o = cond_ctx(q_left_q, q_left_all, mask_AOo)
-                ctx_right_ao_o = cond_ctx(q_right_q, q_right_all, mask_AOo)
-
+                ctx_right_ao_o= cond_ctx(q_right_q, q_right_all, mask_AOo)
                 ctx_left_ol_o = cond_ctx(q_left_q, q_left_all, mask_OLo)
-                ctx_right_ol_o = cond_ctx(q_right_q, q_right_all, mask_OLo)
+                ctx_right_ol_o= cond_ctx(q_right_q, q_right_all, mask_OLo)
 
-                # -----------------------------
-                # Self expert (q_base) + teacher experts (q_delta_*) + reliability gates (g_*)
-                # Compose AO/OL predictions using a probability-mixture so g is an identifiable mixing weight.
-                # -----------------------------
-
-                # Self logits depend on the self-context of each condition.
+                # base logits (self contexts) :contentReference[oaicite:10]{index=10}
                 base_l = (
                     self._head(self.q_base, ctx_left_il, left_feats) * mask_IL.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_left_ao_s, left_feats) * mask_AOs.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_left_ol_s, left_feats) * mask_OLs.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_left_ao_s, left_feats) * mask_AOs.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_left_ol_s, left_feats) * mask_OLs.unsqueeze(-1).float()
                 )
                 base_r = (
                     self._head(self.q_base, ctx_right_il, right_feats) * mask_IL.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
-                    + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
                 )
                 q_self_logits = torch.cat([base_l, base_r], dim=-1)  # (T,B,2)
 
-                # Teacher experts (logits) from observation contexts
+                # teacher deltas (observation contexts) :contentReference[oaicite:11]{index=11}
                 q_teacher_ao = torch.cat(
-                    [
-                        self._head(self.q_delta_ao, ctx_left_ao_o, left_feats),
-                        self._head(self.q_delta_ao, ctx_right_ao_o, right_feats),
-                    ],
-                    dim=-1,
-                )  # (T,B,2)
+                    [self._head(self.q_delta_ao, ctx_left_ao_o, left_feats),
+                    self._head(self.q_delta_ao, ctx_right_ao_o, right_feats)], dim=-1
+                )
                 q_teacher_ol = torch.cat(
-                    [
-                        self._head(self.q_delta_ol, ctx_left_ol_o, left_feats),
-                        self._head(self.q_delta_ol, ctx_right_ol_o, right_feats),
-                    ],
-                    dim=-1,
-                )  # (T,B,2)
-
-                # Reliability gates (0..1)
-                g_ao_in = torch.cat([ctx_left_ao_s, ctx_right_ao_s, ctx_left_ao_o, ctx_right_ao_o], dim=-1)
-                g_ol_in = torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1)
-                g_ao = torch.sigmoid(self.gate_ao(g_ao_in)).clamp(0.0, 1.0)  # (T,B,1)
-                g_ol = torch.sigmoid(self.gate_ol(g_ol_in)).clamp(0.0, 1.0)
-
-                # Mixture in probability space so g is identifiable as a mixing weight
-                eps = 1e-5
-                p_self = torch.sigmoid(q_self_logits.detach())  # detach keeps the self expert mostly trained by base_loss
-                p_teacher_ao = torch.sigmoid(q_teacher_ao)
-                p_teacher_ol = torch.sigmoid(q_teacher_ol)
-                p_mix_ao = (1.0 - g_ao) * p_self + g_ao * p_teacher_ao
-                p_mix_ol = (1.0 - g_ol) * p_self + g_ol * p_teacher_ol
-                p_mix_ao = p_mix_ao.clamp(eps, 1.0 - eps)
-                p_mix_ol = p_mix_ol.clamp(eps, 1.0 - eps)
-                q_mix_ao = torch.log(p_mix_ao / (1.0 - p_mix_ao))
-                q_mix_ol = torch.log(p_mix_ol / (1.0 - p_mix_ol))
-
-                # Base loss trains self expert on self-choice trials (IL/AO-s/OL-s) when reward is observed.
-                q_self_chosen = q_self_logits.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
-                base_mask = mask_self_choice & rwd_obs
-                base_loss = (
-                    F.binary_cross_entropy_with_logits(q_self_chosen[base_mask], rwd01[base_mask])
-                    if base_mask.any()
-                    else torch.zeros((), device=device)
+                    [self._head(self.q_delta_ol, ctx_left_ol_o, left_feats),
+                    self._head(self.q_delta_ol, ctx_right_ol_o, right_feats)], dim=-1
                 )
 
-                # Mix loss trains teacher experts + gates, but only once at least one AO-o/OL-o exists in history.
-                ao_o_cum = mask_AOo.float().cumsum(dim=0)
-                ol_o_cum = mask_OLo.float().cumsum(dim=0)
-                ao_o_before = torch.zeros_like(ao_o_cum)
-                ol_o_before = torch.zeros_like(ol_o_cum)
-                ao_o_before[1:] = ao_o_cum[:-1]
-                ol_o_before[1:] = ol_o_cum[:-1]
-                use_ao_mix = mask_AOs & (ao_o_before > 0) & rwd_obs
-                use_ol_mix = mask_OLs & (ol_o_before > 0) & rwd_obs
+                g_ao = torch.sigmoid(self.gate_ao(torch.cat([ctx_left_ao_s, ctx_right_ao_s, ctx_left_ao_o, ctx_right_ao_o], dim=-1))).clamp(0,1)
+                g_ol = torch.sigmoid(self.gate_ol(torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1))).clamp(0,1)
 
-                q_mix_ao_chosen = q_mix_ao.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
-                q_mix_ol_chosen = q_mix_ol.gather(-1, a_t.unsqueeze(-1)).squeeze(-1)
+                # Match rollout's "has_prev_*": any previous AO-s/AO-o or OL-s/OL-o 
+                ao_any = (mask_AOs | mask_AOo).float().cumsum(dim=0)
+                ol_any = (mask_OLs | mask_OLo).float().cumsum(dim=0)
+                ao_before = torch.zeros_like(ao_any); ao_before[1:] = ao_any[:-1]
+                ol_before = torch.zeros_like(ol_any); ol_before[1:] = ol_any[:-1]
+                use_ao = (mask_AOs & (ao_before > 0)).float().unsqueeze(-1)
+                use_ol = (mask_OLs & (ol_before > 0)).float().unsqueeze(-1)
 
-                mix_losses = []
-                if use_ao_mix.any():
-                    mix_losses.append(
-                        F.binary_cross_entropy_with_logits(q_mix_ao_chosen[use_ao_mix], rwd01[use_ao_mix])
-                    )
-                if use_ol_mix.any():
-                    mix_losses.append(
-                        F.binary_cross_entropy_with_logits(q_mix_ol_chosen[use_ol_mix], rwd01[use_ol_mix])
-                    )
-                mix_loss = torch.stack(mix_losses).mean() if mix_losses else torch.zeros((), device=device)
+                policy_logits = q_self_logits + use_ao * (g_ao * q_teacher_ao) + use_ol * (g_ol * q_teacher_ol)
 
-                # Gate supervision (simulation-only): teach g to track running teacher correctness.
-                # teacher_correct is 1/0 on AO-o/OL-o, and -1 elsewhere.
-                tc = teacher_correct.clamp(0.0, 1.0)
-                ao_sum = (tc * mask_AOo.float()).cumsum(dim=0)
-                ao_cnt = (mask_AOo.float()).cumsum(dim=0)
-                ol_sum = (tc * mask_OLo.float()).cumsum(dim=0)
-                ol_cnt = (mask_OLo.float()).cumsum(dim=0)
+                # critic input: ctx for current condition + feats
+                ctx_left_cur = (
+                    ctx_left_il   * mask_IL.unsqueeze(-1).float()
+                + ctx_left_ao_s * mask_AOs.unsqueeze(-1).float()
+                + ctx_left_ol_s * mask_OLs.unsqueeze(-1).float()
+                )
+                ctx_right_cur = (
+                    ctx_right_il   * mask_IL.unsqueeze(-1).float()
+                + ctx_right_ao_s * mask_AOs.unsqueeze(-1).float()
+                + ctx_right_ol_s * mask_OLs.unsqueeze(-1).float()
+                )
 
-                ao_rel = ao_sum / (ao_cnt + 1e-6)
-                ol_rel = ol_sum / (ol_cnt + 1e-6)
-                ao_rel_prev = torch.zeros_like(ao_rel)
-                ol_rel_prev = torch.zeros_like(ol_rel)
-                ao_rel_prev[1:] = ao_rel[:-1]
-                ol_rel_prev[1:] = ol_rel[:-1]
+                ctx_left_obs = (
+                    ctx_left_ao_o * mask_AOo.unsqueeze(-1).float()+
+                    ctx_left_ol_o * mask_OLo.unsqueeze(-1).float()
+                )
+                ctx_right_obs = (
+                    ctx_right_ao_o * mask_AOo.unsqueeze(-1).float()+
+                    ctx_right_ol_o * mask_OLo.unsqueeze(-1).float()
+                )
+                
+                V = self.v_head(torch.cat([ctx_left_cur, ctx_right_cur, ctx_left_obs, ctx_right_obs, left_feats, right_feats], dim=-1)).squeeze(-1)  # (T,B)
 
-                mask_gate_ao = mask_AOs & (ao_o_before > 0)
-                mask_gate_ol = mask_OLs & (ol_o_before > 0)
-                gate_losses = []
-                if mask_gate_ao.any():
-                    gate_losses.append(F.mse_loss(g_ao.squeeze(-1)[mask_gate_ao], ao_rel_prev[mask_gate_ao]))
-                if mask_gate_ol.any():
-                    gate_losses.append(F.mse_loss(g_ol.squeeze(-1)[mask_gate_ol], ol_rel_prev[mask_gate_ol]))
-                gate_loss = torch.stack(gate_losses).mean() if gate_losses else torch.zeros((), device=device)
+                dist = torch.distributions.Categorical(logits=(policy_logits / tau))
+                logp_new = dist.log_prob(actions)   # (T,B)
+                entropy = dist.entropy()            # (T,B)
 
-                lam_gate = 0.1
-                q_bce = base_loss + mix_loss
+                ratio = torch.exp(logp_new - logp_old)  # (T,B)
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+                pg = -torch.min(surr1, surr2)
 
-                contrast_loss = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
-                bandit_total = q_bce + lam_gate * gate_loss + 0.05 * contrast_loss
+                # mask PPO updates to self-choice trials (where you actually sampled)
+                pg_loss = (pg * mask_self_choice).sum() / (mask_self_choice.sum() + 1e-8)
 
-            bandit_total.backward()
-            bandit_loss_sum += float(q_bce.item())
-            bandit_slices += 1
+                # value loss (simple MSE)
+                v_loss = 0.5 * (ret - V).pow(2).mean()
 
-            # -----------------------------
-            # 4) MOTOR loss (flat over all steps)
-            # -----------------------------
+                ent = (entropy * mask_self_choice).sum() / (mask_self_choice.sum() + 1e-8)
+
+                loss = pg_loss + vf_coef * v_loss - ent_coef * ent
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), 1.0)
+            optim_bandit.step()
+
+            bandit_loss_sum += float(loss.item())
+
+            # motor update (same as update2)
             mini_batch_size = 16384
             total_steps = len(xy_pos_buf)
             for start in range(0, total_steps, mini_batch_size):
                 end = min(start + mini_batch_size, total_steps)
-                xy_slice = xy_pos[start:end]
-                goal_slice = goalvec[start:end]
-                chosen_slice = chosen_bandits_motor[start:end]
+                mu, _ = self.motor_fwd(chosen_bandits_motor[start:end], xy_pos[start:end], goalvec[start:end])
 
-                mu, _log_std = self.motor_fwd(chosen_slice, xy_slice, goal_slice)
-
-                dist = goal_slice.norm(dim=-1, keepdim=True) + 1e-6
-                g_hat = goal_slice / dist
-                speed = (dist / math.sqrt(8.0)).clamp(0.0, 1.0)
+                dist2 = goalvec[start:end].norm(dim=-1, keepdim=True) + 1e-6
+                g_hat = goalvec[start:end] / dist2
+                speed = (dist2 / math.sqrt(8.0)).clamp(0.0, 1.0)
                 target = (g_hat * speed).clamp(-0.999, 0.999)
                 u_target = atanh(target)
 
@@ -575,11 +560,7 @@ class BanditLearner(nn.Module):
                 motor_loss_sum += float(motor_loss.item())
                 motor_slices += 1
 
-            torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), 1.0)
             torch.nn.utils.clip_grad_norm_(list(self.motor_parameters()), 1.0)
-            optim_bandit.step()
             optim_motor.step()
 
-        bandit_loss = bandit_loss_sum / max(1, bandit_slices)
-        motor_loss = motor_loss_sum / max(1, motor_slices)
-        return bandit_loss, motor_loss
+        return bandit_loss_sum / max(1, ppo_epochs), motor_loss_sum / max(1, motor_slices)

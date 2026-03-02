@@ -131,6 +131,11 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     actor_buf = []
     teacher_correct_buf = []
 
+    bandit_action_buf = []
+    bandit_logp_buf   = []
+    bandit_value_buf  = []
+    bandit_policy_mask_buf = []  # 1 for IL/AO-s/OL-s, else 0
+
     # state for the current trial
     curr_trial_condition = None
     left_feats = None
@@ -219,6 +224,42 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         log_l = agent._head(agent.q_base, ctx_l, lf_seq)
         log_r = agent._head(agent.q_base, ctx_r, rf_seq)
         return torch.cat([log_l, log_r], dim=-1)
+    
+    def _value_pred(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
+        ql = agent.q_in(lf).unsqueeze(0)  # (1,1,H)
+        qr = agent.q_in(rf).unsqueeze(0)
+
+        if curr_cond == "IL":
+            ctx_l_s = _ctx_for(ql, {"IL"})
+            ctx_r_s = _ctx_for(qr, {"IL"})
+            ctx_l_o = torch.zeros_like(ctx_l_s)
+            ctx_r_o = torch.zeros_like(ctx_r_s)
+
+        elif curr_cond == "AO-s":
+            ctx_l_s = _ctx_for(ql, {"AO-s"})
+            ctx_r_s = _ctx_for(qr, {"AO-s"})
+            ctx_l_o = _ctx_for(ql, {"AO-o"})
+            ctx_r_o = _ctx_for(qr, {"AO-o"})
+
+        elif curr_cond == "OL-s":
+            ctx_l_s = _ctx_for(ql, {"OL-s"})
+            ctx_r_s = _ctx_for(qr, {"OL-s"})
+            ctx_l_o = _ctx_for(ql, {"OL-o"})
+            ctx_r_o = _ctx_for(qr, {"OL-o"})
+
+        else:
+            # AO-o / OL-o: no policy update, but value can still be trained
+            ctx_l_s = _ctx_for(ql, {curr_cond})
+            ctx_r_s = _ctx_for(qr, {curr_cond})
+            ctx_l_o = torch.zeros_like(ctx_l_s)
+            ctx_r_o = torch.zeros_like(ctx_r_s)
+
+        v_in = torch.cat(
+            [ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o, lf.unsqueeze(0), rf.unsqueeze(0)],
+            dim=-1
+        )  # (1,1,4H+2F)
+        v = agent.v_head(v_in)  # (1,1,1)
+        return v
 
     while not done:
         obs_tensor = (
@@ -243,18 +284,36 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             if curr_trial_condition not in ("AO-o", "OL-o"):
                 logits = _choice_logits(curr_trial_condition, left_feats, right_feats)  # (1,1,2)
 
-                tau = 0.2
-                p_choose = torch.softmax(logits / tau, dim=-1)  # (1,1,2)
-                p_left = p_choose[0, 0, 0]
-                p_right = p_choose[0, 0, 1]
+                # tau = 0.2
+                # p_choose = torch.softmax(logits / tau, dim=-1)  # (1,1,2)
+                # p_left = p_choose[0, 0, 0]
+                # p_right = p_choose[0, 0, 1]
+                # dist = torch.distributions.Categorical(probs=p_choose[0, 0])
+                # a_t = int(dist.sample().item())  # 0=left, 1=right
 
-                dist = torch.distributions.Categorical(probs=p_choose[0, 0])
-                a_t = int(dist.sample().item())  # 0=left, 1=right
+
+                tau = 1.0  # let entropy bonus drive exploration; you can anneal later
+                dist = torch.distributions.Categorical(logits=(logits[0, 0] / tau))
+                a_t = int(dist.sample().item())
+                logp_old = float(dist.log_prob(torch.tensor(a_t, device=device)).item())
+                v_old = float(_value_pred(curr_trial_condition, left_feats, right_feats).item())
+                bandit_action_buf.append(a_t)
+                bandit_logp_buf.append(logp_old)
+                bandit_value_buf.append(v_old)
+                bandit_policy_mask_buf.append(1.0)
+
                 choice_target = F.one_hot(torch.tensor(a_t, device=device), num_classes=2).unsqueeze(0).float()
             else:
                 # Observational trial: env/teacher chooses (revealed at trial end).
                 a_t = 0  # dummy; replaced at trial end
                 choice_target = F.one_hot(torch.tensor(a_t, device=device), num_classes=2).unsqueeze(0).float()
+
+                v_old = float(_value_pred(curr_trial_condition, left_feats, right_feats).item())
+                bandit_action_buf.append(0)     # dummy
+                bandit_logp_buf.append(0.0)     # dummy
+                bandit_value_buf.append(v_old)
+                bandit_policy_mask_buf.append(0.0)
+
 
             meta_ep_len += 1
             ep_start_flag = 0.0
@@ -404,7 +463,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         actor_buf, trial_cond_buf,
         teacher_correct_buf,
         cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
-        high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol
+        high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol,
+        bandit_logp_buf, bandit_value_buf
     )
 
 
@@ -471,40 +531,29 @@ class RolloutWorker:
 # Main
 # -----------------------------
 
-def _call_update2(agent, optim_bandit, optim_motor, batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
+# bandit_train_batch.py
+
+def _call_update2(agent, optim_bandit, optim_motor,
+                 batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
-                 batch_actor, batch_trial_cond, batch_teacher_correct, device):
-    """Call agent.update2 in a backward-compatible way (with or without teacher_correct_buf)."""
-    try:
-        return agent.update2(
-            optim_bandit, optim_motor,
-            batch_xy_pos,
-            batch_goal_vec,
-            batch_chosen_bandits_motor,
-            batch_bandit_obs,
-            batch_chosen_bandits,
-            batch_bandit_rewards,
-            batch_meta_ep_start,
-            batch_actor,
-            batch_trial_cond,
-            batch_teacher_correct,
-            device
-        )
-    except TypeError:
-        # older signature
-        return agent.update2(
-            optim_bandit, optim_motor,
-            batch_xy_pos,
-            batch_goal_vec,
-            batch_chosen_bandits_motor,
-            batch_bandit_obs,
-            batch_chosen_bandits,
-            batch_bandit_rewards,
-            batch_meta_ep_start,
-            batch_actor,
-            batch_trial_cond,
-            device
-        )
+                 batch_actor, batch_trial_cond, batch_teacher_correct,
+                 batch_logp_old, batch_v_old, device):
+    return agent.update2(
+        optim_bandit, optim_motor,
+        batch_xy_pos,
+        batch_goal_vec,
+        batch_chosen_bandits_motor,
+        batch_bandit_obs,
+        batch_chosen_bandits,
+        batch_bandit_rewards,
+        batch_meta_ep_start,
+        batch_actor,
+        batch_trial_cond,
+        batch_teacher_correct,
+        batch_logp_old,
+        batch_v_old,
+        device
+    )
 
 
 def main():
@@ -521,7 +570,7 @@ def main():
     parser.add_argument('--gap-sweep', action='store_true', help='Run gap sweep after training.', default=True)
     parser.add_argument('--p-hi', type=float, default=0.8)
     parser.add_argument('--p-lo-min', type=float, default=0.10)
-    parser.add_argument('--p-lo-max', type=float, default=0.75)
+    parser.add_argument('--p-lo-max', type=float, default=0.6)
     parser.add_argument('--p-lo-steps', type=int, default=14)
     args = parser.parse_args()
 
@@ -590,10 +639,19 @@ def main():
         batch_actor = []
         batch_trial_cond = []
         batch_teacher_correct = []
+        batch_actions = []
+        batch_logp_old = []
+        batch_v_old = []
+        batch_policy_mask = []
+
 
         cum_rewards_list_il = []
         cum_rewards_list_ao = []
         cum_rewards_list_ol = []
+
+        p_hi = args.p_hi
+        p_lo_min = args.p_lo_min
+        p_lo_max = args.p_lo_max
 
         while total_sessions_collected < B:
             remaining = B - total_sessions_collected
@@ -602,8 +660,8 @@ def main():
             probs_list = []
             for _ in range(num_launch):
                 # Train on a mixture of gaps: p_lo ~ U[p_lo_min, p_lo_max]
-                p_lo = float(rng_train.uniform(args.p_lo_min, args.p_lo_max))
-                probs_this_session = sample_probs_this_session(session_K, args.p_hi, p_lo, rng_train)
+                p_lo = float(rng_train.uniform(p_lo_min, p_lo_max))
+                probs_this_session = sample_probs_this_session(session_K, p_hi, p_lo, rng_train)
                 probs_list.append(probs_this_session)
 
             agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
@@ -628,7 +686,7 @@ def main():
                     actor_buf, trial_cond_buf,
                     teacher_correct_buf,
                     cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
-                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol
+                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, logp_old_buf, v_old_buf
                 ) = res
 
                 batch_xy_pos.extend(xy_pos_buf)
@@ -641,6 +699,9 @@ def main():
                 batch_actor.append(torch.as_tensor(np.stack(actor_buf), dtype=torch.long))
                 batch_trial_cond.append(np.stack(trial_cond_buf))
                 batch_teacher_correct.append(torch.as_tensor(np.stack(teacher_correct_buf), dtype=torch.float32))
+                batch_logp_old.append(torch.as_tensor(np.stack(logp_old_buf), dtype=torch.float32))
+                batch_v_old.append(torch.as_tensor(np.stack(v_old_buf), dtype=torch.float32))
+
 
                 cum_rewards_list_il.append(cum_rewards_il)
                 cum_rewards_list_ao.append(cum_rewards_ao)
@@ -662,6 +723,8 @@ def main():
             batch_actor,
             batch_trial_cond,
             batch_teacher_correct,
+            batch_logp_old, 
+            batch_v_old,
             device
         )
 
@@ -723,7 +786,7 @@ def main():
     rng_eval = np.random.default_rng(args.seed + 999)
     agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
 
-    probs_eval = [(0.5, 0.8) if rng_eval.random() < 0.5 else (0.8, 0.5) for _ in range(session_K)]
+    probs_eval = [(0.2, 0.8) if rng_eval.random() < 0.5 else (0.8, 0.2) for _ in range(session_K)]
 
     futures = []
     for i in range(args.eval_sessions):
@@ -746,7 +809,8 @@ def main():
             cum_rew_il, cum_rew_ao, cum_rew_ol,
             high_reward_choices_il,
             high_reward_choices_ao,
-            high_reward_choices_ol
+            high_reward_choices_ol,
+            _, _
         ) = res
 
         eval_il.append(high_reward_choices_il)
@@ -803,6 +867,7 @@ def main():
             cum_ol = 0.0
 
             futures = []
+            print(f"[GapSweep] launching p_lo={p_lo:.2f} ...")
             for i in range(args.eval_sessions):
                 probs_this_session = sample_probs_this_session(session_K, p_hi, float(p_lo), rng)
                 futures.append(
@@ -813,7 +878,7 @@ def main():
                         return_obs=False
                     )
                 )
-                print(f"[GapSweep] launching p_lo={p_lo:.2f} ...")
+                
             results = ray.get(futures)
 
             for res in results:
