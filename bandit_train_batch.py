@@ -896,7 +896,7 @@ def main():
                     cum_rew_il, cum_rew_ao, cum_rew_ol,
                     _,
                     _,
-                    _
+                    _,_,_
                 ) = res
                 cum_il += cum_rew_il
                 cum_ao += cum_rew_ao
