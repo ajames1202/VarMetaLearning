@@ -294,6 +294,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
                 tau = 1.0  # let entropy bonus drive exploration; you can anneal later
                 dist = torch.distributions.Categorical(logits=(logits[0, 0] / tau))
+                p_left = torch.softmax(logits[0, 0], dim=-1)[0]
+                p_right = torch.softmax(logits[0, 0], dim=-1)[1]
                 a_t = int(dist.sample().item())
                 logp_old = float(dist.log_prob(torch.tensor(a_t, device=device)).item())
                 v_old = float(_value_pred(curr_trial_condition, left_feats, right_feats).item())
