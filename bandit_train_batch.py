@@ -418,6 +418,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 ", selected_high_reward =", selected_high_reward,
                 ", p_left =", round(float(p_left), 2),
                 ", p_right =", round(float(p_right), 2),
+                ", v_old =", round(float(v_old), 2),
             )
 
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())

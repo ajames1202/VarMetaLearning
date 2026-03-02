@@ -312,6 +312,38 @@ class BanditLearner(nn.Module):
         if T > 1:
             out[1:] = ctx_q
         return out
+    
+    def gae_sparse(self,rewards, values, mask, gamma, lam):
+        # returns/adv only defined on mask==1 steps; zeros elsewhere
+        T, B = rewards.shape
+        adv = torch.zeros_like(rewards)
+        ret = torch.zeros_like(rewards)
+
+        for b in range(B):
+            idx = torch.nonzero(mask[:, b], as_tuple=False).squeeze(-1)
+            if idx.numel() == 0:
+                continue
+
+            gae = torch.zeros((), device=rewards.device)
+            for j in reversed(range(idx.numel())):
+                t = idx[j].item()
+                if j == idx.numel() - 1:
+                    disc = 0.0
+                    next_v = 0.0
+                    next_gae = 0.0
+                else:
+                    t_next = idx[j + 1].item()
+                    gap = t_next - t
+                    disc = float(gamma ** gap)
+                    next_v = values[t_next, b]
+                    next_gae = gae
+
+                delta = rewards[t, b] + disc * next_v - values[t, b]
+                gae = delta + disc * lam * next_gae
+
+                adv[t, b] = gae
+                ret[t, b] = gae + values[t, b]
+        return adv, ret
 
     # -------------------------
     # Main update
@@ -390,16 +422,25 @@ class BanditLearner(nn.Module):
         rew = (rwd01 * (mask_self_choice & rwd_obs).float())  # (T,B)
 
         # ---------- GAE using v_old from rollout ----------
-        adv = torch.zeros_like(rew)
-        gae = torch.zeros((B,), device=device)
-        next_v = torch.zeros((B,), device=device)
-        for t in reversed(range(T)):
-            delta = rew[t] + gamma * next_v - v_old[t]
-            gae = delta + gamma * gae_lambda * gae
-            adv[t] = gae
-            next_v = v_old[t]
-        ret = adv + v_old
-        # normalize advantages over the (masked) policy steps
+        # adv = torch.zeros_like(rew)
+        # gae = torch.zeros((B,), device=device)
+        # next_v = torch.zeros((B,), device=device)
+        # for t in reversed(range(T)):
+        #     delta = rew[t] + gamma * next_v - v_old[t]
+        #     gae = delta + gamma * gae_lambda * gae
+        #     adv[t] = gae
+        #     next_v = v_old[t]
+        # ret = adv + v_old
+        r_il = rew * mask_IL.float()
+        r_ao = rew * mask_AOs.float()
+        r_ol = rew * mask_OLs.float()
+
+        adv_il, ret_il = self.gae_sparse(r_il, v_old, mask_IL,  gamma, gae_lambda)
+        adv_ao, ret_ao = self.gae_sparse(r_ao, v_old, mask_AOs, gamma, gae_lambda)
+        adv_ol, ret_ol = self.gae_sparse(r_ol, v_old, mask_OLs, gamma, gae_lambda)
+
+        adv = adv_il + adv_ao + adv_ol
+        ret = ret_il + ret_ao + ret_ol        # normalize advantages over the (masked) policy steps
         m = mask_self_choice
         adv_mean = (adv * m).sum() / (m.sum() + 1e-8)
         adv_var = ((adv - adv_mean).pow(2) * m).sum() / (m.sum() + 1e-8)
@@ -529,7 +570,8 @@ class BanditLearner(nn.Module):
                 pg_loss = (pg * mask_self_choice).sum() / (mask_self_choice.sum() + 1e-8)
 
                 # value loss (simple MSE)
-                v_loss = 0.5 * (ret - V).pow(2).mean()
+                m = mask_self_choice.float()
+                v_loss = 0.5 * (((ret - V)**2) * m).sum() / (m.sum() + 1e-8)
 
                 ent = (entropy * mask_self_choice).sum() / (mask_self_choice.sum() + 1e-8)
 

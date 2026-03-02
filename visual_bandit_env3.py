@@ -363,11 +363,11 @@ class TwoChoiceReachingEnv(gym.Env):
                 choices = ["IL", "AO-o", "AO-s", "OL-o", "OL-s"]
                 if(trial_cond_perm.count("IL") == self.session_N):
                     choices.remove("IL")
-                if(trial_cond_perm.count("AO-o") == self.session_N):
+                if(trial_cond_perm.count("AO-o") == self.session_N or trial_cond_perm.count("AO-o") == trial_cond_perm.count("AO-s") + 1):
                     choices.remove("AO-o")
                 if(trial_cond_perm.count("AO-s") == self.session_N or trial_cond_perm.count("AO-o") == trial_cond_perm.count("AO-s")):
                     choices.remove("AO-s")
-                if(trial_cond_perm.count("OL-o") == self.session_N):
+                if(trial_cond_perm.count("OL-o") == self.session_N or trial_cond_perm.count("OL-o") == trial_cond_perm.count("OL-s") + 1):
                     choices.remove("OL-o")
                 if(trial_cond_perm.count("OL-s") == self.session_N or trial_cond_perm.count("OL-o") == trial_cond_perm.count("OL-s")):    
                     choices.remove("OL-s")
