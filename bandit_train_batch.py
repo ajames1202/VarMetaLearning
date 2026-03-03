@@ -677,8 +677,9 @@ def main():
             probs_list = []
             for _ in range(num_launch):
                 # Train on a mixture of gaps: p_lo ~ U[p_lo_min, p_lo_max]
-                p_lo = float(rng_train.uniform(p_lo_min, p_lo_max))
-                probs_this_session = sample_probs_this_session(session_K, p_hi, p_lo, rng_train)
+                # p_lo = float(rng_train.uniform(p_lo_min, p_lo_max))
+                # probs_this_session = sample_probs_this_session(session_K, p_hi, p_lo, rng_train)
+                probs_this_session = [(0.8,0.2) if rng_train.random() < 0.5 else (0.2,0.8) for _ in range(session_K)]
                 probs_list.append(probs_this_session)
 
             agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
