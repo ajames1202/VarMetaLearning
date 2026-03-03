@@ -178,6 +178,12 @@ class BanditLearner(nn.Module):
             nn.Linear(256, 1),
         )
 
+        self.pi_head = nn.Sequential(
+            nn.Linear(4 * rnn_hidden_size + 2 * feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 2),
+        )
+
         # Motor policy
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
@@ -225,6 +231,7 @@ class BanditLearner(nn.Module):
             self.gate_ao,
             self.gate_ol,
             self.v_head,
+            self.pi_head,
         ]
         for m in modules:
             for p in m.parameters():
@@ -525,8 +532,8 @@ class BanditLearner(nn.Module):
                 g_ol = torch.sigmoid(self.gate_ol(torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1))).clamp(0,1)
 
                 # Match rollout's "has_prev_*": any previous AO-s/AO-o or OL-s/OL-o 
-                ao_any = (mask_AOs | mask_AOo).float().cumsum(dim=0)
-                ol_any = (mask_OLs | mask_OLo).float().cumsum(dim=0)
+                ao_any = (mask_AOo).float().cumsum(dim=0)
+                ol_any = (mask_OLo).float().cumsum(dim=0)
                 ao_before = torch.zeros_like(ao_any); ao_before[1:] = ao_any[:-1]
                 ol_before = torch.zeros_like(ol_any); ol_before[1:] = ol_any[:-1]
                 use_ao = (mask_AOs & (ao_before > 0)).float().unsqueeze(-1)

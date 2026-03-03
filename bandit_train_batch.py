@@ -31,6 +31,9 @@ except Exception:
     import var_bandit_learner2 as bl  # type: ignore
 
 from torch.utils.tensorboard import SummaryWriter
+import os
+from datetime import datetime
+
 
 
 # -----------------------------
@@ -201,7 +204,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             g = torch.sigmoid(agent.gate_ao(g_in)).clamp(0.0, 1.0)         # (1,1,1)
             delta_f = delta * g
 
-            has_prev_ao = any(c in ("AO-s", "AO-o") for c in cond_tokens)
+            has_prev_ao = any(c in ("AO-o") for c in cond_tokens)
             logit_final = base + delta_f if has_prev_ao else base
 
             return logit_final, delta, g
@@ -223,7 +226,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             g = torch.sigmoid(agent.gate_ol(g_in)).clamp(0.0, 1.0)         # (1,1,1)
             delta = delta * g
 
-            has_prev_ol = any(c in ("OL-s", "OL-o") for c in cond_tokens)
+            has_prev_ol = any(c in ("OL-o") for c in cond_tokens)
             logit_final = base + delta if has_prev_ol else base
             return logit_final, delta, g
 
@@ -786,9 +789,9 @@ def main():
         mean_cum_rew_ao = float(np.mean(cum_rewards_list_ao))
         mean_cum_rew_ol = float(np.mean(cum_rewards_list_ol))
 
-        mean_hi_choices_il = np.mean(cum_high_reward_choices_il)
-        mean_hi_choices_ao = np.mean(cum_high_reward_choices_ao)
-        mean_hi_choices_ol = np.mean(cum_high_reward_choices_ol)
+        mean_hi_choices_il = np.mean([arr.sum() for arr in cum_high_reward_choices_il])
+        mean_hi_choices_ao = np.mean([arr.sum() for arr in cum_high_reward_choices_ao])
+        mean_hi_choices_ol = np.mean([arr.sum() for arr in cum_high_reward_choices_ol])
 
         #train_score = mean_cum_rew_il + mean_cum_rew_ao + mean_cum_rew_ol
         train_score = mean_hi_choices_il + mean_hi_choices_ao + mean_hi_choices_ol
@@ -892,9 +895,14 @@ def main():
 
     print(f"Eval results over {args.eval_sessions} sessions:")
     print(f" Mean cum reward IL: {mean_cum_rew_il:.1f}, AO: {mean_cum_rew_ao:.1f}, OL: {mean_cum_rew_ol:.1f}")
+    print(f" Mean high-reward choices per session IL: {mean_il.sum():.1f}, AO: {mean_ao.sum():.1f}, OL: {mean_ol.sum():.1f}")
 
     plot_dir = os.path.join(args.save_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
+
+    run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+
 
     fig, ax = plt.subplots(figsize=(6, 4))
     trials = np.arange(session_N)
@@ -907,7 +915,7 @@ def main():
     ax.legend()
     ax.grid(True)
 
-    plot_path = os.path.join(plot_dir, "PerTrialReward.png")
+    plot_path = os.path.join(run_dir, "PerTrialReward.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     writer.add_figure("Eval/PerTrialReward", fig)
     plt.close(fig)
@@ -975,7 +983,7 @@ def main():
 
         # Save CSV
         # Save CSV
-        csv_path = os.path.join(plot_dir, "GapSweep.csv")
+        csv_path = os.path.join(run_dir, "GapSweep.csv")
         with open(csv_path, "w", encoding="utf-8") as f:
             f.write("p_lo,gap,pct_hi_il,pct_hi_ao,pct_hi_ol\n")
             for row in sweep:
@@ -995,7 +1003,7 @@ def main():
         ax.set_title("Gap sweep (high-arm accuracy)")
         ax.grid(True)
         ax.legend()
-        fig.savefig(os.path.join(plot_dir, "GapSweep_HighArmPct.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(run_dir, "GapSweep_HighArmPct.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
         # optional: separation plot
@@ -1008,7 +1016,7 @@ def main():
         ax.set_title("Separation vs difficulty")
         ax.grid(True)
         ax.legend()
-        fig.savefig(os.path.join(plot_dir, "GapSweep_DeltasPct.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(run_dir, "GapSweep_DeltasPct.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     # Cleanup
