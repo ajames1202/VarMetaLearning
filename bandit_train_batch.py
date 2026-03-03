@@ -112,6 +112,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     high_reward_choice_ao = np.zeros(session_N, dtype=np.int32)
     high_reward_choice_ol = np.zeros(session_N, dtype=np.int32)
 
+    # scalar accuracy counters for self-choice trials
+    hi_cnt_il = hi_cnt_ao = hi_cnt_ol = 0
+    tot_il    = tot_ao    = tot_ol    = 0
+
     meta_ep_len = 0
     ep_start_flag = 1.0
 
@@ -395,6 +399,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             # perf stats
             pair_index_ep = info.get("prev_pair_index_in_session", -1)
             selected_high_reward = info.get("selected_high_reward_this_trial", -1)
+            sh = int(selected_high_reward) if selected_high_reward is not None else -1
             flipped = info.get("side_is_flipped", False)
 
             if curr_trial_condition == "IL":
@@ -404,12 +409,27 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             elif curr_trial_condition == "OL-s":
                 pair_index_counter_ol[pair_index_ep] += 1
 
-            if (curr_trial_condition == "IL") and selected_high_reward:
+            if curr_trial_condition == "IL":
+                tot_il += 1
+                if sh == 1:
+                    hi_cnt_il += 1
+            elif curr_trial_condition == "AO-s":
+                tot_ao += 1
+                if sh == 1:
+                    hi_cnt_ao += 1
+            elif curr_trial_condition == "OL-s":
+                tot_ol += 1
+                if sh == 1:
+                    hi_cnt_ol += 1
+
+            # legacy per-index counters (kept for your per-trial plot)
+            if (curr_trial_condition == "IL") and (sh == 1):
                 high_reward_choices_il[pair_index_counter_il[pair_index_ep]] += 1
-            elif (curr_trial_condition == "AO-s") and selected_high_reward:
+            elif (curr_trial_condition == "AO-s") and (sh == 1):
                 high_reward_choice_ao[pair_index_counter_ao[pair_index_ep]] += 1
-            elif (curr_trial_condition == "OL-s") and selected_high_reward:
-                high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1
+            elif (curr_trial_condition == "OL-s") and (sh == 1):
+                high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1        
+
 
             pair_probs = env.unwrapped.pair_probs
             log(
@@ -458,9 +478,14 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     cum_rewards_ao = float(bandit_rewards_arr[trial_cond_arr == "AO-s"].sum())
     cum_rewards_ol = float(bandit_rewards_arr[trial_cond_arr == "OL-s"].sum())
 
+    pct_hi_il = 100.0 * float(hi_cnt_il) / float(max(tot_il, 1))
+    pct_hi_ao = 100.0 * float(hi_cnt_ao) / float(max(tot_ao, 1))
+    pct_hi_ol = 100.0 * float(hi_cnt_ol) / float(max(tot_ol, 1))
+
     high_reward_choices_il = np.array(high_reward_choices_il, dtype=np.int32)
     high_reward_choices_ao = np.array(high_reward_choice_ao, dtype=np.int32)
     high_reward_choices_ol = np.array(high_reward_choice_ol, dtype=np.int32)
+
 
     if return_obs:
         obs_bandit = {
@@ -477,6 +502,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         actor_buf, trial_cond_buf,
         teacher_correct_buf,
         cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
+        pct_hi_il, pct_hi_ao, pct_hi_ol,
         high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol,
         bandit_logp_buf, bandit_value_buf
     )
@@ -666,6 +692,10 @@ def main():
         cum_rewards_list_ao = []
         cum_rewards_list_ol = []
 
+        cum_high_reward_choices_il = []
+        cum_high_reward_choices_ao = [] 
+        cum_high_reward_choices_ol = []
+
         p_hi = args.p_hi
         p_lo_min = args.p_lo_min
         p_lo_max = args.p_lo_max
@@ -704,6 +734,7 @@ def main():
                     actor_buf, trial_cond_buf,
                     teacher_correct_buf,
                     cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
+                    pct_hi_il, pct_hi_ao, pct_hi_ol,
                     high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, logp_old_buf, v_old_buf
                 ) = res
 
@@ -724,6 +755,11 @@ def main():
                 cum_rewards_list_il.append(cum_rewards_il)
                 cum_rewards_list_ao.append(cum_rewards_ao)
                 cum_rewards_list_ol.append(cum_rewards_ol)
+
+                cum_high_reward_choices_il.append(high_reward_choices_il)
+                cum_high_reward_choices_ao.append(high_reward_choices_ao)
+                cum_high_reward_choices_ol.append(high_reward_choices_ol)
+
 
                 total_sessions_collected += 1
                 if total_sessions_collected >= B:
@@ -750,11 +786,17 @@ def main():
         mean_cum_rew_ao = float(np.mean(cum_rewards_list_ao))
         mean_cum_rew_ol = float(np.mean(cum_rewards_list_ol))
 
-        train_score = mean_cum_rew_il + mean_cum_rew_ao + mean_cum_rew_ol
+        mean_hi_choices_il = np.mean(cum_high_reward_choices_il)
+        mean_hi_choices_ao = np.mean(cum_high_reward_choices_ao)
+        mean_hi_choices_ol = np.mean(cum_high_reward_choices_ol)
+
+        #train_score = mean_cum_rew_il + mean_cum_rew_ao + mean_cum_rew_ol
+        train_score = mean_hi_choices_il + mean_hi_choices_ao + mean_hi_choices_ol
         ema = train_score if ema is None else (ema_beta * ema + (1 - ema_beta) * train_score)
 
         if update_idx % 10 == 0:
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
+                  f"mean_hi_choices_il={mean_hi_choices_il:.1f} mean_hi_choices_ao={mean_hi_choices_ao:.1f} mean_hi_choices_ol={mean_hi_choices_ol:.1f} "
                   f"mean_cum_rew_il={mean_cum_rew_il:.1f} mean_cum_rew_ao={mean_cum_rew_ao:.1f} mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
 
         # Early stopping (after warmup)
@@ -825,6 +867,7 @@ def main():
             _, _,
             _,  # teacher_correct_buf
             cum_rew_il, cum_rew_ao, cum_rew_ol,
+            pct_hi_il, pct_hi_ao, pct_hi_ol,
             high_reward_choices_il,
             high_reward_choices_ao,
             high_reward_choices_ol,
@@ -880,9 +923,10 @@ def main():
         sweep = []
 
         for p_lo in p_lo_grid:
-            cum_il = 0.0
-            cum_ao = 0.0
-            cum_ol = 0.0
+            # mean high-arm pick rate (%), averaged over eval sessions
+            pct_il = 0.0
+            pct_ao = 0.0
+            pct_ol = 0.0
 
             futures = []
             print(f"[GapSweep] launching p_lo={p_lo:.2f} ...")
@@ -896,7 +940,7 @@ def main():
                         return_obs=False
                     )
                 )
-                
+
             results = ray.get(futures)
 
             for res in results:
@@ -905,63 +949,66 @@ def main():
                     _, _, _, _,
                     _, _,
                     _,  # teacher_correct_buf
-                    cum_rew_il, cum_rew_ao, cum_rew_ol,
-                    _,
-                    _,
-                    _,_,_
+                    _, _, _,              # cum_rew_il, cum_rew_ao, cum_rew_ol (unused)
+                    pct_hi_il, pct_hi_ao, pct_hi_ol,
+                    _, _,                 # high_reward_choices_* (unused here)
+                    _, _, _
                 ) = res
-                cum_il += cum_rew_il
-                cum_ao += cum_rew_ao
-                cum_ol += cum_rew_ol
 
-            cum_il /= args.eval_sessions
-            cum_ao /= args.eval_sessions
-            cum_ol /= args.eval_sessions
+                pct_il += float(pct_hi_il)
+                pct_ao += float(pct_hi_ao)
+                pct_ol += float(pct_hi_ol)
+
+            pct_il /= args.eval_sessions
+            pct_ao /= args.eval_sessions
+            pct_ol /= args.eval_sessions
 
             sweep.append({
                 "p_lo": float(p_lo),
                 "gap": float(p_hi - p_lo),
-                "cum_il": float(cum_il),
-                "cum_ao": float(cum_ao),
-                "cum_ol": float(cum_ol),
+                "pct_hi_il": float(pct_il),
+                "pct_hi_ao": float(pct_ao),
+                "pct_hi_ol": float(pct_ol),
             })
 
-            print(f"[GapSweep] p_lo={p_lo:.2f} gap={p_hi-p_lo:.2f} | IL={cum_il:.2f} AO={cum_ao:.2f} OL={cum_ol:.2f}")
+            print(f"[GapSweep] p_lo={p_lo:.2f} gap={p_hi-p_lo:.2f} | IL={pct_il:.1f}% AO={pct_ao:.1f}% OL={pct_ol:.1f}%")
 
+        # Save CSV
         # Save CSV
         csv_path = os.path.join(plot_dir, "GapSweep.csv")
         with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("p_lo,gap,cum_il,cum_ao,cum_ol\n")
+            f.write("p_lo,gap,pct_hi_il,pct_hi_ao,pct_hi_ol\n")
             for row in sweep:
-                f.write(f"{row['p_lo']:.4f},{row['gap']:.4f},{row['cum_il']:.4f},{row['cum_ao']:.4f},{row['cum_ol']:.4f}\n")
+                f.write(f"{row['p_lo']:.4f},{row['gap']:.4f},{row['pct_hi_il']:.4f},{row['pct_hi_ao']:.4f},{row['pct_hi_ol']:.4f}\n")
 
-        gaps = np.array([d["gap"] for d in sweep])
-        cum_il = np.array([d["cum_il"] for d in sweep])
-        cum_ao = np.array([d["cum_ao"] for d in sweep])
-        cum_ol = np.array([d["cum_ol"] for d in sweep])
+        gaps   = np.array([d["gap"] for d in sweep])
+        pct_il = np.array([d["pct_hi_il"] for d in sweep])
+        pct_ao = np.array([d["pct_hi_ao"] for d in sweep])
+        pct_ol = np.array([d["pct_hi_ol"] for d in sweep])
 
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(gaps, cum_il, label="IL")
-        ax.plot(gaps, cum_ao, label="AO")
-        ax.plot(gaps, cum_ol, label="OL")
+        ax.plot(gaps, pct_il, label="IL")
+        ax.plot(gaps, pct_ao, label="AO")
+        ax.plot(gaps, pct_ol, label="OL")
         ax.set_xlabel("Gap (p_hi - p_lo)")
-        ax.set_ylabel("Mean cumulative reward")
-        ax.set_title("Gap sweep (difficulty)")
+        ax.set_ylabel("High-arm pick rate (%)")
+        ax.set_title("Gap sweep (high-arm accuracy)")
         ax.grid(True)
         ax.legend()
-        fig.savefig(os.path.join(plot_dir, "GapSweep_CumReward.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(plot_dir, "GapSweep_HighArmPct.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
+        # optional: separation plot
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(gaps, cum_ol - cum_ao, label="OL - AO")
-        ax.plot(gaps, cum_ao - cum_il, label="AO - IL")
+        ax.plot(gaps, pct_ol - pct_ao, label="OL - AO")
+        ax.plot(gaps, pct_ao - pct_il, label="AO - IL")
         ax.axhline(0, linewidth=1)
         ax.set_xlabel("Gap (p_hi - p_lo)")
-        ax.set_ylabel("Δ cumulative reward")
+        ax.set_ylabel("Δ high-arm pick rate (%)")
         ax.set_title("Separation vs difficulty")
         ax.grid(True)
         ax.legend()
-        fig.savefig(os.path.join(plot_dir, "GapSweep_Deltas.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(plot_dir, "GapSweep_DeltasPct.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     # Cleanup
