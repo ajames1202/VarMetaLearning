@@ -146,6 +146,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     p_left = torch.tensor(0.5)
     p_right = torch.tensor(0.5)
 
+    delta_val = np.array([0.0,0.0])
+    g_val = 0.0
+
     def _ctx_for(q_tok: torch.Tensor, keep_conds: set) -> torch.Tensor:
         """Return ctx for a single query token, attending only to past trials in keep_conds.
 
@@ -174,7 +177,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             ctx_r = _ctx_for(qr, {"IL"})
             log_l = agent._head(agent.q_base, ctx_l, lf_seq)
             log_r = agent._head(agent.q_base, ctx_r, rf_seq)
-            return torch.cat([log_l, log_r], dim=-1)
+            return torch.cat([log_l, log_r], dim=-1), None, None
 
         if curr_cond == "AO-s":
             ctx_l_s = _ctx_for(ql, {"AO-s"})
@@ -192,11 +195,12 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
             g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
             g = torch.sigmoid(agent.gate_ao(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta = delta * g
+            delta_f = delta * g
 
             has_prev_ao = any(c in ("AO-s", "AO-o") for c in cond_tokens)
-            return base + delta if has_prev_ao else base
+            logit_final = base + delta_f if has_prev_ao else base
 
+            return logit_final, delta, g
         if curr_cond == "OL-s":
             ctx_l_s = _ctx_for(ql, {"OL-s"})
             ctx_r_s = _ctx_for(qr, {"OL-s"})
@@ -216,7 +220,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             delta = delta * g
 
             has_prev_ol = any(c in ("OL-s", "OL-o") for c in cond_tokens)
-            return base + delta if has_prev_ol else base
+            logit_final = base + delta if has_prev_ol else base
+            return logit_final, delta, g
 
         # Fallback: treat unknown as IL
         ctx_l = _ctx_for(ql, {"IL"})
@@ -282,8 +287,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
             # Self-choice trials
             if curr_trial_condition not in ("AO-o", "OL-o"):
-                logits = _choice_logits(curr_trial_condition, left_feats, right_feats)  # (1,1,2)
-
+                logits, delta, g = _choice_logits(curr_trial_condition, left_feats, right_feats)  # (1,1,2)
+                delta_val = np.array(delta[0,0].cpu().numpy()) if delta is not None else np.array([-1,-1])
+                g_val = g[0,0].item() if g is not None else -1
+                # print("delta.shape = ", delta.shape, ", g.shape = ", g.shape, g_val, delta_val)
                 # tau = 0.2
                 # p_choose = torch.softmax(logits / tau, dim=-1)  # (1,1,2)
                 # p_left = p_choose[0, 0, 0]
@@ -404,6 +411,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             elif (curr_trial_condition == "OL-s") and selected_high_reward:
                 high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1
 
+            pair_probs = env.unwrapped.pair_probs
             log(
                 "Ep:", info.get("trial_index"),
                 ", curr_idx =", pair_index_ep,
@@ -419,6 +427,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 ", p_left =", round(float(p_left), 2),
                 ", p_right =", round(float(p_right), 2),
                 ", v_old =", round(float(v_old), 2),
+                ", delta = ", np.round(delta_val, 2),
+                ", g =", np.round(float(g_val), 2),
+                ", pair_probs =", [(round(pl, 2), round(pr, 2)) for pl, pr in pair_probs]
             )
 
             chosen_bandits_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
