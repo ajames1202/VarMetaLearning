@@ -385,6 +385,10 @@ class BanditLearner(nn.Module):
         max_grad_norm: float = 1.0,
         motor_epochs: int = 1,
         motor_minibatch_size: int = 16384,
+        # Aux losses (supervised) to make observations matter:
+        aux_mb_size: int = 256,
+        aux_ao_coef: float = 0.2,   # AO-o: imitate teacher action (CE)
+        aux_ol_coef: float = 0.5,   # OL-o: predict teacher reward on chosen arm (BCE)
     ):
         """
         PPO update with:
@@ -464,6 +468,9 @@ class BanditLearner(nn.Module):
         idx_tb = torch.nonzero(mask_self_choice, as_tuple=False)  # (N,2)
         N = int(idx_tb.shape[0])
 
+        # number of (t,b) steps where observations were shown (AO-o/OL-o)
+        Nobs = int((mask_AOo | mask_OLo).sum().item())
+
         if N == 0:
             # should not happen, but stay safe
             return 0.0, 0.0
@@ -491,7 +498,9 @@ class BanditLearner(nn.Module):
             if T < 2:
                 policy_logits = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
                 V = torch.zeros((T, B), device=device, dtype=left_feats.dtype)
-                return policy_logits, V
+                q_teacher_ao = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
+                q_teacher_ol = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
+                return policy_logits, V, q_teacher_ao, q_teacher_ol
 
             q_left_q = q_left_all[1:]
             q_right_q = q_right_all[1:]
@@ -585,7 +594,7 @@ class BanditLearner(nn.Module):
                 torch.cat([ctx_left_cur, ctx_right_cur, ctx_left_obs, ctx_right_obs, left_feats, right_feats], dim=-1)
             ).squeeze(-1)  # (T,B)
 
-            return policy_logits, V
+            return policy_logits, V, q_teacher_ao, q_teacher_ol
 
         # ---------- PPO bandit update (epochs × minibatches) ----------
         total_loss = 0.0
@@ -595,6 +604,12 @@ class BanditLearner(nn.Module):
             perm = torch.randperm(N, device=device)
             idx_shuf = idx_tb[perm]
 
+            # Aux losses are computed over *all* observation steps (AO-o / OL-o).
+            # We add them to every PPO minibatch loss, but scale by 1/num_minibatches
+            # so the total aux weight per PPO epoch stays roughly constant.
+            num_minibatches = max(1, int(math.ceil(N / float(ppo_minibatch_size))))
+            aux_scale = 1.0 / float(num_minibatches)
+
             for start in range(0, N, int(ppo_minibatch_size)):
                 mb = idx_shuf[start:start + int(ppo_minibatch_size)]
                 t_idx = mb[:, 0]
@@ -602,7 +617,7 @@ class BanditLearner(nn.Module):
 
                 optim_bandit.zero_grad(set_to_none=True)
 
-                policy_logits, V = forward_policy_value()
+                policy_logits, V, q_teacher_ao, q_teacher_ol = forward_policy_value()
                 dist = torch.distributions.Categorical(logits=(policy_logits / tau))
                 logp_new = dist.log_prob(actions)   # (T,B)
                 entropy = dist.entropy()            # (T,B)
@@ -623,6 +638,34 @@ class BanditLearner(nn.Module):
                 ent_loss = ent_mb.mean()
 
                 loss = pg_loss + vf_coef * v_loss - ent_coef * ent_loss
+
+                # ----- auxiliary losses on observation trials -----
+                # AO-o: imitate teacher action using q_teacher_ao logits (cross-entropy)
+                # OL-o: predict observed teacher reward on chosen arm using q_teacher_ol (BCE-with-logits)
+                aux_ao = torch.zeros((), device=device)
+                aux_ol = torch.zeros((), device=device)
+
+                if (Nobs > 0) and ((aux_ao_coef != 0.0) or (aux_ol_coef != 0.0)):
+                    # AO-o: imitate teacher action (over *all* AO-o steps)
+                    if (aux_ao_coef != 0.0) and mask_AOo.any():
+                        logits_ao = q_teacher_ao[mask_AOo]      # (N_AOo,2)
+                        targ_ao = actions[mask_AOo].long()      # (N_AOo,)
+                        aux_ao = F.cross_entropy(logits_ao, targ_ao)
+
+                    # OL-o: predict observed teacher reward on chosen arm (over *all* OL-o steps)
+                    ol_mask = (mask_OLo & rwd_obs)
+                    if (aux_ol_coef != 0.0) and ol_mask.any():
+                        logits_ol = q_teacher_ol[ol_mask]       # (N_OLo,2)
+                        targ_act = actions[ol_mask].long()      # (N_OLo,)
+                        chosen_logit = logits_ol.gather(-1, targ_act.unsqueeze(-1)).squeeze(-1)
+                        aux_ol = F.binary_cross_entropy_with_logits(
+                            chosen_logit,
+                            rwd01[ol_mask],
+                        )
+
+                # scale aux so its total weight per PPO epoch doesn't grow with #minibatches
+                loss = loss + aux_scale * (aux_ao_coef * aux_ao + aux_ol_coef * aux_ol)
+
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), max_grad_norm)

@@ -25,10 +25,7 @@ import ray
 import visual_bandit_env3 as vbe
 
 # Prefer updated learner if present; fall back to original.
-try:
-    import var_bandit_learner2_updated as bl  # type: ignore
-except Exception:
-    import var_bandit_learner2 as bl  # type: ignore
+import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
@@ -637,6 +634,7 @@ class RolloutWorker:
                     except Exception:
                         pass
 
+        # print(f"Worker {self.worker_id} running session with probs {probs_this_session} and teacher_cfg {teacher_cfg}")                                
         with torch.no_grad():
             return meta_ep_rollout(
                 self.env, agent, self.device,
@@ -657,7 +655,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
                  batch_actor, batch_trial_cond, batch_teacher_correct,
-                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256):
+                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -675,6 +673,9 @@ def _call_update2(agent, optim_bandit, optim_motor,
         device,
         ppo_epochs=ppo_epochs,
         ppo_minibatch_size=ppo_minibatch_size,
+        aux_mb_size=aux_mb_size,
+        aux_ao_coef=aux_ao_coef,
+        aux_ol_coef=aux_ol_coef,
     )
 
 
@@ -683,12 +684,22 @@ def main():
     parser.add_argument('--save-dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--episodes-per-update', type=int, default=8)  # B
+    # If you want *balanced* training over the full 5×4 grid each update:
+    #   episodes_per_update = grid_repeats * 20
+    parser.add_argument('--grid-repeats', type=int, default=1,
+                        help='K repeats of the full 20-cell (p_lo × teacher_mode) grid per update. B = K*20')
+    parser.add_argument('--episodes-per-update', type=int, default=20,
+                        help='Rollout sessions per update (B). If --grid-repeats is set, B will be overridden to K*20.')
     parser.add_argument('--num-updates', type=int, default=1000)
 
     # PPO inner-loop
     parser.add_argument('--ppo-epochs', type=int, default=4)
     parser.add_argument('--ppo-minibatch-size', type=int, default=256)
+
+    # Aux losses (supervised) for observation trials
+    parser.add_argument('--aux-mb-size', type=int, default=256)
+    parser.add_argument('--aux-ao-coef', type=float, default=0.2, help='AO-o teacher action imitation weight')
+    parser.add_argument('--aux-ol-coef', type=float, default=0.5, help='OL-o teacher reward prediction weight')
 
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
@@ -751,16 +762,41 @@ def main():
         RolloutWorker.remote(session_K, session_N, seed=args.seed + 1000 * i, worker_id=i)
         for i in range(args.num_workers)
     ]
-
     num_updates = args.num_updates
-    B = args.episodes_per_update
+
+    # Balanced grid training: always use B = K*20 sessions per update.
+    # (Keeps coverage of all p_lo × teacher_mode combinations each update.)
+    if args.grid_repeats is not None:
+        if args.grid_repeats < 1:
+            raise ValueError('--grid-repeats must be >= 1')
+        B = int(args.grid_repeats) * 20
+        if args.episodes_per_update is not None and int(args.episodes_per_update) != B:
+            print(f'[info] Overriding --episodes-per-update={args.episodes_per_update} -> {B} because --grid-repeats={args.grid_repeats}')
+    else:
+        B = int(args.episodes_per_update)
+        if B % 20 != 0:
+            raise ValueError('episodes-per-update must be a multiple of 20 (5 p_lo × 4 teacher modes).')
+
     W = args.num_workers
 
     # training mixture RNG
     rng_train = np.random.default_rng(args.seed + 123)
 
+    # -----------------------------
+    # Balanced training grid (20 cells)
+    # -----------------------------
+    train_cells = [(float(p_lo), mode_name, cfg)
+                   for p_lo in P_LO_GRID_DEFAULT
+                   for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
+    assert len(train_cells) == 20, f'Expected 20 grid cells, got {len(train_cells)}'
+
+
     for update_idx in range(num_updates):
         total_sessions_collected = 0
+
+        # Build a balanced list of grid cells for this update: K repeats of all 20 cells, then shuffle.
+        cells_update = train_cells * int(args.grid_repeats)
+        rng_train.shuffle(cells_update)
 
         batch_xy_pos = []
         batch_goal_vec = []
@@ -793,25 +829,30 @@ def main():
         while total_sessions_collected < B:
             remaining = B - total_sessions_collected
             num_launch = min(W, remaining)
-
+            # Take the next num_launch grid cells for this update (balanced coverage)
+            slice_cells = cells_update[total_sessions_collected: total_sessions_collected + num_launch]
             probs_list = []
-            for _ in range(num_launch):
-                # Train on a mixture of gaps: p_lo ~ U[p_lo_min, p_lo_max]
-                # p_lo = float(rng_train.uniform(p_lo_min, p_lo_max))
-                # probs_this_session = sample_probs_this_session(session_K, p_hi, p_lo, rng_train)
-                probs_this_session = [(0.8,0.2) if rng_train.random() < 0.5 else (0.2,0.8) for _ in range(session_K)]
+            teacher_cfg_list = []
+            # (Optional debug) keep p_lo/mode for logging if you want
+            # cell_meta = []
+            for (p_lo, mode_name, cfg) in slice_cells:
+                probs_this_session = sample_probs_this_session(session_K, p_hi=float(args.p_hi), p_lo=float(p_lo), rng=rng_train)
                 probs_list.append(probs_this_session)
+                teacher_cfg_list.append(cfg)
+                # cell_meta.append((p_lo, mode_name))
 
             agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
 
             rollout_futures = []
             for w_id in range(num_launch):
                 print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx % 10 == 0)
+                # print(f'w_id={w_id} probs={probs_list[w_id]} teacher_cfg={teacher_cfg_list[w_id]}')
                 rollout_futures.append(
                     workers[w_id].run_session.remote(
                         agent_state_cpu,
                         probs_list[w_id],
-                        print_this_session=print_flag
+                        print_this_session=print_flag,
+                        teacher_cfg=teacher_cfg_list[w_id]
                     )
                 )
 
@@ -842,9 +883,9 @@ def main():
                 batch_v_old.append(torch.as_tensor(np.stack(v_old_buf), dtype=torch.float32))
 
 
-                cum_rewards_list_il.append(cum_rewards_il)
-                cum_rewards_list_ao.append(cum_rewards_ao)
-                cum_rewards_list_ol.append(cum_rewards_ol)
+                cum_rewards_list_il.append(pct_hi_il)
+                cum_rewards_list_ao.append(pct_hi_ao)
+                cum_rewards_list_ol.append(pct_hi_ol)
 
                 cum_high_reward_choices_il.append(high_reward_choices_il)
                 cum_high_reward_choices_ao.append(high_reward_choices_ao)
@@ -874,12 +915,12 @@ def main():
             ppo_minibatch_size=args.ppo_minibatch_size,
         )
 
-        mean_cum_rew_il = float(np.mean(np.sum(cum_rewards_list_il)))
-        mean_cum_rew_ao = float(np.mean(np.sum(cum_rewards_list_ao)))
-        mean_cum_rew_ol = float(np.mean(np.sum(cum_rewards_list_ol)))
+        mean_cum_rew_il = float(np.mean(cum_rewards_list_il))
+        mean_cum_rew_ao = float(np.mean(cum_rewards_list_ao))
+        mean_cum_rew_ol = float(np.mean(cum_rewards_list_ol))
 
-        print("cum_high_reward_choices_il.shape = ", np.array(cum_high_reward_choices_il).shape)
-        print(cum_high_reward_choices_il)
+        # print("cum_high_reward_choices_il.shape = ", np.array(cum_high_reward_choices_il).shape)
+        # print(cum_high_reward_choices_il)
 
 
         mean_hi_choices_il = np.mean([arr.sum() for arr in cum_high_reward_choices_il])
