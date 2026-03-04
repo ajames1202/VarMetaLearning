@@ -169,7 +169,13 @@ class TwoChoiceReachingEnv(gym.Env):
         # Rendering
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
-        shuffle: bool = True
+        shuffle: bool = True,
+        expert_teacher: bool = False,
+        expert_eps: float = 0.1,
+        unrealiable_teacher: bool = False,
+        alpha: Optional[List] = None,
+        tau: Optional[List] = None
+
     ):
         super().__init__()
 
@@ -216,6 +222,16 @@ class TwoChoiceReachingEnv(gym.Env):
 
         self.shuffle = shuffle
 
+        self.expert_teacher = expert_teacher
+        self.eps = expert_eps  # for epsilon-greedy expert behavior in obs trials
+
+
+        self.unrealiable_teacher = unrealiable_teacher
+
+        assert not(unrealiable_teacher and expert_teacher), "unreliable_teacher and expert_teacher cannot both be True (contradictory modes)"
+
+        self.alpha = alpha
+        self.tau = tau 
         self._build_static_canvas()
 
     # ---------- helpers ----------
@@ -408,9 +424,9 @@ class TwoChoiceReachingEnv(gym.Env):
         self.prev_cursor = self.cursor.copy()
 
         self.Q = np.zeros((3,2))  # Q-values for each condition and each side
-        self.alpha = 0.2886           # learning rate
-        self.tau = 0.3302              # softmax temperature
-
+        # self.alpha = 0.2886           # learning rate
+        # self.tau = 0.3302              # softmax temperature
+        
 
         # First frame
         frame = self._render()
@@ -444,10 +460,13 @@ class TwoChoiceReachingEnv(gym.Env):
     def step(self, action = None):
         # Action: (vx, vy) in [-1,1]
         a = np.array([0.0, 0.0], dtype=np.float32)
-        if self.obs_trial:
+
+        if self.obs_trial and not self.expert_teacher and not self.unrealiable_teacher:
+            # print("self.alpha:", self.alpha)
+            # print("self.tau:", self.tau[self.K])
             q_left = self.Q[self.K,self.curr_labels[0]]
             q_right = self.Q[self.K,self.curr_labels[1]]
-            prob_right = np.exp(q_right/self.tau) / (np.exp(q_left/self.tau) + np.exp(q_right/self.tau))
+            prob_right = np.exp(q_right/self.tau[self.K]) / (np.exp(q_left/self.tau[self.K]) + np.exp(q_right/self.tau[self.K]))
             chosen_side = None
             if np.random.rand() < prob_right:
                 chosen_side = "right"
@@ -462,6 +481,26 @@ class TwoChoiceReachingEnv(gym.Env):
             # print("Q-values:", self.Q)
 
             if chosen_side == "left":
+                self.cursor = left_c
+            else:
+                self.cursor = right_c
+        elif self.obs_trial and self.expert_teacher:
+            high_side = "L" if self.curr_probs[0] >= self.curr_probs[1] else "R"
+            chosen_side = high_side if np.random.rand() < self.eps else ("R" if high_side == "L" else "L")
+            left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
+            right_c = np.array([self.right_rect.centerx, self.right_rect.centery], np.float32)
+
+            if chosen_side in ("L","left"):
+                self.cursor = left_c
+            else:
+                self.cursor = right_c
+
+        elif self.obs_trial and self.unrealiable_teacher:
+            chosen_side = "L" if np.random.rand() < 0.5 else "R"  # random choice, ignoring probabilities    
+            left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
+            right_c = np.array([self.right_rect.centerx, self.right_rect.centery], np.float32)
+
+            if chosen_side in ("L","left"):
                 self.cursor = left_c
             else:
                 self.cursor = right_c
@@ -515,8 +554,8 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.high_reward_choice_count_on_left += (1 if chose_side == 0 else 0)
                 self.high_reward_choice_count_on_right += (1 if chose_side == 1 else 0)
             trial_ended = True
-            if self.obs_trial:
-                self.Q[self.K,chose_side] += self.alpha * (reward - self.Q[self.K,chose_side])
+            if self.obs_trial and not self.expert_teacher and not self.unrealiable_teacher:
+                self.Q[self.K,chose_side] += self.alpha[self.K] * (reward - self.Q[self.K,chose_side])
 
         # Timeout
         if not trial_ended and self.steps_in_trial >= self.steps_per_trial:

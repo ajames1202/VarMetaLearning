@@ -82,6 +82,77 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
     return probs
 
 
+
+# -----------------------------
+# Grid eval for early stopping
+# -----------------------------
+
+# Default training/eval grid (can edit here)
+P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
+
+# Teacher modes (env attributes are set only if they exist)
+TEACHER_MODES_DEFAULT = [
+    ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
+    ("slow",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.05, 0.05], "tau": [0.33, 0.33, 0.33]}),
+    ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.50, 0.50], "tau": [0.33, 0.33, 0.33]}),
+    ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+]
+
+
+def eval_grid_score(
+    workers,
+    agent_state_cpu,
+    session_K: int,
+    p_hi: float,
+    p_lo_grid: List[float],
+    teacher_modes: List[Tuple[str, Dict[str, Any]]],
+    n_sessions_per_cell: int,
+    seed: int,
+):
+    """Evaluate the *full grid* and return:
+      - macro_avg: mean over all grid cells
+      - worst5_avg: mean over the worst 5 cells
+      - cell_means: dict[(p_lo, mode_name)] -> mean cell score (0..100)
+
+    Cell score = mean( pct_hi_IL, pct_hi_AO, pct_hi_OL ).
+    """
+    rng = np.random.default_rng(seed)
+
+    futures = []
+    meta = []  # (p_lo, mode_name)
+    for p_lo in p_lo_grid:
+        for mode_name, cfg in teacher_modes:
+            for _ in range(int(n_sessions_per_cell)):
+                probs = sample_probs_this_session(session_K, float(p_hi), float(p_lo), rng)
+                w = workers[len(futures) % len(workers)]
+                futures.append(
+                    w.run_session.remote(
+                        agent_state_cpu,
+                        probs,
+                        print_this_session=False,
+                        teacher_cfg=cfg,
+                        return_obs=False,
+                    )
+                )
+                meta.append((float(p_lo), str(mode_name)))
+
+    results = ray.get(futures)
+
+    cell_scores: Dict[Tuple[float, str], List[float]] = {}
+    for (p_lo, mode_name), res in zip(meta, results):
+        pct_hi_il = float(res[13])
+        pct_hi_ao = float(res[14])
+        pct_hi_ol = float(res[15])
+        cell = (p_lo, mode_name)
+        cell_scores.setdefault(cell, []).append((pct_hi_il + pct_hi_ao + pct_hi_ol) / 3.0)
+
+    cell_means = {k: float(np.mean(v)) for k, v in cell_scores.items()}
+    all_scores = np.array(list(cell_means.values()), dtype=np.float32)
+    macro_avg = float(all_scores.mean()) if all_scores.size else 0.0
+    worst5_avg = float(np.sort(all_scores)[: min(5, all_scores.size)].mean()) if all_scores.size else 0.0
+    return macro_avg, worst5_avg, cell_means
+
+
 # -----------------------------
 # Rollout
 # -----------------------------
@@ -535,7 +606,7 @@ class RolloutWorker:
             shuffle=True,
         )
 
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_eps: float = 0.0, return_obs: bool = True):
+    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True):
         """Run one session with given pair probs. teacher_eps is optional (only used if env supports it)."""
         hidden_size = 128
         feature_dim = 128
@@ -554,11 +625,17 @@ class RolloutWorker:
         agent.eval()
 
         self.env.unwrapped.pair_probs = probs_this_session
-        if hasattr(self.env.unwrapped, "teacher_eps"):
-            try:
-                self.env.unwrapped.teacher_eps = float(teacher_eps)
-            except Exception:
-                pass
+
+        # Optional teacher configuration (expert/slow/fast/unreliable, eps/alpha/tau etc.)
+        # We set only attributes that exist in the env to keep this backward-compatible.
+        if teacher_cfg is not None:
+            uw = self.env.unwrapped
+            for k, v in dict(teacher_cfg).items():
+                if hasattr(uw, k):
+                    try:
+                        setattr(uw, k, v)
+                    except Exception:
+                        pass
 
         with torch.no_grad():
             return meta_ep_rollout(
@@ -580,7 +657,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
                  batch_actor, batch_trial_cond, batch_teacher_correct,
-                 batch_logp_old, batch_v_old, device):
+                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -595,7 +672,9 @@ def _call_update2(agent, optim_bandit, optim_motor,
         batch_teacher_correct,
         batch_logp_old,
         batch_v_old,
-        device
+        device,
+        ppo_epochs=ppo_epochs,
+        ppo_minibatch_size=ppo_minibatch_size,
     )
 
 
@@ -606,9 +685,19 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--episodes-per-update', type=int, default=8)  # B
     parser.add_argument('--num-updates', type=int, default=1000)
-    parser.add_argument('--warmup-updates', type=int, default=900)
-    parser.add_argument('--patience', type=int, default=30)
-    parser.add_argument('--min-delta', type=float, default=0.1)
+
+    # PPO inner-loop
+    parser.add_argument('--ppo-epochs', type=int, default=4)
+    parser.add_argument('--ppo-minibatch-size', type=int, default=256)
+
+    # Grid eval + early stop (eval-based, not train EMA)
+    parser.add_argument('--eval-interval', type=int, default=20)
+    parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
+    parser.add_argument('--warmup-updates', type=int, default=100)
+    parser.add_argument('--patience-evals', type=int, default=10)
+    parser.add_argument('--min-delta', type=float, default=0.25)
+
+    # Post-training eval / plots
     parser.add_argument('--eval-sessions', type=int, default=200)
     parser.add_argument('--gap-sweep', action='store_true', help='Run gap sweep after training.', default=True)
     parser.add_argument('--p-hi', type=float, default=0.8)
@@ -631,11 +720,9 @@ def main():
     feature_dim = 128
     input_size = feature_dim + 1
 
-    # early stopping
-    ema = None
-    ema_beta = 0.9
-    best_ema = -float("inf")
-    bad = 0
+    # eval-based early stopping (grid eval)
+    best_eval = -float("inf")
+    bad_evals = 0
 
     agent = bl.BanditLearner(
         input_size=input_size,
@@ -782,7 +869,9 @@ def main():
             batch_teacher_correct,
             batch_logp_old, 
             batch_v_old,
-            device
+            device,
+            ppo_epochs=args.ppo_epochs,
+            ppo_minibatch_size=args.ppo_minibatch_size,
         )
 
         mean_cum_rew_il = float(np.mean(np.sum(cum_rewards_list_il)))
@@ -797,30 +886,59 @@ def main():
         mean_hi_choices_ao = np.mean([arr.sum() for arr in cum_high_reward_choices_ao])
         mean_hi_choices_ol = np.mean([arr.sum() for arr in cum_high_reward_choices_ol])
 
-        #train_score = mean_cum_rew_il + mean_cum_rew_ao + mean_cum_rew_ol
-        train_score = mean_hi_choices_il + mean_hi_choices_ao + mean_hi_choices_ol
-        ema = train_score if ema is None else (ema_beta * ema + (1 - ema_beta) * train_score)
+        #train_score = mean_hi_choices_il + mean_hi_choices_ao + mean_hi_choices_ol
 
         if update_idx % 10 == 0:
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"mean_hi_choices_il={mean_hi_choices_il:.1f} mean_hi_choices_ao={mean_hi_choices_ao:.1f} mean_hi_choices_ol={mean_hi_choices_ol:.1f} "
                   f"mean_cum_rew_il={mean_cum_rew_il:.1f} mean_cum_rew_ao={mean_cum_rew_ao:.1f} mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
 
-        # Early stopping (after warmup)
-        if update_idx >= args.warmup_updates:
-            if ema > best_ema + args.min_delta:
-                best_ema = ema
-                bad = 0
+        # Grid-eval + early stopping (after warmup)
+        if (update_idx >= args.warmup_updates) and (update_idx % args.eval_interval == 0):
+            agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
+
+            p_lo_grid = P_LO_GRID_DEFAULT
+            teacher_modes = TEACHER_MODES_DEFAULT
+
+            macro, worst5, cell_means = eval_grid_score(
+                workers=workers,
+                agent_state_cpu=agent_state_cpu,
+                session_K=session_K,
+                p_hi=args.p_hi,
+                p_lo_grid=p_lo_grid,
+                teacher_modes=teacher_modes,
+                n_sessions_per_cell=args.eval_sessions_per_cell,
+                seed=args.seed + 10_000 + update_idx,
+            )
+            # Use a composite score to avoid "good on easy cells only"
+            eval_score = 0.7 * macro + 0.3 * worst5
+
+            print(f"[eval upd {update_idx:04d}] macro={macro:.2f} worst5={worst5:.2f} score={eval_score:.2f}")
+
+            writer.add_scalar("EvalGrid/macro", macro, update_idx)
+            writer.add_scalar("EvalGrid/worst5", worst5, update_idx)
+            writer.add_scalar("EvalGrid/score", eval_score, update_idx)
+
+            if eval_score > best_eval + args.min_delta:
+                best_eval = eval_score
+                bad_evals = 0
                 save_checkpoint(
                     os.path.join(args.save_dir, "best.pt"),
                     agent, optim_bandit, optim_motor,
-                    extra={"update": update_idx, "ema_score": float(ema)}
+                    extra={
+                        "update": update_idx,
+                        "eval_score": float(eval_score),
+                        "macro": float(macro),
+                        "worst5": float(worst5),
+                        "p_lo_grid": list(p_lo_grid),
+                        "teacher_modes": [m for m, _ in teacher_modes],
+                    }
                 )
             else:
-                bad += 1
+                bad_evals += 1
 
-            if bad >= args.patience:
-                print(f"Early stopping at update {update_idx}, best_ema={best_ema:.2f}")
+            if bad_evals >= args.patience_evals:
+                print(f"Early stopping at update {update_idx}, best_eval={best_eval:.2f}")
                 break
 
         # TensorBoard
@@ -835,7 +953,10 @@ def main():
     # -----------------------------
     ckpt_path = os.path.join(args.save_dir, "best.pt")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    print(f"Loaded best checkpoint from update {ckpt['extra']['update']}, ema_score={ckpt['extra']['ema_score']:.2f}")
+    best_extra = ckpt.get("extra", {})
+    best_update = best_extra.get("update", -1)
+    best_score = best_extra.get("eval_score", best_extra.get("ema_score", float("nan")))
+    print(f"Loaded best checkpoint from update {best_update}, best_score={best_score:.2f}")
     agent.load_state_dict(ckpt["model_state"])
     agent.eval()
 
