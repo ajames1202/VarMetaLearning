@@ -11,6 +11,7 @@
 #     it will be passed; otherwise it will be ignored.
 
 import argparse
+import copy
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -95,6 +96,9 @@ TEACHER_MODES_DEFAULT = [
     ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
 ]
 
+# Keys used by teacher configs; used to reset env attrs each session to avoid cross-contamination.
+TEACHER_CFG_KEYS = sorted({k for _, cfg in TEACHER_MODES_DEFAULT for k in cfg.keys()})
+
 
 def eval_grid_score(
     workers,
@@ -148,6 +152,141 @@ def eval_grid_score(
     macro_avg = float(all_scores.mean()) if all_scores.size else 0.0
     worst5_avg = float(np.sort(all_scores)[: min(5, all_scores.size)].mean()) if all_scores.size else 0.0
     return macro_avg, worst5_avg, cell_means
+
+
+# -----------------------------
+# Post-training grid eval (teacher modes × reward probs)
+# -----------------------------
+
+def eval_post_grid(
+    workers,
+    agent_state_cpu,
+    session_K: int,
+    p_hi: float,
+    p_lo_grid: List[float],
+    teacher_modes: List[Tuple[str, Dict[str, Any]]],
+    n_sessions_per_cell: int,
+    seed: int,
+):
+    """Evaluate a grid and return per-cell means + std.
+
+    Returns:
+      cell_stats[(p_lo, mode_name)] = {
+        'pct_hi_il_mean', 'pct_hi_il_std', ...
+        'cum_rew_il_mean', ...
+        'pertrial_il_mean': (session_N,), ...
+      }
+    """
+    rng = np.random.default_rng(seed)
+
+    futures = []
+    meta = []  # (p_lo, mode_name)
+    for p_lo in p_lo_grid:
+        for mode_name, cfg in teacher_modes:
+            for _ in range(int(n_sessions_per_cell)):
+                probs = sample_probs_this_session(session_K, float(p_hi), float(p_lo), rng)
+                w = workers[len(futures) % len(workers)]
+                futures.append(
+                    w.run_session.remote(
+                        agent_state_cpu,
+                        probs,
+                        print_this_session=False,
+                        teacher_cfg=cfg,
+                        return_obs=False,
+                    )
+                )
+                meta.append((float(p_lo), str(mode_name)))
+
+    results = ray.get(futures)
+
+    # collect per-cell arrays
+    per_cell: Dict[Tuple[float, str], Dict[str, List[Any]]] = {}
+    for (p_lo, mode_name), res in zip(meta, results):
+        (
+            _, _, _,
+            _, _, _, _,
+            _, _,
+            _,
+            cum_rew_il, cum_rew_ao, cum_rew_ol,
+            pct_hi_il, pct_hi_ao, pct_hi_ol,
+            high_reward_choices_il,
+            high_reward_choices_ao,
+            high_reward_choices_ol,
+            _, _,  # logp_old_buf, v_old_buf
+            g_trace_ao, g_trace_ol,
+        ) = res
+
+        cell = (p_lo, mode_name)
+        d = per_cell.setdefault(cell, {
+            "pct_hi_il": [], "pct_hi_ao": [], "pct_hi_ol": [],
+            "cum_rew_il": [], "cum_rew_ao": [], "cum_rew_ol": [],
+            "pertrial_il": [], "pertrial_ao": [], "pertrial_ol": [],
+            "gtrace_ao": [], "gtrace_ol": [],
+        })
+        d["pct_hi_il"].append(float(pct_hi_il))
+        d["pct_hi_ao"].append(float(pct_hi_ao))
+        d["pct_hi_ol"].append(float(pct_hi_ol))
+        d["cum_rew_il"].append(float(cum_rew_il))
+        d["cum_rew_ao"].append(float(cum_rew_ao))
+        d["cum_rew_ol"].append(float(cum_rew_ol))
+        d["pertrial_il"].append(np.asarray(high_reward_choices_il, dtype=np.float32))
+        d["pertrial_ao"].append(np.asarray(high_reward_choices_ao, dtype=np.float32))
+        d["pertrial_ol"].append(np.asarray(high_reward_choices_ol, dtype=np.float32))
+        d["gtrace_ao"].append(np.asarray(g_trace_ao, dtype=np.float32))
+        d["gtrace_ol"].append(np.asarray(g_trace_ol, dtype=np.float32))
+
+    cell_stats: Dict[Tuple[float, str], Dict[str, Any]] = {}
+    for cell, d in per_cell.items():
+        def _mstd(x):
+            x = np.asarray(x, dtype=np.float32)
+            return float(x.mean()), float(x.std(ddof=0))
+
+        il_m, il_s = _mstd(d["pct_hi_il"])
+        ao_m, ao_s = _mstd(d["pct_hi_ao"])
+        ol_m, ol_s = _mstd(d["pct_hi_ol"])
+        ril_m, ril_s = _mstd(d["cum_rew_il"])
+        rao_m, rao_s = _mstd(d["cum_rew_ao"])
+        rol_m, rol_s = _mstd(d["cum_rew_ol"])
+
+        pt_il = np.stack(d["pertrial_il"], axis=0)
+        pt_ao = np.stack(d["pertrial_ao"], axis=0)
+        pt_ol = np.stack(d["pertrial_ol"], axis=0)
+
+        g_ao = np.stack(d["gtrace_ao"], axis=0)
+        g_ol = np.stack(d["gtrace_ol"], axis=0)
+        gao_mu = np.nanmean(g_ao, axis=0)
+        gao_sd = np.nanstd(g_ao, axis=0, ddof=0)
+        gol_mu = np.nanmean(g_ol, axis=0)
+        gol_sd = np.nanstd(g_ol, axis=0, ddof=0)
+
+        cell_stats[cell] = {
+            "pct_hi_il_mean": il_m,
+            "pct_hi_il_std": il_s,
+            "pct_hi_ao_mean": ao_m,
+            "pct_hi_ao_std": ao_s,
+            "pct_hi_ol_mean": ol_m,
+            "pct_hi_ol_std": ol_s,
+            "cum_rew_il_mean": ril_m,
+            "cum_rew_il_std": ril_s,
+            "cum_rew_ao_mean": rao_m,
+            "cum_rew_ao_std": rao_s,
+            "cum_rew_ol_mean": rol_m,
+            "cum_rew_ol_std": rol_s,
+            "pertrial_il_mean": pt_il.mean(axis=0),
+            "pertrial_il_std": pt_il.std(axis=0, ddof=0),
+            "pertrial_ao_mean": pt_ao.mean(axis=0),
+            "pertrial_ao_std": pt_ao.std(axis=0, ddof=0),
+            "pertrial_ol_mean": pt_ol.mean(axis=0),
+            "pertrial_ol_std": pt_ol.std(axis=0, ddof=0),
+            "gtrace_ao_mean": gao_mu,
+            "gtrace_ao_std": gao_sd,
+            "gtrace_ol_mean": gol_mu,
+            "gtrace_ol_std": gol_sd,
+            "gtrace_ao_mean_over_trials": float(np.nanmean(gao_mu)),
+            "gtrace_ol_mean_over_trials": float(np.nanmean(gol_mu)),
+        }
+
+    return cell_stats
 
 
 # -----------------------------
@@ -223,6 +362,14 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
     delta_val = np.array([0.0,0.0])
     g_val = 0.0
+
+    # Track gate values (g) over within-pair trial index (0..session_N-1) for AO-s and OL-s.
+    # We aggregate across pairs within a session by summing g at the corresponding within-pair index,
+    # then averaging (counts) at the end of the session.
+    g_trace_ao_sum = np.zeros(session_N, dtype=np.float32)
+    g_trace_ao_cnt = np.zeros(session_N, dtype=np.int32)
+    g_trace_ol_sum = np.zeros(session_N, dtype=np.float32)
+    g_trace_ol_cnt = np.zeros(session_N, dtype=np.int32)
 
     def _ctx_for(q_tok: torch.Tensor, keep_conds: set) -> torch.Tensor:
         """Return ctx for a single query token, attending only to past trials in keep_conds.
@@ -480,6 +627,20 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             elif curr_trial_condition == "OL-s":
                 pair_index_counter_ol[pair_index_ep] += 1
 
+            # Gate traces (g) for AO-s / OL-s at the within-pair trial index.
+            # NOTE: g_val is computed at trial start for self-choice trials; we snapshot it here when the trial ends.
+            if (pair_index_ep is not None) and (pair_index_ep >= 0):
+                if curr_trial_condition == "AO-s":
+                    idx = int(pair_index_counter_ao[pair_index_ep])
+                    if 0 <= idx < session_N and np.isfinite(float(g_val)):
+                        g_trace_ao_sum[idx] += float(g_val)
+                        g_trace_ao_cnt[idx] += 1
+                elif curr_trial_condition == "OL-s":
+                    idx = int(pair_index_counter_ol[pair_index_ep])
+                    if 0 <= idx < session_N and np.isfinite(float(g_val)):
+                        g_trace_ol_sum[idx] += float(g_val)
+                        g_trace_ol_cnt[idx] += 1
+
             if curr_trial_condition == "IL":
                 tot_il += 1
                 if sh == 1:
@@ -557,6 +718,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     high_reward_choices_ao = np.array(high_reward_choice_ao, dtype=np.int32)
     high_reward_choices_ol = np.array(high_reward_choice_ol, dtype=np.int32)
 
+    # Mean gate value per within-pair trial index (NaN where not observed in this session)
+    g_trace_ao = np.where(g_trace_ao_cnt > 0, g_trace_ao_sum / np.maximum(g_trace_ao_cnt, 1), np.nan).astype(np.float32)
+    g_trace_ol = np.where(g_trace_ol_cnt > 0, g_trace_ol_sum / np.maximum(g_trace_ol_cnt, 1), np.nan).astype(np.float32)
+
 
     if return_obs:
         obs_bandit = {
@@ -575,7 +740,8 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
         pct_hi_il, pct_hi_ao, pct_hi_ol,
         high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol,
-        bandit_logp_buf, bandit_value_buf
+        bandit_logp_buf, bandit_value_buf,
+        g_trace_ao, g_trace_ol
     )
 
 
@@ -603,6 +769,17 @@ class RolloutWorker:
             shuffle=True,
         )
 
+        # Snapshot teacher-related defaults once, so each session can start from a clean slate.
+        uw = self.env.unwrapped
+        self._teacher_defaults = {}
+        for k in TEACHER_CFG_KEYS:
+            if hasattr(uw, k):
+                try:
+                    self._teacher_defaults[k] = copy.deepcopy(getattr(uw, k))
+                except Exception:
+                    # Fallback: store raw value
+                    self._teacher_defaults[k] = getattr(uw, k)
+
     def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True):
         """Run one session with given pair probs. teacher_eps is optional (only used if env supports it)."""
         hidden_size = 128
@@ -623,16 +800,31 @@ class RolloutWorker:
 
         self.env.unwrapped.pair_probs = probs_this_session
 
-        # Optional teacher configuration (expert/slow/fast/unreliable, eps/alpha/tau etc.)
-        # We set only attributes that exist in the env to keep this backward-compatible.
-        if teacher_cfg is not None:
-            uw = self.env.unwrapped
-            for k, v in dict(teacher_cfg).items():
-                if hasattr(uw, k):
+        # Reset teacher-related attributes to defaults, then apply teacher_cfg.
+        # This avoids leakage when we run mixed teacher modes back-to-back in the same worker.
+        uw = self.env.unwrapped
+        for k, v in self._teacher_defaults.items():
+            if hasattr(uw, k):
+                try:
+                    setattr(uw, k, copy.deepcopy(v))
+                except Exception:
                     try:
                         setattr(uw, k, v)
                     except Exception:
                         pass
+
+        # Optional teacher configuration (expert/slow/fast/unreliable, eps/alpha/tau etc.)
+        # We set only attributes that exist in the env to keep this backward-compatible.
+        if teacher_cfg is not None:
+            for k, v in dict(teacher_cfg).items():
+                if hasattr(uw, k):
+                    try:
+                        setattr(uw, k, copy.deepcopy(v))
+                    except Exception:
+                        try:
+                            setattr(uw, k, v)
+                        except Exception:
+                            pass
 
         # print(f"Worker {self.worker_id} running session with probs {probs_this_session} and teacher_cfg {teacher_cfg}")                                
         with torch.no_grad():
@@ -710,7 +902,18 @@ def main():
 
     # Post-training eval / plots
     parser.add_argument('--eval-sessions', type=int, default=200)
-    parser.add_argument('--gap-sweep', action='store_true', help='Run gap sweep after training.', default=True)
+
+    # Post-training *grid* eval: teacher modes × reward probs
+    parser.add_argument('--post-grid-eval', dest='post_grid_eval', action='store_true', default=True,
+                        help='Run post-training eval on a grid of (teacher_mode × p_lo) and save plots/CSV.')
+    parser.add_argument('--no-post-grid-eval', dest='post_grid_eval', action='store_false',
+                        help='Disable post-training grid eval.')
+    parser.add_argument('--post-grid-sessions-per-cell', type=int, default=50,
+                        help='Eval sessions per grid cell (teacher_mode × p_lo).')
+
+    # Backward-compat alias
+    parser.add_argument('--gap-sweep', dest='post_grid_eval', action='store_true',
+                        help='(deprecated) Alias for --post-grid-eval.')
     parser.add_argument('--p-hi', type=float, default=0.8)
     parser.add_argument('--p-lo-min', type=float, default=0.10)
     parser.add_argument('--p-lo-max', type=float, default=0.6)
@@ -866,7 +1069,7 @@ def main():
                     teacher_correct_buf,
                     cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
                     pct_hi_il, pct_hi_ao, pct_hi_ol,
-                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, logp_old_buf, v_old_buf
+                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, logp_old_buf, v_old_buf, _, _
                 ) = res
 
                 batch_xy_pos.extend(xy_pos_buf)
@@ -1040,7 +1243,8 @@ def main():
             high_reward_choices_il,
             high_reward_choices_ao,
             high_reward_choices_ol,
-            _, _
+            _, _,  # logp_old_buf, v_old_buf
+            _, _   # g_trace_ao, g_trace_ol
         ) = res
 
         eval_il.append(high_reward_choices_il)
@@ -1087,103 +1291,331 @@ def main():
     plt.close(fig)
 
     # -----------------------------
-    # Gap sweep (optional)
+    # Post-training grid eval (optional): teacher modes × reward probs
     # -----------------------------
-    if args.gap_sweep:
-        rng = np.random.default_rng(args.seed + 2026)
-
+    if args.post_grid_eval:
         p_hi = float(args.p_hi)
         p_lo_grid = np.linspace(float(args.p_lo_max), float(args.p_lo_min), int(args.p_lo_steps))
-        sweep = []
+        teacher_modes = TEACHER_MODES_DEFAULT
 
-        for p_lo in p_lo_grid:
-            # mean high-arm pick rate (%), averaged over eval sessions
-            pct_il = 0.0
-            pct_ao = 0.0
-            pct_ol = 0.0
+        print(f"[PostGrid] Evaluating {len(p_lo_grid)} p_lo values × {len(teacher_modes)} teacher modes = {len(p_lo_grid)*len(teacher_modes)} cells")
+        print(f"[PostGrid] Sessions per cell: {int(args.post_grid_sessions_per_cell)}")
 
-            futures = []
-            print(f"[GapSweep] launching p_lo={p_lo:.2f} ...")
-            for i in range(args.eval_sessions):
-                probs_this_session = sample_probs_this_session(session_K, p_hi, float(p_lo), rng)
-                futures.append(
-                    workers[i % len(workers)].run_session.remote(
-                        agent_state_cpu,
-                        probs_this_session=probs_this_session,
-                        print_this_session=False,
-                        return_obs=False
-                    )
-                )
+        cell_stats = eval_post_grid(
+            workers=workers,
+            agent_state_cpu=agent_state_cpu,
+            session_K=session_K,
+            p_hi=p_hi,
+            p_lo_grid=[float(x) for x in p_lo_grid],
+            teacher_modes=teacher_modes,
+            n_sessions_per_cell=int(args.post_grid_sessions_per_cell),
+            seed=int(args.seed + 40_000 + best_update),
+        )
 
-            results = ray.get(futures)
-
-            for res in results:
-                (
-                    _, _, _,
-                    _, _, _, _,
-                    _, _,
-                    _,  # teacher_correct_buf
-                    _, _, _,              # cum_rew_il, cum_rew_ao, cum_rew_ol (unused)
-                    pct_hi_il, pct_hi_ao, pct_hi_ol,
-                    _, _,                 # high_reward_choices_* (unused here)
-                    _, _, _
-                ) = res
-
-                pct_il += float(pct_hi_il)
-                pct_ao += float(pct_hi_ao)
-                pct_ol += float(pct_hi_ol)
-
-            pct_il /= args.eval_sessions
-            pct_ao /= args.eval_sessions
-            pct_ol /= args.eval_sessions
-
-            sweep.append({
-                "p_lo": float(p_lo),
-                "gap": float(p_hi - p_lo),
-                "pct_hi_il": float(pct_il),
-                "pct_hi_ao": float(pct_ao),
-                "pct_hi_ol": float(pct_ol),
-            })
-
-            print(f"[GapSweep] p_lo={p_lo:.2f} gap={p_hi-p_lo:.2f} | IL={pct_il:.1f}% AO={pct_ao:.1f}% OL={pct_ol:.1f}%")
-
-        # Save CSV
-        # Save CSV
-        csv_path = os.path.join(run_dir, "GapSweep.csv")
+        # ------------------
+        # Save CSV (one row per cell)
+        # ------------------
+        csv_path = os.path.join(run_dir, "PostGridEval.csv")
         with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("p_lo,gap,pct_hi_il,pct_hi_ao,pct_hi_ol\n")
-            for row in sweep:
-                f.write(f"{row['p_lo']:.4f},{row['gap']:.4f},{row['pct_hi_il']:.4f},{row['pct_hi_ao']:.4f},{row['pct_hi_ol']:.4f}\n")
+            f.write(
+                "p_hi,p_lo,gap,teacher_mode,"
+                "pct_hi_il_mean,pct_hi_il_std,pct_hi_ao_mean,pct_hi_ao_std,pct_hi_ol_mean,pct_hi_ol_std,"
+                "cum_rew_il_mean,cum_rew_il_std,cum_rew_ao_mean,cum_rew_ao_std,cum_rew_ol_mean,cum_rew_ol_std,"
+                "gtrace_ao_mean_over_trials,gtrace_ol_mean_over_trials\n"
+            )
+            for p_lo in p_lo_grid:
+                for mode_name, _cfg in teacher_modes:
+                    k = (float(p_lo), str(mode_name))
+                    if k not in cell_stats:
+                        continue
+                    st = cell_stats[k]
+                    f.write(
+                        f"{p_hi:.4f},{float(p_lo):.4f},{(p_hi-float(p_lo)):.4f},{mode_name},"
+                        f"{st['pct_hi_il_mean']:.4f},{st['pct_hi_il_std']:.4f},{st['pct_hi_ao_mean']:.4f},{st['pct_hi_ao_std']:.4f},{st['pct_hi_ol_mean']:.4f},{st['pct_hi_ol_std']:.4f},"
+                        f"{st['cum_rew_il_mean']:.4f},{st['cum_rew_il_std']:.4f},{st['cum_rew_ao_mean']:.4f},{st['cum_rew_ao_std']:.4f},{st['cum_rew_ol_mean']:.4f},{st['cum_rew_ol_std']:.4f},"
+                        f"{st['gtrace_ao_mean_over_trials']:.4f},{st['gtrace_ol_mean_over_trials']:.4f}\n"
+                    )
 
-        gaps   = np.array([d["gap"] for d in sweep])
-        pct_il = np.array([d["pct_hi_il"] for d in sweep])
-        pct_ao = np.array([d["pct_hi_ao"] for d in sweep])
-        pct_ol = np.array([d["pct_hi_ol"] for d in sweep])
+        # ------------------
+        # Save raw g traces (mean/std) per cell as a compact NPZ (easy to load later)
+        # ------------------
+        npz_path = os.path.join(run_dir, "PostGrid_gTrace_arrays.npz")
+        npz_payload: Dict[str, Any] = {}
+        for p_lo in p_lo_grid:
+            for mode_name, _cfg in teacher_modes:
+                k = (float(p_lo), str(mode_name))
+                st = cell_stats.get(k)
+                if st is None:
+                    continue
+                tag = f"mode={mode_name}__pLo={float(p_lo):.2f}"
+                npz_payload[f"gAO_mean__{tag}"] = np.asarray(st["gtrace_ao_mean"], dtype=np.float32)
+                npz_payload[f"gAO_std__{tag}"]  = np.asarray(st["gtrace_ao_std"], dtype=np.float32)
+                npz_payload[f"gOL_mean__{tag}"] = np.asarray(st["gtrace_ol_mean"], dtype=np.float32)
+                npz_payload[f"gOL_std__{tag}"]  = np.asarray(st["gtrace_ol_std"], dtype=np.float32)
+        if len(npz_payload) > 0:
+            np.savez(npz_path, **npz_payload)
 
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(gaps, pct_il, label="IL")
-        ax.plot(gaps, pct_ao, label="AO")
-        ax.plot(gaps, pct_ol, label="OL")
-        ax.set_xlabel("Gap (p_hi - p_lo)")
-        ax.set_ylabel("High-arm pick rate (%)")
-        ax.set_title("Gap sweep (high-arm accuracy)")
-        ax.grid(True)
-        ax.legend()
-        fig.savefig(os.path.join(run_dir, "GapSweep_HighArmPct.png"), dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        # ------------------
+        # Per-cell plots (per-trial + summary high-arm pick rate)
+        # ------------------
+        trials = np.arange(session_N)
+        for p_lo in p_lo_grid:
+            for mode_name, _cfg in teacher_modes:
+                k = (float(p_lo), str(mode_name))
+                if k not in cell_stats:
+                    continue
+                st = cell_stats[k]
+                gap = p_hi - float(p_lo)
 
-        # optional: separation plot
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(gaps, pct_ol - pct_ao, label="OL - AO")
-        ax.plot(gaps, pct_ao - pct_il, label="AO - IL")
-        ax.axhline(0, linewidth=1)
-        ax.set_xlabel("Gap (p_hi - p_lo)")
-        ax.set_ylabel("Δ high-arm pick rate (%)")
-        ax.set_title("Separation vs difficulty")
-        ax.grid(True)
-        ax.legend()
-        fig.savefig(os.path.join(run_dir, "GapSweep_DeltasPct.png"), dpi=150, bbox_inches="tight")
-        plt.close(fig)
+                # per-trial curve
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(trials, st["pertrial_il_mean"], label="IL")
+                ax.plot(trials, st["pertrial_ao_mean"], label="AO")
+                ax.plot(trials, st["pertrial_ol_mean"], label="OL")
+                ax.set_xlabel("Trial index")
+                ax.set_ylabel("Mean high-reward choice")
+                ax.set_title(f"Per-trial (mode={mode_name}, p_lo={float(p_lo):.2f}, gap={gap:.2f})")
+                ax.grid(True)
+                ax.legend()
+                fig.savefig(
+                    os.path.join(run_dir, f"PostGrid_PerTrial_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                    dpi=150,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
+
+                # pick-rate bar
+                fig, ax = plt.subplots(figsize=(6, 4))
+                means = [st["pct_hi_il_mean"], st["pct_hi_ao_mean"], st["pct_hi_ol_mean"]]
+                stds = [st["pct_hi_il_std"], st["pct_hi_ao_std"], st["pct_hi_ol_std"]]
+                x = np.arange(3)
+                ax.bar(x, means, yerr=stds, capsize=3)
+                ax.set_xticks(x)
+                ax.set_xticklabels(["IL", "AO", "OL"])
+                ax.set_ylabel("High-arm pick rate (%)")
+                ax.set_title(f"High-arm pick rate (mode={mode_name}, p_lo={float(p_lo):.2f})")
+                ax.grid(True, axis="y")
+                fig.savefig(
+                    os.path.join(run_dir, f"PostGrid_PctHi_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                    dpi=150,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
+
+                # g traces: gate value over within-pair trial index (AO-s vs OL-s)
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(trials, st["gtrace_ao_mean"], label="g (AO)")
+                ax.fill_between(
+                    trials,
+                    st["gtrace_ao_mean"] - st["gtrace_ao_std"],
+                    st["gtrace_ao_mean"] + st["gtrace_ao_std"],
+                    alpha=0.2,
+                )
+                ax.plot(trials, st["gtrace_ol_mean"], label="g (OL)")
+                ax.fill_between(
+                    trials,
+                    st["gtrace_ol_mean"] - st["gtrace_ol_std"],
+                    st["gtrace_ol_mean"] + st["gtrace_ol_std"],
+                    alpha=0.2,
+                )
+                ax.set_ylim(-0.05, 1.05)
+                ax.set_xlabel("Trial index")
+                ax.set_ylabel("Gate g")
+                ax.set_title(f"Gate g over trials (mode={mode_name}, p_lo={float(p_lo):.2f}, gap={gap:.2f})")
+                ax.grid(True)
+                ax.legend()
+                fig.savefig(
+                    os.path.join(run_dir, f"PostGrid_gTrace_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                    dpi=150,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
+
+        # ------------------
+        # Summary plots: per-teacher curves + heatmaps over the grid
+        # ------------------
+        mode_names = [m for m, _ in teacher_modes]
+        p_lo_list = [float(x) for x in p_lo_grid]
+        gaps = np.array([p_hi - x for x in p_lo_list], dtype=np.float32)
+
+        # per-mode curves
+        for mode_name, _cfg in teacher_modes:
+            il = []
+            ao = []
+            ol = []
+            for p_lo in p_lo_list:
+                st = cell_stats.get((p_lo, str(mode_name)))
+                if st is None:
+                    il.append(np.nan)
+                    ao.append(np.nan)
+                    ol.append(np.nan)
+                else:
+                    il.append(st["pct_hi_il_mean"])
+                    ao.append(st["pct_hi_ao_mean"])
+                    ol.append(st["pct_hi_ol_mean"])
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(gaps, il, label="IL")
+            ax.plot(gaps, ao, label="AO")
+            ax.plot(gaps, ol, label="OL")
+            ax.set_xlabel("Gap (p_hi - p_lo)")
+            ax.set_ylabel("High-arm pick rate (%)")
+            ax.set_title(f"High-arm pick rate vs gap (mode={mode_name})")
+            ax.grid(True)
+            ax.legend()
+            fig.savefig(os.path.join(run_dir, f"PostGrid_ModeCurve_{mode_name}.png"), dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        # heatmaps: rows=p_lo, cols=mode
+        def _heatmap(mat: np.ndarray, title: str, fname: str):
+            fig, ax = plt.subplots(figsize=(7, 4))
+            im = ax.imshow(mat, aspect="auto", origin="lower")
+            ax.set_xticks(np.arange(len(mode_names)))
+            ax.set_xticklabels(mode_names, rotation=30, ha="right")
+            ax.set_yticks(np.arange(len(p_lo_list)))
+            ax.set_yticklabels([f"{x:.2f}" for x in p_lo_list])
+            ax.set_xlabel("Teacher mode")
+            ax.set_ylabel("p_lo")
+            ax.set_title(title)
+            fig.colorbar(im, ax=ax, shrink=0.9)
+            fig.savefig(os.path.join(run_dir, fname), dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        mat_il = np.full((len(p_lo_list), len(mode_names)), np.nan, dtype=np.float32)
+        mat_ao = np.full_like(mat_il, np.nan)
+        mat_ol = np.full_like(mat_il, np.nan)
+        mat_g_ao = np.full_like(mat_il, np.nan)
+        mat_g_ol = np.full_like(mat_il, np.nan)
+        for i, p_lo in enumerate(p_lo_list):
+            for j, mode_name in enumerate(mode_names):
+                st = cell_stats.get((p_lo, str(mode_name)))
+                if st is None:
+                    continue
+                mat_il[i, j] = st["pct_hi_il_mean"]
+                mat_ao[i, j] = st["pct_hi_ao_mean"]
+                mat_ol[i, j] = st["pct_hi_ol_mean"]
+                mat_g_ao[i, j] = float(st.get("gtrace_ao_mean_over_trials", np.nan))
+                mat_g_ol[i, j] = float(st.get("gtrace_ol_mean_over_trials", np.nan))
+
+        _heatmap(mat_il, "High-arm pick rate (%) — IL", "PostGrid_Heatmap_PctHi_IL.png")
+        _heatmap(mat_ao, "High-arm pick rate (%) — AO", "PostGrid_Heatmap_PctHi_AO.png")
+        _heatmap(mat_ol, "High-arm pick rate (%) — OL", "PostGrid_Heatmap_PctHi_OL.png")
+        _heatmap(mat_g_ao, "Gate g (mean over trials) — AO-s", "PostGrid_Heatmap_g_AO.png")
+        _heatmap(mat_g_ol, "Gate g (mean over trials) — OL-s", "PostGrid_Heatmap_g_OL.png")
+
+        # ------------------
+        # Mega-summary: per teacher mode (per-trial mean±std across p_lo + pick-rate vs gap mean±std)
+        # ------------------
+        for mode_name, _cfg in teacher_modes:
+            # gather per-cell arrays (skip missing)
+            pertrial_il = []
+            pertrial_ao = []
+            pertrial_ol = []
+            gtrace_ao = []
+            gtrace_ol = []
+            pct_il = []
+            pct_ao = []
+            pct_ol = []
+            pct_il_std = []
+            pct_ao_std = []
+            pct_ol_std = []
+            gaps_ok = []
+
+            for p_lo in p_lo_list:
+                st = cell_stats.get((p_lo, str(mode_name)))
+                if st is None:
+                    continue
+                pertrial_il.append(np.asarray(st["pertrial_il_mean"], dtype=np.float32))
+                pertrial_ao.append(np.asarray(st["pertrial_ao_mean"], dtype=np.float32))
+                pertrial_ol.append(np.asarray(st["pertrial_ol_mean"], dtype=np.float32))
+                gtrace_ao.append(np.asarray(st["gtrace_ao_mean"], dtype=np.float32))
+                gtrace_ol.append(np.asarray(st["gtrace_ol_mean"], dtype=np.float32))
+                pct_il.append(float(st["pct_hi_il_mean"]))
+                pct_ao.append(float(st["pct_hi_ao_mean"]))
+                pct_ol.append(float(st["pct_hi_ol_mean"]))
+                pct_il_std.append(float(st["pct_hi_il_std"]))
+                pct_ao_std.append(float(st["pct_hi_ao_std"]))
+                pct_ol_std.append(float(st["pct_hi_ol_std"]))
+                gaps_ok.append(float(p_hi - p_lo))
+
+            if len(pertrial_il) == 0:
+                continue
+
+            pertrial_il = np.stack(pertrial_il, axis=0)  # (P, N)
+            pertrial_ao = np.stack(pertrial_ao, axis=0)
+            pertrial_ol = np.stack(pertrial_ol, axis=0)
+
+            gtrace_ao = np.stack(gtrace_ao, axis=0)
+            gtrace_ol = np.stack(gtrace_ol, axis=0)
+
+            # mean±std across p_lo (shows how trial curve changes with gap)
+            il_mu = np.nanmean(pertrial_il, axis=0)
+            ao_mu = np.nanmean(pertrial_ao, axis=0)
+            ol_mu = np.nanmean(pertrial_ol, axis=0)
+            il_sd = np.nanstd(pertrial_il, axis=0)
+            ao_sd = np.nanstd(pertrial_ao, axis=0)
+            ol_sd = np.nanstd(pertrial_ol, axis=0)
+
+            gao_mu = np.nanmean(gtrace_ao, axis=0)
+            gao_sd = np.nanstd(gtrace_ao, axis=0)
+            gol_mu = np.nanmean(gtrace_ol, axis=0)
+            gol_sd = np.nanstd(gtrace_ol, axis=0)
+
+            # sort by gap for curve plot
+            order = np.argsort(np.asarray(gaps_ok))
+            gaps_s = np.asarray(gaps_ok)[order]
+            pct_il_s = np.asarray(pct_il)[order]
+            pct_ao_s = np.asarray(pct_ao)[order]
+            pct_ol_s = np.asarray(pct_ol)[order]
+            pct_il_sd_s = np.asarray(pct_il_std)[order]
+            pct_ao_sd_s = np.asarray(pct_ao_std)[order]
+            pct_ol_sd_s = np.asarray(pct_ol_std)[order]
+
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 4))
+
+            # left: per-trial mean±std across p_lo
+            ax1.plot(trials, il_mu, label="IL")
+            ax1.fill_between(trials, il_mu - il_sd, il_mu + il_sd, alpha=0.2)
+            ax1.plot(trials, ao_mu, label="AO")
+            ax1.fill_between(trials, ao_mu - ao_sd, ao_mu + ao_sd, alpha=0.2)
+            ax1.plot(trials, ol_mu, label="OL")
+            ax1.fill_between(trials, ol_mu - ol_sd, ol_mu + ol_sd, alpha=0.2)
+            ax1.set_xlabel("Trial index")
+            ax1.set_ylabel("Mean high-reward choice")
+            ax1.set_title(f"Per-trial mean±std across p_lo (mode={mode_name})")
+            ax1.grid(True)
+            ax1.legend()
+
+            # right: pick-rate vs gap mean±std across sessions (std per cell)
+            ax2.plot(gaps_s, pct_il_s, label="IL")
+            ax2.fill_between(gaps_s, pct_il_s - pct_il_sd_s, pct_il_s + pct_il_sd_s, alpha=0.2)
+            ax2.plot(gaps_s, pct_ao_s, label="AO")
+            ax2.fill_between(gaps_s, pct_ao_s - pct_ao_sd_s, pct_ao_s + pct_ao_sd_s, alpha=0.2)
+            ax2.plot(gaps_s, pct_ol_s, label="OL")
+            ax2.fill_between(gaps_s, pct_ol_s - pct_ol_sd_s, pct_ol_s + pct_ol_sd_s, alpha=0.2)
+            ax2.set_xlabel("Gap (p_hi - p_lo)")
+            ax2.set_ylabel("High-arm pick rate (%)")
+            ax2.set_title(f"Pick rate vs gap mean±std (mode={mode_name})")
+            ax2.grid(True)
+            ax2.legend()
+
+            # third: gate g over trials (mean±std across p_lo)
+            ax3.plot(trials, gao_mu, label="g (AO)")
+            ax3.fill_between(trials, gao_mu - gao_sd, gao_mu + gao_sd, alpha=0.2)
+            ax3.plot(trials, gol_mu, label="g (OL)")
+            ax3.fill_between(trials, gol_mu - gol_sd, gol_mu + gol_sd, alpha=0.2)
+            ax3.set_ylim(-0.05, 1.05)
+            ax3.set_xlabel("Trial index")
+            ax3.set_ylabel("Gate g")
+            ax3.set_title(f"Gate g mean±std across p_lo (mode={mode_name})")
+            ax3.grid(True)
+            ax3.legend()
+
+            fig.suptitle(f"Post-grid mega-summary — {mode_name} (p_hi={p_hi:.2f})", y=1.02)
+            fig.tight_layout()
+            fig.savefig(os.path.join(run_dir, f"PostGrid_MegaSummary_Mode_{mode_name}.png"), dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
 
     # Cleanup
     ray.shutdown()
