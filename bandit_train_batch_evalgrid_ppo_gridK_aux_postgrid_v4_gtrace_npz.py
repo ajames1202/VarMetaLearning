@@ -974,7 +974,7 @@ def main():
     plot_dir = os.path.join(args.save_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
-    run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
+    run_dir = os.path.join(plot_dir, "cnn_attn5", datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
 
 
