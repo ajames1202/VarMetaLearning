@@ -139,20 +139,30 @@ def eval_grid_score(
 
     results = ray.get(futures)
 
-    cell_scores: Dict[Tuple[float, str], List[float]] = {}
+    # cell_scores: Dict[Tuple[float, str], List[float]] = {}
+    il_scores: Dict[Tuple[float, str], List[float]] = {}
+    ao_scores: Dict[Tuple[float, str], List[float]] = {}
+    ol_scores: Dict[Tuple[float, str], List[float]] = {}
     for (p_lo, mode_name), res in zip(meta, results):
-        pct_hi_il = float(res[13])
-        pct_hi_ao = float(res[14])
-        pct_hi_ol = float(res[15])
+        # pct_hi_il = float(res[13])
+        # pct_hi_ao = float(res[14])
+        # pct_hi_ol = float(res[15])
+        cum_rew_il = float(res[11])
+        cum_rew_ao = float(res[12])
+        cum_rew_ol = float(res[13])
         cell = (p_lo, mode_name)
-        cell_scores.setdefault(cell, []).append((pct_hi_il + pct_hi_ao + pct_hi_ol) / 3.0)
+        il_scores.setdefault(cell, []).append((cum_rew_il))
+        ao_scores.setdefault(cell, []).append((cum_rew_ao))
+        ol_scores.setdefault(cell, []).append((cum_rew_ol))
 
-    cell_means = {k: float(np.mean(v)) for k, v in cell_scores.items()}
-    all_scores = np.array(list(cell_means.values()), dtype=np.float32)
+    # cell_means = {k: float(np.mean(v)) for k, v in cell_scores.items()}
+    il_mean = [float(np.mean(v)) for v in il_scores.values()].mean() #mean il over all rollouts
+    ao_mean = [float(np.mean(v)) for v in ao_scores.values()].mean() #mean ao over all rollouts
+    ol_mean = [float(np.mean(v)) for v in ol_scores.values()].mean() #mean ol over all rollouts
+    all_scores = np.array([il_mean, ao_mean, ol_mean], dtype=np.float32)
     macro_avg = float(all_scores.mean()) if all_scores.size else 0.0
     worst5_avg = float(np.sort(all_scores)[: min(5, all_scores.size)].mean()) if all_scores.size else 0.0
-    return macro_avg, worst5_avg, cell_means
-
+    return macro_avg, worst5_avg, il_mean, ao_mean, ol_mean
 
 # -----------------------------
 # Post-training grid eval (teacher modes × reward probs)
@@ -1152,7 +1162,7 @@ def main():
             p_lo_grid = P_LO_GRID_DEFAULT
             teacher_modes = TEACHER_MODES_DEFAULT
 
-            macro, worst5, cell_means = eval_grid_score(
+            macro, worst5, il_mean, ao_mean, ol_mean = eval_grid_score(
                 workers=workers,
                 agent_state_cpu=agent_state_cpu,
                 session_K=session_K,
@@ -1163,9 +1173,10 @@ def main():
                 seed=args.seed + 10_000 + update_idx,
             )
             # Use a composite score to avoid "good on easy cells only"
-            eval_score = 0.7 * macro + 0.3 * worst5
+            # eval_score = 0.7 * macro + 0.3 * worst5
+            eval_score = il_mean + ao_mean + ol_mean  # simpler unweighted sum of means
 
-            print(f"[eval upd {update_idx:04d}] macro={macro:.2f} worst5={worst5:.2f} score={eval_score:.2f}")
+            print(f"[eval upd {update_idx:04d}] il_mean={il_mean:.2f} ao_mean={ao_mean:.2f} ol_mean={ol_mean:.2f} macro={macro:.2f} worst5={worst5:.2f} eval_score={eval_score:.2f}")
 
             writer.add_scalar("EvalGrid/macro", macro, update_idx)
             writer.add_scalar("EvalGrid/worst5", worst5, update_idx)
