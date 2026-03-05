@@ -926,7 +926,7 @@ def main():
                         help='Run post-training eval on a grid of (teacher_mode × p_lo) and save plots/CSV.')
     parser.add_argument('--no-post-grid-eval', dest='post_grid_eval', action='store_false',
                         help='Disable post-training grid eval.')
-    parser.add_argument('--post-grid-sessions-per-cell', type=int, default=50,
+    parser.add_argument('--post-grid-sessions-per-cell', type=int, default=20,
                         help='Eval sessions per grid cell (teacher_mode × p_lo).')
 
     # Backward-compat alias
@@ -1321,7 +1321,8 @@ def main():
     # -----------------------------
     if args.post_grid_eval:
         p_hi = float(args.p_hi)
-        p_lo_grid = np.linspace(float(args.p_lo_max), float(args.p_lo_min), int(args.p_lo_steps))
+        # p_lo_grid = np.linspace(float(args.p_lo_max), float(args.p_lo_min), int(args.p_lo_steps))
+        p_lo_grid = P_LO_GRID_DEFAULT  # fixed p_lo values for clearer plots (can be overridden by args)
         teacher_modes = TEACHER_MODES_DEFAULT
 
         print(f"[PostGrid] Evaluating {len(p_lo_grid)} p_lo values × {len(teacher_modes)} teacher modes = {len(p_lo_grid)*len(teacher_modes)} cells")
