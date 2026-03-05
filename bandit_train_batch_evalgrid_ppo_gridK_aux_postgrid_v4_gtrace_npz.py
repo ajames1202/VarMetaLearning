@@ -156,9 +156,9 @@ def eval_grid_score(
         ol_scores.setdefault(cell, []).append((cum_rew_ol))
 
     # cell_means = {k: float(np.mean(v)) for k, v in cell_scores.items()}
-    il_mean = [float(np.mean(v)) for v in il_scores.values()].mean() #mean il over all rollouts
-    ao_mean = [float(np.mean(v)) for v in ao_scores.values()].mean() #mean ao over all rollouts
-    ol_mean = [float(np.mean(v)) for v in ol_scores.values()].mean() #mean ol over all rollouts
+    il_mean = float(np.mean([np.mean(v) for v in il_scores.values()])) #mean il over all rollouts
+    ao_mean = float(np.mean([np.mean(v) for v in ao_scores.values()])) #mean ao over all rollouts
+    ol_mean = float(np.mean([np.mean(v) for v in ol_scores.values()])) #mean ol over all rollouts
     all_scores = np.array([il_mean, ao_mean, ol_mean], dtype=np.float32)
     macro_avg = float(all_scores.mean()) if all_scores.size else 0.0
     worst5_avg = float(np.sort(all_scores)[: min(5, all_scores.size)].mean()) if all_scores.size else 0.0
