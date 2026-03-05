@@ -447,7 +447,7 @@ class BanditLearner(nn.Module):
         # reward only credited on self-choice trials with observed feedback
         rew = (rwd01 * (mask_self_choice & rwd_obs).float())  # (T,B)
 
-        # ---------- sparse GAE using rollout-time values ----------
+        # ---------- GAE using rollout-time values ----------
         r_il = rew * mask_IL.float()
         r_ao = rew * mask_AOs.float()
         r_ol = rew * mask_OLs.float()
@@ -638,33 +638,6 @@ class BanditLearner(nn.Module):
                 ent_loss = ent_mb.mean()
 
                 loss = pg_loss + vf_coef * v_loss - ent_coef * ent_loss
-
-                # ----- auxiliary losses on observation trials -----
-                # AO-o: imitate teacher action using q_teacher_ao logits (cross-entropy)
-                # OL-o: predict observed teacher reward on chosen arm using q_teacher_ol (BCE-with-logits)
-                aux_ao = torch.zeros((), device=device)
-                aux_ol = torch.zeros((), device=device)
-
-                if (Nobs > 0) and ((aux_ao_coef != 0.0) or (aux_ol_coef != 0.0)):
-                    # AO-o: imitate teacher action (over *all* AO-o steps)
-                    if (aux_ao_coef != 0.0) and mask_AOo.any():
-                        logits_ao = q_teacher_ao[mask_AOo]      # (N_AOo,2)
-                        targ_ao = actions[mask_AOo].long()      # (N_AOo,)
-                        aux_ao = F.cross_entropy(logits_ao, targ_ao)
-
-                    # OL-o: predict observed teacher reward on chosen arm (over *all* OL-o steps)
-                    ol_mask = (mask_OLo & rwd_obs)
-                    if (aux_ol_coef != 0.0) and ol_mask.any():
-                        logits_ol = q_teacher_ol[ol_mask]       # (N_OLo,2)
-                        targ_act = actions[ol_mask].long()      # (N_OLo,)
-                        chosen_logit = logits_ol.gather(-1, targ_act.unsqueeze(-1)).squeeze(-1)
-                        aux_ol = F.binary_cross_entropy_with_logits(
-                            chosen_logit,
-                            rwd01[ol_mask],
-                        )
-
-                # scale aux so its total weight per PPO epoch doesn't grow with #minibatches
-                loss = loss + aux_scale * (aux_ao_coef * aux_ao + aux_ol_coef * aux_ol)
 
                 loss.backward()
 
