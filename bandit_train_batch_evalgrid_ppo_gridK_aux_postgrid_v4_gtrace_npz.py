@@ -971,6 +971,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent.to(device)
 
+    plot_dir = os.path.join(args.save_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+
+
     # Ray init
     if not ray.is_initialized():
         tmp_dir = os.path.expanduser("~/tmp/ray")
@@ -1186,7 +1193,7 @@ def main():
                 best_eval = eval_score
                 bad_evals = 0
                 save_checkpoint(
-                    os.path.join(args.save_dir, "best.pt"),
+                    os.path.join(args.run_dir, "best.pt"),
                     agent, optim_bandit, optim_motor,
                     extra={
                         "update": update_idx,
@@ -1214,7 +1221,7 @@ def main():
     # -----------------------------
     # Load best checkpoint
     # -----------------------------
-    ckpt_path = os.path.join(args.save_dir, "best.pt")
+    ckpt_path = os.path.join(args.run_dir, "best.pt")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     best_extra = ckpt.get("extra", {})
     best_update = best_extra.get("update", -1)
@@ -1310,11 +1317,6 @@ def main():
     # plt.close(fig)
 
 
-    plot_dir = os.path.join(args.save_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
-
-    run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
-    os.makedirs(run_dir, exist_ok=True)
 
     # -----------------------------
     # Post-training grid eval (optional): teacher modes × reward probs
