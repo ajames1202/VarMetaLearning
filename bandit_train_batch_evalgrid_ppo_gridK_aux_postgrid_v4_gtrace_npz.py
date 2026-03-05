@@ -706,9 +706,17 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     bandit_rewards_arr = np.asarray(bandit_rewards_buf, dtype=np.float32)
     trial_cond_arr = np.asarray(trial_cond_buf)
 
-    cum_rewards_il = float(bandit_rewards_arr[trial_cond_arr == "IL"].sum())
-    cum_rewards_ao = float(bandit_rewards_arr[trial_cond_arr == "AO-s"].sum())
-    cum_rewards_ol = float(bandit_rewards_arr[trial_cond_arr == "OL-s"].sum())
+    mask_il = (trial_cond_arr == "IL")
+    mask_ao = (trial_cond_arr == "AO-s")
+    mask_ol = (trial_cond_arr == "OL-s")
+
+    mean_r_il = float(bandit_rewards_arr[mask_il].mean()) if mask_il.any() else 0.0
+    mean_r_ao = float(bandit_rewards_arr[mask_ao].mean()) if mask_ao.any() else 0.0
+    mean_r_ol = float(bandit_rewards_arr[mask_ol].mean()) if mask_ol.any() else 0.0
+
+    cum_rewards_il = mean_r_il * float(session_N)   # session_N=12 → range ~[0,12]
+    cum_rewards_ao = mean_r_ao * float(session_N)
+    cum_rewards_ol = mean_r_ol * float(session_N)
 
     pct_hi_il = 100.0 * float(hi_cnt_il) / float(max(tot_il, 1))
     pct_hi_ao = 100.0 * float(hi_cnt_ao) / float(max(tot_ao, 1))
@@ -896,8 +904,8 @@ def main():
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
-    parser.add_argument('--warmup-updates', type=int, default=100)
-    parser.add_argument('--patience-evals', type=int, default=10)
+    parser.add_argument('--warmup-updates', type=int, default=500)
+    parser.add_argument('--patience-evals', type=int, default=50)
     parser.add_argument('--min-delta', type=float, default=0.25)
 
     # Post-training eval / plots
@@ -1086,9 +1094,9 @@ def main():
                 batch_v_old.append(torch.as_tensor(np.stack(v_old_buf), dtype=torch.float32))
 
 
-                cum_rewards_list_il.append(pct_hi_il)
-                cum_rewards_list_ao.append(pct_hi_ao)
-                cum_rewards_list_ol.append(pct_hi_ol)
+                cum_rewards_list_il.append(cum_rewards_il)
+                cum_rewards_list_ao.append(cum_rewards_ao)
+                cum_rewards_list_ol.append(cum_rewards_ol)
 
                 cum_high_reward_choices_il.append(high_reward_choices_il)
                 cum_high_reward_choices_ao.append(high_reward_choices_ao)
@@ -1204,91 +1212,98 @@ def main():
     agent.load_state_dict(ckpt["model_state"])
     agent.eval()
 
-    # -----------------------------
-    # Fixed-prob eval + per-trial plot
-    # -----------------------------
-    eval_il = []
-    eval_ao = []
-    eval_ol = []
+    # # -----------------------------
+    # # Fixed-prob eval + per-trial plot
+    # # -----------------------------
+    # eval_il = []
+    # eval_ao = []
+    # eval_ol = []
 
-    mean_cum_rew_il = 0.0
-    mean_cum_rew_ao = 0.0
-    mean_cum_rew_ol = 0.0
+    # mean_cum_rew_il = 0.0
+    # mean_cum_rew_ao = 0.0
+    # mean_cum_rew_ol = 0.0
 
-    rng_eval = np.random.default_rng(args.seed + 999)
-    agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
+    # rng_eval = np.random.default_rng(args.seed + 999)
+    # agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
 
-    probs_eval = [(0.2, 0.8) if rng_eval.random() < 0.5 else (0.8, 0.2) for _ in range(session_K)]
+    # probs_eval = [(0.2, 0.8) if rng_eval.random() < 0.5 else (0.8, 0.2) for _ in range(session_K)]
 
-    futures = []
-    for i in range(args.eval_sessions):
-        futures.append(
-            workers[i % len(workers)].run_session.remote(
-                agent_state_cpu,
-                probs_this_session=probs_eval,
-                print_this_session=False,
-                return_obs=False
-            )
-        )
-    results = ray.get(futures)
+    # futures = []
+    # for i in range(args.eval_sessions):
+    #     futures.append(
+    #         workers[i % len(workers)].run_session.remote(
+    #             agent_state_cpu,
+    #             probs_this_session=probs_eval,
+    #             print_this_session=False,
+    #             return_obs=False
+    #         )
+    #     )
+    # results = ray.get(futures)
 
-    for res in results:
-        (
-            _, _, _,
-            _, _, _, _,
-            _, _,
-            _,  # teacher_correct_buf
-            cum_rew_il, cum_rew_ao, cum_rew_ol,
-            pct_hi_il, pct_hi_ao, pct_hi_ol,
-            high_reward_choices_il,
-            high_reward_choices_ao,
-            high_reward_choices_ol,
-            _, _,  # logp_old_buf, v_old_buf
-            _, _   # g_trace_ao, g_trace_ol
-        ) = res
+    # for res in results:
+    #     (
+    #         _, _, _,
+    #         _, _, _, _,
+    #         _, _,
+    #         _,  # teacher_correct_buf
+    #         cum_rew_il, cum_rew_ao, cum_rew_ol,
+    #         pct_hi_il, pct_hi_ao, pct_hi_ol,
+    #         high_reward_choices_il,
+    #         high_reward_choices_ao,
+    #         high_reward_choices_ol,
+    #         _, _,  # logp_old_buf, v_old_buf
+    #         _, _   # g_trace_ao, g_trace_ol
+    #     ) = res
 
-        eval_il.append(high_reward_choices_il)
-        eval_ao.append(high_reward_choices_ao)
-        eval_ol.append(high_reward_choices_ol)
+    #     eval_il.append(high_reward_choices_il)
+    #     eval_ao.append(high_reward_choices_ao)
+    #     eval_ol.append(high_reward_choices_ol)
 
-        mean_cum_rew_il += cum_rew_il
-        mean_cum_rew_ao += cum_rew_ao
-        mean_cum_rew_ol += cum_rew_ol
+    #     mean_cum_rew_il += cum_rew_il
+    #     mean_cum_rew_ao += cum_rew_ao
+    #     mean_cum_rew_ol += cum_rew_ol
 
-    mean_il = np.array(eval_il).mean(axis=0)
-    mean_ao = np.array(eval_ao).mean(axis=0)
-    mean_ol = np.array(eval_ol).mean(axis=0)
+    # mean_il = np.array(eval_il).mean(axis=0)
+    # mean_ao = np.array(eval_ao).mean(axis=0)
+    # mean_ol = np.array(eval_ol).mean(axis=0)
 
-    mean_cum_rew_il /= args.eval_sessions
-    mean_cum_rew_ao /= args.eval_sessions
-    mean_cum_rew_ol /= args.eval_sessions
+    # mean_cum_rew_il /= args.eval_sessions
+    # mean_cum_rew_ao /= args.eval_sessions
+    # mean_cum_rew_ol /= args.eval_sessions
 
-    print(f"Eval results over {args.eval_sessions} sessions:")
-    print(f" Mean cum reward IL: {mean_cum_rew_il:.1f}, AO: {mean_cum_rew_ao:.1f}, OL: {mean_cum_rew_ol:.1f}")
-    print(f" Mean high-reward choices per session IL: {mean_il.sum():.1f}, AO: {mean_ao.sum():.1f}, OL: {mean_ol.sum():.1f}")
+    # print(f"Eval results over {args.eval_sessions} sessions:")
+    # print(f" Mean cum reward IL: {mean_cum_rew_il:.1f}, AO: {mean_cum_rew_ao:.1f}, OL: {mean_cum_rew_ol:.1f}")
+    # print(f" Mean high-reward choices per session IL: {mean_il.sum():.1f}, AO: {mean_ao.sum():.1f}, OL: {mean_ol.sum():.1f}")
+
+    # plot_dir = os.path.join(args.save_dir, "plots")
+    # os.makedirs(plot_dir, exist_ok=True)
+
+    # run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
+    # os.makedirs(run_dir, exist_ok=True)
+
+
+    # fig, ax = plt.subplots(figsize=(6, 4))
+    # trials = np.arange(session_N)
+    # ax.plot(trials, mean_il, label="IL")
+    # ax.plot(trials, mean_ao, label="AO")
+    # ax.plot(trials, mean_ol, label="OL")
+    # ax.set_xlabel("Trial index")
+    # ax.set_ylabel("Mean high-reward choice")
+    # ax.set_title("Per-trial performance (best checkpoint)")
+    # ax.legend()
+    # ax.grid(True)
+
+    # plot_path = os.path.join(run_dir, "PerTrialReward.png")
+    # fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    # writer.add_figure("Eval/PerTrialReward", fig)
+    # plt.close(fig)
+
 
     plot_dir = os.path.join(args.save_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
     run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
-
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    trials = np.arange(session_N)
-    ax.plot(trials, mean_il, label="IL")
-    ax.plot(trials, mean_ao, label="AO")
-    ax.plot(trials, mean_ol, label="OL")
-    ax.set_xlabel("Trial index")
-    ax.set_ylabel("Mean high-reward choice")
-    ax.set_title("Per-trial performance (best checkpoint)")
-    ax.legend()
-    ax.grid(True)
-
-    plot_path = os.path.join(run_dir, "PerTrialReward.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    writer.add_figure("Eval/PerTrialReward", fig)
-    plt.close(fig)
 
     # -----------------------------
     # Post-training grid eval (optional): teacher modes × reward probs
