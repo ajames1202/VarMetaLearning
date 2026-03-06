@@ -26,7 +26,7 @@ import ray
 import visual_bandit_env3 as vbe
 
 # Prefer updated learner if present; fall back to original.
-import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
+import var_bandit_learner2_ppo_beliefsplit_probmix as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
@@ -152,9 +152,9 @@ def eval_grid_score(
         # pct_hi_il = float(res[13])
         # pct_hi_ao = float(res[14])
         # pct_hi_ol = float(res[15])
-        cum_rew_il = float(res[10])
-        cum_rew_ao = float(res[11])
-        cum_rew_ol = float(res[12])
+        cum_rew_il = float(res[11])
+        cum_rew_ao = float(res[12])
+        cum_rew_ol = float(res[13])
         cell = (p_lo, mode_name)
         il_scores.setdefault(cell, []).append((cum_rew_il))
         ao_scores.setdefault(cell, []).append((cum_rew_ao))
@@ -401,106 +401,163 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         ctx_attn = agent._safe_causal_attn(q_tok, k, v, kpm)  # (1,1,H)
         return agent.attn_ln(ctx_attn + q_tok)
 
-    def _choice_logits(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
-        """Compute (1,1,2) action logits for self-choice trials."""
+    def _belief_policy_value(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor):
+        """Compute detached control policy/value and current belief summaries for one trial."""
         ql = agent.q_in(lf).unsqueeze(0)  # (1,1,H)
         qr = agent.q_in(rf).unsqueeze(0)  # (1,1,H)
 
         lf_seq = lf.unsqueeze(0)  # (1,1,F)
         rf_seq = rf.unsqueeze(0)  # (1,1,F)
 
-        if curr_cond == "IL":
-            ctx_l = _ctx_for(ql, {"IL"})
-            ctx_r = _ctx_for(qr, {"IL"})
-            log_l = agent._head(agent.q_base, ctx_l, lf_seq)
-            log_r = agent._head(agent.q_base, ctx_r, rf_seq)
-            return torch.cat([log_l, log_r], dim=-1), None, None
-
-        if curr_cond == "AO-s":
-            ctx_l_s = _ctx_for(ql, {"AO-s"})
-            ctx_r_s = _ctx_for(qr, {"AO-s"})
-            base_l = agent._head(agent.q_base, ctx_l_s, lf_seq)
-            base_r = agent._head(agent.q_base, ctx_r_s, rf_seq)
-            base = torch.cat([base_l, base_r], dim=-1)
-
-            # correction from observed-teacher-action history
-            ctx_l_o = _ctx_for(ql, {"AO-o"})
-            ctx_r_o = _ctx_for(qr, {"AO-o"})
-            d_l = agent._head(agent.q_delta_ao, ctx_l_o, lf_seq)
-            d_r = agent._head(agent.q_delta_ao, ctx_r_o, rf_seq)
-            delta = torch.cat([d_l, d_r], dim=-1)
-
-            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
-            g = torch.sigmoid(agent.gate_ao(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta_f = delta * g
-
-            has_prev_ao = any(c in ("AO-o") for c in cond_tokens)
-            logit_final = base + delta_f if has_prev_ao else base
-
-            return logit_final, delta, g
-        if curr_cond == "OL-s":
-            ctx_l_s = _ctx_for(ql, {"OL-s"})
-            ctx_r_s = _ctx_for(qr, {"OL-s"})
-            base_l = agent._head(agent.q_base, ctx_l_s, lf_seq)
-            base_r = agent._head(agent.q_base, ctx_r_s, rf_seq)
-            base = torch.cat([base_l, base_r], dim=-1)
-
-            # correction from observed-teacher-feedback history
-            ctx_l_o = _ctx_for(ql, {"OL-o"})
-            ctx_r_o = _ctx_for(qr, {"OL-o"})
-            d_l = agent._head(agent.q_delta_ol, ctx_l_o, lf_seq)
-            d_r = agent._head(agent.q_delta_ol, ctx_r_o, rf_seq)
-            delta = torch.cat([d_l, d_r], dim=-1)
-
-            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
-            g = torch.sigmoid(agent.gate_ol(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta = delta * g
-
-            has_prev_ol = any(c in ("OL-o") for c in cond_tokens)
-            logit_final = base + delta if has_prev_ol else base
-            return logit_final, delta, g
-
-        # Fallback: treat unknown as IL
-        ctx_l = _ctx_for(ql, {"IL"})
-        ctx_r = _ctx_for(qr, {"IL"})
-        log_l = agent._head(agent.q_base, ctx_l, lf_seq)
-        log_r = agent._head(agent.q_base, ctx_r, rf_seq)
-        return torch.cat([log_l, log_r], dim=-1)
-    
-    def _value_pred(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
-        ql = agent.q_in(lf).unsqueeze(0)  # (1,1,H)
-        qr = agent.q_in(rf).unsqueeze(0)
+        zeros_ctx_l = torch.zeros_like(ql)
+        zeros_ctx_r = torch.zeros_like(qr)
+        zeros_logits = torch.zeros((1, 1, 2), device=device, dtype=lf.dtype)
+        zeros_gate = torch.zeros((1, 1, 1), device=device, dtype=lf.dtype)
 
         if curr_cond == "IL":
-            ctx_l_s = _ctx_for(ql, {"IL"})
-            ctx_r_s = _ctx_for(qr, {"IL"})
-            ctx_l_o = torch.zeros_like(ctx_l_s)
-            ctx_r_o = torch.zeros_like(ctx_r_s)
+            ctx_l_cur = _ctx_for(ql, {"IL"})
+            ctx_r_cur = _ctx_for(qr, {"IL"})
+            ctx_l_obs = zeros_ctx_l
+            ctx_r_obs = zeros_ctx_r
+
+            q_self_logits = torch.cat([
+                agent._head(agent.q_base, ctx_l_cur, lf_seq),
+                agent._head(agent.q_base, ctx_r_cur, rf_seq),
+            ], dim=-1)
+            q_teacher_ao = zeros_logits
+            q_teacher_ol = zeros_logits
+            g_ao = zeros_gate
+            g_ol = zeros_gate
+            use_ao = zeros_gate
+            use_ol = zeros_gate
 
         elif curr_cond == "AO-s":
-            ctx_l_s = _ctx_for(ql, {"AO-s"})
-            ctx_r_s = _ctx_for(qr, {"AO-s"})
-            ctx_l_o = _ctx_for(ql, {"AO-o"})
-            ctx_r_o = _ctx_for(qr, {"AO-o"})
+            ctx_l_cur = _ctx_for(ql, {"AO-s"})
+            ctx_r_cur = _ctx_for(qr, {"AO-s"})
+            ctx_l_obs = _ctx_for(ql, {"AO-o"})
+            ctx_r_obs = _ctx_for(qr, {"AO-o"})
+
+            q_self_logits = torch.cat([
+                agent._head(agent.q_base, ctx_l_cur, lf_seq),
+                agent._head(agent.q_base, ctx_r_cur, rf_seq),
+            ], dim=-1)
+            q_teacher_ao = torch.cat([
+                agent._head(agent.q_delta_ao, ctx_l_obs, lf_seq),
+                agent._head(agent.q_delta_ao, ctx_r_obs, rf_seq),
+            ], dim=-1)
+            q_teacher_ol = zeros_logits
+            g_ao = torch.sigmoid(agent.gate_ao(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))).clamp(0.0, 1.0)
+            g_ol = zeros_gate
+            use_ao = torch.full_like(g_ao, 1.0 if any(c == "AO-o" for c in cond_tokens) else 0.0)
+            use_ol = zeros_gate
 
         elif curr_cond == "OL-s":
-            ctx_l_s = _ctx_for(ql, {"OL-s"})
-            ctx_r_s = _ctx_for(qr, {"OL-s"})
-            ctx_l_o = _ctx_for(ql, {"OL-o"})
-            ctx_r_o = _ctx_for(qr, {"OL-o"})
+            ctx_l_cur = _ctx_for(ql, {"OL-s"})
+            ctx_r_cur = _ctx_for(qr, {"OL-s"})
+            ctx_l_obs = _ctx_for(ql, {"OL-o"})
+            ctx_r_obs = _ctx_for(qr, {"OL-o"})
+
+            q_self_logits = torch.cat([
+                agent._head(agent.q_base, ctx_l_cur, lf_seq),
+                agent._head(agent.q_base, ctx_r_cur, rf_seq),
+            ], dim=-1)
+            q_teacher_ao = zeros_logits
+            q_teacher_ol = torch.cat([
+                agent._head(agent.q_delta_ol, ctx_l_obs, lf_seq),
+                agent._head(agent.q_delta_ol, ctx_r_obs, rf_seq),
+            ], dim=-1)
+            g_ao = zeros_gate
+            g_ol = torch.sigmoid(agent.gate_ol(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))).clamp(0.0, 1.0)
+            use_ao = zeros_gate
+            use_ol = torch.full_like(g_ol, 1.0 if any(c == "OL-o" for c in cond_tokens) else 0.0)
+
+        elif curr_cond == "AO-o":
+            ctx_l_cur = zeros_ctx_l
+            ctx_r_cur = zeros_ctx_r
+            ctx_l_obs = _ctx_for(ql, {"AO-o"})
+            ctx_r_obs = _ctx_for(qr, {"AO-o"})
+            q_self_logits = zeros_logits
+            q_teacher_ao = torch.cat([
+                agent._head(agent.q_delta_ao, ctx_l_obs, lf_seq),
+                agent._head(agent.q_delta_ao, ctx_r_obs, rf_seq),
+            ], dim=-1)
+            q_teacher_ol = zeros_logits
+            g_ao = zeros_gate
+            g_ol = zeros_gate
+            use_ao = zeros_gate
+            use_ol = zeros_gate
+
+        elif curr_cond == "OL-o":
+            ctx_l_cur = zeros_ctx_l
+            ctx_r_cur = zeros_ctx_r
+            ctx_l_obs = _ctx_for(ql, {"OL-o"})
+            ctx_r_obs = _ctx_for(qr, {"OL-o"})
+            q_self_logits = zeros_logits
+            q_teacher_ao = zeros_logits
+            q_teacher_ol = torch.cat([
+                agent._head(agent.q_delta_ol, ctx_l_obs, lf_seq),
+                agent._head(agent.q_delta_ol, ctx_r_obs, rf_seq),
+            ], dim=-1)
+            g_ao = zeros_gate
+            g_ol = zeros_gate
+            use_ao = zeros_gate
+            use_ol = zeros_gate
 
         else:
-            # AO-o / OL-o: no policy update, but value can still be trained
-            ctx_l_s = _ctx_for(ql, {curr_cond})
-            ctx_r_s = _ctx_for(qr, {curr_cond})
-            ctx_l_o = torch.zeros_like(ctx_l_s)
-            ctx_r_o = torch.zeros_like(ctx_r_s)
+            ctx_l_cur = _ctx_for(ql, {"IL"})
+            ctx_r_cur = _ctx_for(qr, {"IL"})
+            ctx_l_obs = zeros_ctx_l
+            ctx_r_obs = zeros_ctx_r
+            q_self_logits = torch.cat([
+                agent._head(agent.q_base, ctx_l_cur, lf_seq),
+                agent._head(agent.q_base, ctx_r_cur, rf_seq),
+            ], dim=-1)
+            q_teacher_ao = zeros_logits
+            q_teacher_ol = zeros_logits
+            g_ao = zeros_gate
+            g_ol = zeros_gate
+            use_ao = zeros_gate
+            use_ol = zeros_gate
 
-        v_in = torch.cat(
-            [ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o, lf.unsqueeze(0), rf.unsqueeze(0)],
-            dim=-1
-        )  # (1,1,4H+2F)
-        v = agent.v_head(v_in)  # (1,1,1)
+        p_self = torch.sigmoid(q_self_logits)
+        p_teacher_ao = torch.sigmoid(q_teacher_ao)
+        p_teacher_ol = torch.sigmoid(q_teacher_ol)
+
+        p_belief = p_self
+        if curr_cond == "AO-s":
+            p_belief = torch.where(use_ao.bool(), (1.0 - g_ao) * p_belief + g_ao * p_teacher_ao, p_belief)
+        elif curr_cond == "OL-s":
+            p_belief = torch.where(use_ol.bool(), (1.0 - g_ol) * p_belief + g_ol * p_teacher_ol, p_belief)
+
+        control_in = agent._control_features(
+            ctx_l_cur.detach(),
+            ctx_r_cur.detach(),
+            ctx_l_obs.detach(),
+            ctx_r_obs.detach(),
+            lf_seq.detach(),
+            rf_seq.detach(),
+            p_self.detach(),
+            p_teacher_ao.detach(),
+            p_teacher_ol.detach(),
+            p_belief.detach(),
+            g_ao.detach(),
+            g_ol.detach(),
+            use_ao.detach(),
+            use_ol.detach(),
+        )
+
+        policy_logits = agent.pi_head(control_in)
+        v = agent.v_head(control_in)
+        belief_delta = p_belief - p_self
+        gate_out = g_ao if curr_cond == "AO-s" else (g_ol if curr_cond == "OL-s" else None)
+        return policy_logits, v, belief_delta, gate_out
+
+    def _choice_logits(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
+        logits, _, belief_delta, gate_out = _belief_policy_value(curr_cond, lf, rf)
+        return logits, belief_delta, gate_out
+
+    def _value_pred(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
+        _, v, _, _ = _belief_policy_value(curr_cond, lf, rf)
         return v
 
     while not done:
@@ -870,7 +927,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
                  batch_actor, batch_trial_cond, batch_teacher_correct,
-                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5):
+                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -889,6 +946,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
         ppo_epochs=ppo_epochs,
         ppo_minibatch_size=ppo_minibatch_size,
         aux_mb_size=aux_mb_size,
+        self_bce_coef=self_bce_coef,
         aux_ao_coef=aux_ao_coef,
         aux_ol_coef=aux_ol_coef,
     )
@@ -902,7 +960,7 @@ def main():
     # If you want *balanced* training over the full 5×4 grid each update:
     #   episodes_per_update = grid_repeats * 20
     parser.add_argument('--grid-repeats', type=int, default=1,
-                        help='K repeats of the full 20-cell (p_lo × teacher_mode) grid per update. B = K*num_grid_cells')
+                        help='K repeats of the full num_grid_cells-cell (p_lo × teacher_mode) grid per update. B = K*num_grid_cells')
     parser.add_argument('--episodes-per-update', type=int, default=num_grid_cells,
                         help='Rollout sessions per update (B). If --grid-repeats is set, B will be overridden to K*num_grid_cells.')
     parser.add_argument('--num-updates', type=int, default=1500)
@@ -913,6 +971,7 @@ def main():
 
     # Aux losses (supervised) for observation trials
     parser.add_argument('--aux-mb-size', type=int, default=256)
+    parser.add_argument('--self-bce-coef', type=float, default=1.0, help='Self-choice fused-belief BCE weight')
     parser.add_argument('--aux-ao-coef', type=float, default=0.2, help='AO-o teacher action imitation weight')
     parser.add_argument('--aux-ol-coef', type=float, default=0.5, help='OL-o teacher reward prediction weight')
 
@@ -951,7 +1010,7 @@ def main():
     writer = SummaryWriter(log_dir)
 
     session_K = 3
-    session_N = 12
+    session_N = 30
 
     hidden_size = 128
     feature_dim = 128
@@ -979,7 +1038,7 @@ def main():
     plot_dir = os.path.join(args.save_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
-    run_dir = os.path.join(plot_dir, "cnn_attn5", datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
+    run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
 
 
@@ -1008,7 +1067,7 @@ def main():
     else:
         B = int(args.episodes_per_update)
         if B % num_grid_cells != 0:
-            raise ValueError(f'episodes-per-update must be a multiple of {num_grid_cells} episodes).')
+            raise ValueError(f'episodes-per-update must be a multiple of {num_grid_cells} ({len(P_LO_GRID_DEFAULT)} p_lo × {len(TEACHER_MODES_DEFAULT)} teacher modes).')
 
     W = args.num_workers
 
@@ -1021,7 +1080,7 @@ def main():
     train_cells = [(float(p_lo), mode_name, cfg)
                    for p_lo in P_LO_GRID_DEFAULT
                    for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
-    assert len(train_cells) == num_grid_cells, f'Expected {num_grid_cells} grid cells, got {len(train_cells)}'
+    assert len(train_cells) == 20, f'Expected 20 grid cells, got {len(train_cells)}'
 
 
     for update_idx in range(num_updates):
@@ -1146,6 +1205,10 @@ def main():
             device,
             ppo_epochs=args.ppo_epochs,
             ppo_minibatch_size=args.ppo_minibatch_size,
+            aux_mb_size=args.aux_mb_size,
+            self_bce_coef=args.self_bce_coef,
+            aux_ao_coef=args.aux_ao_coef,
+            aux_ol_coef=args.aux_ol_coef,
         )
 
         mean_cum_rew_il = float(np.mean(cum_rewards_list_il))
@@ -1198,7 +1261,7 @@ def main():
                 best_eval = eval_score
                 bad_evals = 0
                 save_checkpoint(
-                    os.path.join(run_dir, "best.pt"),
+                    os.path.join(args.run_dir, "best.pt"),
                     agent, optim_bandit, optim_motor,
                     extra={
                         "update": update_idx,
@@ -1226,7 +1289,7 @@ def main():
     # -----------------------------
     # Load best checkpoint
     # -----------------------------
-    ckpt_path = os.path.join(run_dir, "best.pt")
+    ckpt_path = os.path.join(args.run_dir, "best.pt")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     best_extra = ckpt.get("extra", {})
     best_update = best_extra.get("update", -1)
