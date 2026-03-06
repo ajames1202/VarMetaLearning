@@ -89,11 +89,15 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
 P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
 
 # Teacher modes (env attributes are set only if they exist)
+# TEACHER_MODES_DEFAULT = [
+#     ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
+#     ("slow",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
+#     ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.50, 0.50], "tau": [0.33, 0.33, 0.33]}),
+#     ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+# ]
+
 TEACHER_MODES_DEFAULT = [
-    ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
-    ("slow",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.05, 0.05], "tau": [0.33, 0.33, 0.33]}),
-    ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.50, 0.50], "tau": [0.33, 0.33, 0.33]}),
-    ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+    ("learning",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
 ]
 
 # Keys used by teacher configs; used to reset env attrs each session to avoid cross-contamination.
