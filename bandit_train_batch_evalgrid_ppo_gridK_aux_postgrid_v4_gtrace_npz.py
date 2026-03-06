@@ -100,6 +100,8 @@ TEACHER_MODES_DEFAULT = [
     ("learning",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
 ]
 
+num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
+
 # Keys used by teacher configs; used to reset env attrs each session to avoid cross-contamination.
 TEACHER_CFG_KEYS = sorted({k for _, cfg in TEACHER_MODES_DEFAULT for k in cfg.keys()})
 
@@ -904,7 +906,7 @@ def main():
                         help='K repeats of the full 20-cell (p_lo × teacher_mode) grid per update. B = K*20')
     parser.add_argument('--episodes-per-update', type=int, default=20,
                         help='Rollout sessions per update (B). If --grid-repeats is set, B will be overridden to K*20.')
-    parser.add_argument('--num-updates', type=int, default=1000)
+    parser.add_argument('--num-updates', type=int, default=1500)
 
     # PPO inner-loop
     parser.add_argument('--ppo-epochs', type=int, default=4)
@@ -918,7 +920,7 @@ def main():
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
-    parser.add_argument('--warmup-updates', type=int, default=1000)
+    parser.add_argument('--warmup-updates', type=int, default=800)
     parser.add_argument('--patience-evals', type=int, default=100)
     parser.add_argument('--min-delta', type=float, default=1.5)
 
@@ -950,7 +952,7 @@ def main():
     writer = SummaryWriter(log_dir)
 
     session_K = 3
-    session_N = 12
+    session_N = 30
 
     hidden_size = 128
     feature_dim = 128
@@ -1001,13 +1003,13 @@ def main():
     if args.grid_repeats is not None:
         if args.grid_repeats < 1:
             raise ValueError('--grid-repeats must be >= 1')
-        B = int(args.grid_repeats) * 20
+        B = int(args.grid_repeats) * num_grid_cells
         if args.episodes_per_update is not None and int(args.episodes_per_update) != B:
             print(f'[info] Overriding --episodes-per-update={args.episodes_per_update} -> {B} because --grid-repeats={args.grid_repeats}')
     else:
         B = int(args.episodes_per_update)
-        if B % 20 != 0:
-            raise ValueError('episodes-per-update must be a multiple of 20 (5 p_lo × 4 teacher modes).')
+        if B % num_grid_cells != 0:
+            raise ValueError(f'episodes-per-update must be a multiple of {num_grid_cells} ({len(P_LO_GRID_DEFAULT)} p_lo × {len(TEACHER_MODES_DEFAULT)} teacher modes).')
 
     W = args.num_workers
 
@@ -1020,7 +1022,8 @@ def main():
     train_cells = [(float(p_lo), mode_name, cfg)
                    for p_lo in P_LO_GRID_DEFAULT
                    for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
-    assert len(train_cells) == 20, f'Expected 20 grid cells, got {len(train_cells)}'
+    # assert len(train_cells) == 20, f'Expected 20 grid cells, got {len(train_cells)}'
+    assert len(train_cells) == num_grid_cells, f'Expected {num_grid_cells} grid cells, got {len(train_cells)}'
 
 
     for update_idx in range(num_updates):
