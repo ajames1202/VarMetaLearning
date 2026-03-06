@@ -26,7 +26,7 @@ import ray
 import visual_bandit_env3 as vbe
 
 # Prefer updated learner if present; fall back to original.
-import var_bandit_learner2_ppo_beliefsplit_probmix as bl
+import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
@@ -1080,7 +1080,7 @@ def main():
     train_cells = [(float(p_lo), mode_name, cfg)
                    for p_lo in P_LO_GRID_DEFAULT
                    for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
-    assert len(train_cells) == 20, f'Expected 20 grid cells, got {len(train_cells)}'
+    assert len(train_cells) == num_grid_cells, f'Expected {num_grid_cells} grid cells, got {len(train_cells)}'
 
 
     for update_idx in range(num_updates):

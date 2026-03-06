@@ -462,8 +462,8 @@ class TwoChoiceReachingEnv(gym.Env):
         a = np.array([0.0, 0.0], dtype=np.float32)
 
         if self.obs_trial and not self.expert_teacher and not self.unrealiable_teacher:
-            # print("self.alpha:", self.alpha)
-            # print("self.tau:", self.tau[self.K])
+            # print("K=", self.K, "self.alpha:", self.alpha[self.K])
+            # print("K=", self.K,"self.tau:", self.tau[self.K])
             q_left = self.Q[self.K,self.curr_labels[0]]
             q_right = self.Q[self.K,self.curr_labels[1]]
             prob_right = np.exp(q_right/self.tau[self.K]) / (np.exp(q_left/self.tau[self.K]) + np.exp(q_right/self.tau[self.K]))
@@ -471,7 +471,9 @@ class TwoChoiceReachingEnv(gym.Env):
             if np.random.rand() < prob_right:
                 chosen_side = "right"
             else:
-                chosen_side = "left"    
+                chosen_side = "left" 
+
+            # print(f"[Env] Trial {self.trial_index} (K={self.K}, obs_trial): Q_left={q_left:.2f}, Q_right={q_right:.2f}, prob_right={prob_right:.2f}, chosen_side={chosen_side}, high_reward_side={'right' if self.curr_probs[1] > self.curr_probs[0] else 'left'}")   
             
             
             left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
@@ -485,6 +487,7 @@ class TwoChoiceReachingEnv(gym.Env):
             else:
                 self.cursor = right_c
         elif self.obs_trial and self.expert_teacher:
+            # print(f"[Env] Trial {self.trial_index} (K={self.K}, obs_trial): expert teacher mode")
             high_side = "L" if self.curr_probs[0] >= self.curr_probs[1] else "R"
             chosen_side = high_side if np.random.rand() < self.eps else ("R" if high_side == "L" else "L")
             left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
@@ -496,6 +499,7 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.cursor = right_c
 
         elif self.obs_trial and self.unrealiable_teacher:
+            # print(f"[Env] Trial {self.trial_index} (K={self.K}, obs_trial): unreliable teacher mode")
             chosen_side = "L" if np.random.rand() < 0.5 else "R"  # random choice, ignoring probabilities    
             left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
             right_c = np.array([self.right_rect.centerx, self.right_rect.centery], np.float32)
@@ -506,6 +510,7 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.cursor = right_c
 
         else:  
+            # print(f"[Env] Trial {self.trial_index} (K={self.K}): regular trial with action input")
             a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
             # Scale velocity to pixels/frame
             speed_px = 12.0
@@ -555,7 +560,14 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.high_reward_choice_count_on_right += (1 if chose_side == 1 else 0)
             trial_ended = True
             if self.obs_trial and not self.expert_teacher and not self.unrealiable_teacher:
-                self.Q[self.K,chose_side] += self.alpha[self.K] * (reward - self.Q[self.K,chose_side])
+                chosen_label = self.curr_labels[chose_side]         # label currently shown on chosen side
+                other_label = self.curr_labels[1 - chose_side]      # label on the other side
+
+                self.Q[self.K, chosen_label] += self.alpha[self.K] * (
+                    reward - self.Q[self.K, chosen_label]
+                )
+                # only keep this if you really want complementary values
+                # self.Q[self.K, other_label] = 1.0 - self.Q[self.K, chosen_label]  # keep the other side's Q complementary for simplicity
 
         # Timeout
         if not trial_ended and self.steps_in_trial >= self.steps_per_trial:
