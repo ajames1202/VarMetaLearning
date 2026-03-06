@@ -856,7 +856,7 @@ def main():
     parser.add_argument('--num-updates', type=int, default=1500)
 
     # Bandit BCE full-batch passes
-    parser.add_argument('--bandit-epochs', type=int, default=4)
+    parser.add_argument('--bandit-epochs', type=int, default=1)
     parser.add_argument('--ppo-epochs', dest='bandit_epochs', type=int, help='Deprecated alias for --bandit-epochs')
 
     # Aux losses (supervised) for observation trials
