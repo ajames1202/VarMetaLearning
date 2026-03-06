@@ -26,7 +26,7 @@ import ray
 import visual_bandit_env3 as vbe
 
 # Prefer updated learner if present; fall back to original.
-import var_bandit_learner2_bce_probmix_clean as bl
+import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
