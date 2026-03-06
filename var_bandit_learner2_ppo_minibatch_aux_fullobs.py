@@ -582,12 +582,12 @@ class BanditLearner(nn.Module):
               + ctx_right_ol_s * mask_OLs.unsqueeze(-1).float()
             )
             ctx_left_obs = (
-                ctx_left_ao_o * mask_AOo.unsqueeze(-1).float()
-              + ctx_left_ol_o * mask_OLo.unsqueeze(-1).float()
+                ctx_left_ao_o * mask_AOs.unsqueeze(-1).float()
+              + ctx_left_ol_o * mask_OLs.unsqueeze(-1).float()
             )
             ctx_right_obs = (
-                ctx_right_ao_o * mask_AOo.unsqueeze(-1).float()
-              + ctx_right_ol_o * mask_OLo.unsqueeze(-1).float()
+                ctx_right_ao_o * mask_AOs.unsqueeze(-1).float()
+              + ctx_right_ol_o * mask_OLs.unsqueeze(-1).float()
             )
 
             V = self.v_head(
