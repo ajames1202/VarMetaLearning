@@ -918,9 +918,9 @@ def main():
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
-    parser.add_argument('--warmup-updates', type=int, default=500)
-    parser.add_argument('--patience-evals', type=int, default=50)
-    parser.add_argument('--min-delta', type=float, default=0.25)
+    parser.add_argument('--warmup-updates', type=int, default=1000)
+    parser.add_argument('--patience-evals', type=int, default=100)
+    parser.add_argument('--min-delta', type=float, default=1.5)
 
     # Post-training eval / plots
     parser.add_argument('--eval-sessions', type=int, default=200)
