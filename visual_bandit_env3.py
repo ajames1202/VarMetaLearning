@@ -555,7 +555,13 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.high_reward_choice_count_on_right += (1 if chose_side == 1 else 0)
             trial_ended = True
             if self.obs_trial and not self.expert_teacher and not self.unrealiable_teacher:
-                self.Q[self.K,chose_side] += self.alpha[self.K] * (reward - self.Q[self.K,chose_side])
+                chosen_label = self.curr_labels[chose_side]         # label currently shown on chosen side
+                other_label = self.curr_labels[1 - chose_side]      # label on the other side
+
+                self.Q[self.K, chosen_label] += self.alpha[self.K] * (
+                    reward - self.Q[self.K, chosen_label]
+                )
+
 
         # Timeout
         if not trial_ended and self.steps_in_trial >= self.steps_per_trial:
