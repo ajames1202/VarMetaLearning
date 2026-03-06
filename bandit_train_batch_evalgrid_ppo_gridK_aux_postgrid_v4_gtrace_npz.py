@@ -26,7 +26,7 @@ import ray
 import visual_bandit_env3 as vbe
 
 # Prefer updated learner if present; fall back to original.
-import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
+import var_bandit_learner2_bce_probmix_clean as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
@@ -89,12 +89,19 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
 P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
 
 # Teacher modes (env attributes are set only if they exist)
+# TEACHER_MODES_DEFAULT = [
+#     ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
+#     ("slow",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.05, 0.05], "tau": [0.33, 0.33, 0.33]}),
+#     ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.50, 0.50], "tau": [0.33, 0.33, 0.33]}),
+#     ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+# ]
+
+
 TEACHER_MODES_DEFAULT = [
-    ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
-    ("slow",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.05, 0.05], "tau": [0.33, 0.33, 0.33]}),
-    ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.50, 0.50], "tau": [0.33, 0.33, 0.33]}),
-    ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+    ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
 ]
+
+num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
 
 # Keys used by teacher configs; used to reset env attrs each session to avoid cross-contamination.
 TEACHER_CFG_KEYS = sorted({k for _, cfg in TEACHER_MODES_DEFAULT for k in cfg.keys()})
@@ -222,7 +229,6 @@ def eval_post_grid(
             high_reward_choices_il,
             high_reward_choices_ao,
             high_reward_choices_ol,
-            _, _,  # logp_old_buf, v_old_buf
             g_trace_ao, g_trace_ol,
         ) = res
 
@@ -355,11 +361,6 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     actor_buf = []
     teacher_correct_buf = []
 
-    bandit_action_buf = []
-    bandit_logp_buf   = []
-    bandit_value_buf  = []
-    bandit_policy_mask_buf = []  # 1 for IL/AO-s/OL-s, else 0
-
     # state for the current trial
     curr_trial_condition = None
     left_feats = None
@@ -397,12 +398,13 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         return agent.attn_ln(ctx_attn + q_tok)
 
     def _choice_logits(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
-        """Compute (1,1,2) action logits for self-choice trials."""
+        """Compute (1,1,2) action logits for self-choice trials using probability-space mixing."""
         ql = agent.q_in(lf).unsqueeze(0)  # (1,1,H)
         qr = agent.q_in(rf).unsqueeze(0)  # (1,1,H)
 
         lf_seq = lf.unsqueeze(0)  # (1,1,F)
         rf_seq = rf.unsqueeze(0)  # (1,1,F)
+        eps = 1e-5
 
         if curr_cond == "IL":
             ctx_l = _ctx_for(ql, {"IL"})
@@ -418,21 +420,26 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             base_r = agent._head(agent.q_base, ctx_r_s, rf_seq)
             base = torch.cat([base_l, base_r], dim=-1)
 
-            # correction from observed-teacher-action history
             ctx_l_o = _ctx_for(ql, {"AO-o"})
             ctx_r_o = _ctx_for(qr, {"AO-o"})
             d_l = agent._head(agent.q_delta_ao, ctx_l_o, lf_seq)
             d_r = agent._head(agent.q_delta_ao, ctx_r_o, rf_seq)
             delta = torch.cat([d_l, d_r], dim=-1)
 
-            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
-            g = torch.sigmoid(agent.gate_ao(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta_f = delta * g
+            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)
+            g = torch.sigmoid(agent.gate_ao(g_in)).clamp(0.0, 1.0)
 
-            has_prev_ao = any(c in ("AO-o") for c in cond_tokens)
-            logit_final = base + delta_f if has_prev_ao else base
+            has_prev_ao = any(c == "AO-o" for c in cond_tokens)
+            if has_prev_ao:
+                p_self = torch.sigmoid(base.detach())
+                p_teacher = torch.sigmoid(delta)
+                p_mix = ((1.0 - g) * p_self + g * p_teacher).clamp(eps, 1.0 - eps)
+                logit_final = torch.log(p_mix / (1.0 - p_mix))
+            else:
+                logit_final = base
 
             return logit_final, delta, g
+
         if curr_cond == "OL-s":
             ctx_l_s = _ctx_for(ql, {"OL-s"})
             ctx_r_s = _ctx_for(qr, {"OL-s"})
@@ -440,63 +447,30 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             base_r = agent._head(agent.q_base, ctx_r_s, rf_seq)
             base = torch.cat([base_l, base_r], dim=-1)
 
-            # correction from observed-teacher-feedback history
             ctx_l_o = _ctx_for(ql, {"OL-o"})
             ctx_r_o = _ctx_for(qr, {"OL-o"})
             d_l = agent._head(agent.q_delta_ol, ctx_l_o, lf_seq)
             d_r = agent._head(agent.q_delta_ol, ctx_r_o, rf_seq)
             delta = torch.cat([d_l, d_r], dim=-1)
 
-            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)  # (1,1,4H)
-            g = torch.sigmoid(agent.gate_ol(g_in)).clamp(0.0, 1.0)         # (1,1,1)
-            delta = delta * g
+            g_in = torch.cat([ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o], dim=-1)
+            g = torch.sigmoid(agent.gate_ol(g_in)).clamp(0.0, 1.0)
 
-            has_prev_ol = any(c in ("OL-o") for c in cond_tokens)
-            logit_final = base + delta if has_prev_ol else base
+            has_prev_ol = any(c == "OL-o" for c in cond_tokens)
+            if has_prev_ol:
+                p_self = torch.sigmoid(base.detach())
+                p_teacher = torch.sigmoid(delta)
+                p_mix = ((1.0 - g) * p_self + g * p_teacher).clamp(eps, 1.0 - eps)
+                logit_final = torch.log(p_mix / (1.0 - p_mix))
+            else:
+                logit_final = base
             return logit_final, delta, g
 
-        # Fallback: treat unknown as IL
         ctx_l = _ctx_for(ql, {"IL"})
         ctx_r = _ctx_for(qr, {"IL"})
         log_l = agent._head(agent.q_base, ctx_l, lf_seq)
         log_r = agent._head(agent.q_base, ctx_r, rf_seq)
-        return torch.cat([log_l, log_r], dim=-1)
-    
-    def _value_pred(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
-        ql = agent.q_in(lf).unsqueeze(0)  # (1,1,H)
-        qr = agent.q_in(rf).unsqueeze(0)
-
-        if curr_cond == "IL":
-            ctx_l_s = _ctx_for(ql, {"IL"})
-            ctx_r_s = _ctx_for(qr, {"IL"})
-            ctx_l_o = torch.zeros_like(ctx_l_s)
-            ctx_r_o = torch.zeros_like(ctx_r_s)
-
-        elif curr_cond == "AO-s":
-            ctx_l_s = _ctx_for(ql, {"AO-s"})
-            ctx_r_s = _ctx_for(qr, {"AO-s"})
-            ctx_l_o = _ctx_for(ql, {"AO-o"})
-            ctx_r_o = _ctx_for(qr, {"AO-o"})
-
-        elif curr_cond == "OL-s":
-            ctx_l_s = _ctx_for(ql, {"OL-s"})
-            ctx_r_s = _ctx_for(qr, {"OL-s"})
-            ctx_l_o = _ctx_for(ql, {"OL-o"})
-            ctx_r_o = _ctx_for(qr, {"OL-o"})
-
-        else:
-            # AO-o / OL-o: no policy update, but value can still be trained
-            ctx_l_s = _ctx_for(ql, {curr_cond})
-            ctx_r_s = _ctx_for(qr, {curr_cond})
-            ctx_l_o = torch.zeros_like(ctx_l_s)
-            ctx_r_o = torch.zeros_like(ctx_r_s)
-
-        v_in = torch.cat(
-            [ctx_l_s, ctx_r_s, ctx_l_o, ctx_r_o, lf.unsqueeze(0), rf.unsqueeze(0)],
-            dim=-1
-        )  # (1,1,4H+2F)
-        v = agent.v_head(v_in)  # (1,1,1)
-        return v
+        return torch.cat([log_l, log_r], dim=-1), None, None
 
     while not done:
         obs_tensor = (
@@ -536,24 +510,11 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 p_left = torch.softmax(logits[0, 0], dim=-1)[0]
                 p_right = torch.softmax(logits[0, 0], dim=-1)[1]
                 a_t = int(dist.sample().item())
-                logp_old = float(dist.log_prob(torch.tensor(a_t, device=device)).item())
-                v_old = float(_value_pred(curr_trial_condition, left_feats, right_feats).item())
-                bandit_action_buf.append(a_t)
-                bandit_logp_buf.append(logp_old)
-                bandit_value_buf.append(v_old)
-                bandit_policy_mask_buf.append(1.0)
-
                 choice_target = F.one_hot(torch.tensor(a_t, device=device), num_classes=2).unsqueeze(0).float()
             else:
                 # Observational trial: env/teacher chooses (revealed at trial end).
                 a_t = 0  # dummy; replaced at trial end
                 choice_target = F.one_hot(torch.tensor(a_t, device=device), num_classes=2).unsqueeze(0).float()
-
-                v_old = float(_value_pred(curr_trial_condition, left_feats, right_feats).item())
-                bandit_action_buf.append(0)     # dummy
-                bandit_logp_buf.append(0.0)     # dummy
-                bandit_value_buf.append(v_old)
-                bandit_policy_mask_buf.append(0.0)
 
 
             meta_ep_len += 1
@@ -688,7 +649,6 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 "| selected_high_reward =", selected_high_reward,
                 "| p_left =", round(float(p_left), 2),
                 "| p_right =", round(float(p_right), 2),
-                "| v_old =", round(float(v_old), 2),
                 "| delta = ", np.round(delta_val, 2),
                 "| g =", np.round(float(g_val), 2),
                 "| pair_probs =", [(round(pl, 2), round(pr, 2)) for pl, pr in pair_probs]
@@ -758,7 +718,6 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
         pct_hi_il, pct_hi_ao, pct_hi_ol,
         high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol,
-        bandit_logp_buf, bandit_value_buf,
         g_trace_ao, g_trace_ol
     )
 
@@ -865,7 +824,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
                  batch_actor, batch_trial_cond, batch_teacher_correct,
-                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5):
+                 device, bandit_epochs: int = 4):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -878,14 +837,8 @@ def _call_update2(agent, optim_bandit, optim_motor,
         batch_actor,
         batch_trial_cond,
         batch_teacher_correct,
-        batch_logp_old,
-        batch_v_old,
         device,
-        ppo_epochs=ppo_epochs,
-        ppo_minibatch_size=ppo_minibatch_size,
-        aux_mb_size=aux_mb_size,
-        aux_ao_coef=aux_ao_coef,
-        aux_ol_coef=aux_ol_coef,
+        bandit_epochs=bandit_epochs,
     )
 
 
@@ -897,14 +850,14 @@ def main():
     # If you want *balanced* training over the full 5×4 grid each update:
     #   episodes_per_update = grid_repeats * 20
     parser.add_argument('--grid-repeats', type=int, default=1,
-                        help='K repeats of the full 20-cell (p_lo × teacher_mode) grid per update. B = K*20')
-    parser.add_argument('--episodes-per-update', type=int, default=20,
-                        help='Rollout sessions per update (B). If --grid-repeats is set, B will be overridden to K*20.')
-    parser.add_argument('--num-updates', type=int, default=1000)
+                        help='K repeats of the full num_grid_cells-cell (p_lo × teacher_mode) grid per update. B = K*num_grid_cells')
+    parser.add_argument('--episodes-per-update', type=int, default=num_grid_cells,
+                        help='Rollout sessions per update (B). If --grid-repeats is set, B will be overridden to K*num_grid_cells.')
+    parser.add_argument('--num-updates', type=int, default=1500)
 
-    # PPO inner-loop
-    parser.add_argument('--ppo-epochs', type=int, default=4)
-    parser.add_argument('--ppo-minibatch-size', type=int, default=256)
+    # Bandit BCE full-batch passes
+    parser.add_argument('--bandit-epochs', type=int, default=4)
+    parser.add_argument('--ppo-epochs', dest='bandit_epochs', type=int, help='Deprecated alias for --bandit-epochs')
 
     # Aux losses (supervised) for observation trials
     parser.add_argument('--aux-mb-size', type=int, default=256)
@@ -914,9 +867,9 @@ def main():
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
-    parser.add_argument('--warmup-updates', type=int, default=500)
-    parser.add_argument('--patience-evals', type=int, default=50)
-    parser.add_argument('--min-delta', type=float, default=0.25)
+    parser.add_argument('--warmup-updates', type=int, default=800)
+    parser.add_argument('--patience-evals', type=int, default=100)
+    parser.add_argument('--min-delta', type=float, default=1.5)
 
     # Post-training eval / plots
     parser.add_argument('--eval-sessions', type=int, default=200)
@@ -946,7 +899,7 @@ def main():
     writer = SummaryWriter(log_dir)
 
     session_K = 3
-    session_N = 12
+    session_N = 30
 
     hidden_size = 128
     feature_dim = 128
@@ -997,13 +950,13 @@ def main():
     if args.grid_repeats is not None:
         if args.grid_repeats < 1:
             raise ValueError('--grid-repeats must be >= 1')
-        B = int(args.grid_repeats) * 20
+        B = int(args.grid_repeats) * num_grid_cells
         if args.episodes_per_update is not None and int(args.episodes_per_update) != B:
             print(f'[info] Overriding --episodes-per-update={args.episodes_per_update} -> {B} because --grid-repeats={args.grid_repeats}')
     else:
         B = int(args.episodes_per_update)
-        if B % 20 != 0:
-            raise ValueError('episodes-per-update must be a multiple of 20 (5 p_lo × 4 teacher modes).')
+        if B % num_grid_cells != 0:
+            raise ValueError(f'episodes-per-update must be a multiple of {num_grid_cells} (p_lo × teacher modes).')
 
     W = args.num_workers
 
@@ -1016,7 +969,7 @@ def main():
     train_cells = [(float(p_lo), mode_name, cfg)
                    for p_lo in P_LO_GRID_DEFAULT
                    for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
-    assert len(train_cells) == 20, f'Expected 20 grid cells, got {len(train_cells)}'
+    assert len(train_cells) == num_grid_cells, f'Expected {num_grid_cells} grid cells, got {len(train_cells)}'
 
 
     for update_idx in range(num_updates):
@@ -1036,10 +989,6 @@ def main():
         batch_actor = []
         batch_trial_cond = []
         batch_teacher_correct = []
-        batch_actions = []
-        batch_logp_old = []
-        batch_v_old = []
-        batch_policy_mask = []
 
 
         cum_rewards_list_il = []
@@ -1094,7 +1043,7 @@ def main():
                     teacher_correct_buf,
                     cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
                     pct_hi_il, pct_hi_ao, pct_hi_ol,
-                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, logp_old_buf, v_old_buf, _, _
+                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, _, _
                 ) = res
 
                 batch_xy_pos.extend(xy_pos_buf)
@@ -1107,8 +1056,6 @@ def main():
                 batch_actor.append(torch.as_tensor(np.stack(actor_buf), dtype=torch.long))
                 batch_trial_cond.append(np.stack(trial_cond_buf))
                 batch_teacher_correct.append(torch.as_tensor(np.stack(teacher_correct_buf), dtype=torch.float32))
-                batch_logp_old.append(torch.as_tensor(np.stack(logp_old_buf), dtype=torch.float32))
-                batch_v_old.append(torch.as_tensor(np.stack(v_old_buf), dtype=torch.float32))
 
 
                 cum_rewards_list_il.append(cum_rewards_il)
@@ -1136,11 +1083,8 @@ def main():
             batch_actor,
             batch_trial_cond,
             batch_teacher_correct,
-            batch_logp_old, 
-            batch_v_old,
             device,
-            ppo_epochs=args.ppo_epochs,
-            ppo_minibatch_size=args.ppo_minibatch_size,
+            bandit_epochs=args.bandit_epochs,
         )
 
         mean_cum_rew_il = float(np.mean(cum_rewards_list_il))

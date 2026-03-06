@@ -170,20 +170,6 @@ class BanditLearner(nn.Module):
             nn.Linear(64, 1),
         )
 
-
-        # value head
-        self.v_head = nn.Sequential(
-            nn.Linear(4 * rnn_hidden_size + 2 * feature_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 1),
-        )
-
-        self.pi_head = nn.Sequential(
-            nn.Linear(4 * rnn_hidden_size + 2 * feature_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 2),
-        )
-
         # Motor policy
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
@@ -230,8 +216,6 @@ class BanditLearner(nn.Module):
             self.q_delta_ol,
             self.gate_ao,
             self.gate_ol,
-            self.v_head,
-            self.pi_head,
         ]
         for m in modules:
             for p in m.parameters():
@@ -319,38 +303,6 @@ class BanditLearner(nn.Module):
         if T > 1:
             out[1:] = ctx_q
         return out
-    
-    def gae_sparse(self,rewards, values, mask, gamma, lam):
-        # returns/adv only defined on mask==1 steps; zeros elsewhere
-        T, B = rewards.shape
-        adv = torch.zeros_like(rewards)
-        ret = torch.zeros_like(rewards)
-
-        for b in range(B):
-            idx = torch.nonzero(mask[:, b], as_tuple=False).squeeze(-1)
-            if idx.numel() == 0:
-                continue
-
-            gae = torch.zeros((), device=rewards.device)
-            for j in reversed(range(idx.numel())):
-                t = idx[j].item()
-                if j == idx.numel() - 1:
-                    disc = 0.0
-                    next_v = 0.0
-                    next_gae = 0.0
-                else:
-                    t_next = idx[j + 1].item()
-                    gap = t_next - t
-                    disc = float(gamma ** gap)
-                    next_v = values[t_next, b]
-                    next_gae = gae
-
-                delta = rewards[t, b] + disc * next_v - values[t, b]
-                gae = delta + disc * lam * next_gae
-
-                adv[t, b] = gae
-                ret[t, b] = gae + values[t, b]
-        return adv, ret
 
     # -------------------------
     # Main update
@@ -368,74 +320,45 @@ class BanditLearner(nn.Module):
         meta_ep_start_buf,   # unused (kept for signature compat)
         actor_buf,
         trial_cond_buf,
-        teacher_correct_buf, # unused for pure PPO (kept for compat)
-        # PPO extras:
-        bandit_logp_buf,
-        bandit_value_buf,
+        teacher_correct_buf,
         device,
-        # PPO hyperparams:
-        ppo_epochs: int = 4,
-        ppo_minibatch_size: int = 256,
-        clip_eps: float = 0.2,
-        vf_coef: float = 0.5,
-        ent_coef: float = 0.01,
-        gamma: float = 1.0,
-        gae_lambda: float = 0.95,
-        tau: float = 1.0,
+        bandit_epochs: int = 4,
         max_grad_norm: float = 1.0,
         motor_epochs: int = 1,
         motor_minibatch_size: int = 16384,
-        # Aux losses (supervised) to make observations matter:
-        aux_mb_size: int = 256,
-        aux_ao_coef: float = 0.2,   # AO-o: imitate teacher action (CE)
-        aux_ol_coef: float = 0.5,   # OL-o: predict teacher reward on chosen arm (BCE)
+        gate_coef: float = 0.1,
+        contrast_coef: float = 0.05,
     ):
-        """
-        PPO update with:
-          - multiple PPO epochs
-          - shuffled minibatches over *self-choice* (IL/AO-s/OL-s) decisions
-          - value loss + entropy bonus
-          - motor regression update (separate, optionally multiple epochs)
-
-        Notes:
-          - We mask out AO-o / OL-o steps from the policy objective (no self action sampled there).
-          - Advantages/returns are computed from rollout-time values (bandit_value_buf) using sparse-GAE.
-        """
+        """BCE update with probability-space AO/OL belief mixing and a separate motor update."""
         # ---------- motor data ----------
         xy_pos = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
         goalvec = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
         chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
         # ---------- bandit data ----------
-        # bandit_obs is a list of dicts {"left": (T,3,h,w), "right": ...}
         left_obs = torch.stack([torch.as_tensor(b["left"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
         right_obs = torch.stack([torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
 
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)     # (B,T,2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device)    # (B,T) 0/1/2 (2=no_feedback)
         actor = torch.stack(actor_buf, dim=0).to(device)                       # (B,T) 0=self 1=teacher
+        teacher_correct = torch.stack(teacher_correct_buf, dim=0).to(device)   # (B,T) in {-1,0,1}
         trial_cond = np.stack(trial_cond_buf, axis=0)                          # (B,T) strings
-
-        logp_old_bt = torch.stack(bandit_logp_buf, dim=0).to(device)           # (B,T) (dummy on obs trials)
-        v_old_bt = torch.stack(bandit_value_buf, dim=0).to(device)             # (B,T)
 
         B, T, C, H, W = left_obs.shape
 
         # time-major
-        chosen_bandits = chosen_bandits.permute(1, 0, 2)  # (T,B,2)
-        rewards_bandits = rewards_bandits.permute(1, 0)   # (T,B)
-        actor = actor.permute(1, 0).long().clamp(0, 1)    # (T,B)
-        trial_cond = trial_cond.transpose(1, 0)           # (T,B)
+        chosen_bandits = chosen_bandits.permute(1, 0, 2)   # (T,B,2)
+        rewards_bandits = rewards_bandits.permute(1, 0)    # (T,B)
+        actor = actor.permute(1, 0).long().clamp(0, 1)     # (T,B)
+        teacher_correct = teacher_correct.permute(1, 0).float()  # (T,B)
+        trial_cond = trial_cond.transpose(1, 0)            # (T,B)
 
-        actions = chosen_bandits.argmax(dim=-1)           # (T,B) int64
-        logp_old = logp_old_bt.permute(1, 0).float()      # (T,B)
-        v_old = v_old_bt.permute(1, 0).float()            # (T,B)
-
-        rwd_idx = rewards_bandits.long().clamp(0, 2)      # (T,B) in {0,1,2}
+        actions = chosen_bandits.argmax(dim=-1)            # (T,B)
+        rwd_idx = rewards_bandits.long().clamp(0, 2)       # (T,B)
         rwd_obs = (rwd_idx != 2)
         rwd01 = rwd_idx.float().clamp(0.0, 1.0)
 
-        # masks by condition (T,B)
         mask_IL  = torch.as_tensor(trial_cond == "IL",   device=device)
         mask_AOo = torch.as_tensor(trial_cond == "AO-o", device=device)
         mask_AOs = torch.as_tensor(trial_cond == "AO-s", device=device)
@@ -443,64 +366,46 @@ class BanditLearner(nn.Module):
         mask_OLs = torch.as_tensor(trial_cond == "OL-s", device=device)
         mask_self_choice = (mask_IL | mask_AOs | mask_OLs)
 
-
-        # reward only credited on self-choice trials with observed feedback
-        rew = (rwd01 * (mask_self_choice & rwd_obs).float())  # (T,B)
-
-        # ---------- sparse GAE using rollout-time values ----------
-        r_il = rew * mask_IL.float()
-        r_ao = rew * mask_AOs.float()
-        r_ol = rew * mask_OLs.float()
-        adv_il, ret_il = self.gae_sparse(r_il, v_old, mask_IL,  gamma, gae_lambda)
-        adv_ao, ret_ao = self.gae_sparse(r_ao, v_old, mask_AOs, gamma, gae_lambda)
-        adv_ol, ret_ol = self.gae_sparse(r_ol, v_old, mask_OLs, gamma, gae_lambda)
-        adv = adv_il + adv_ao + adv_ol
-        ret = ret_il + ret_ao + ret_ol
-
-        # normalize advantages over self-choice steps only
-        m = mask_self_choice.float()
-        denom = (m.sum() + 1e-8)
-        adv_mean = (adv * m).sum() / denom
-        adv_var = ((adv - adv_mean).pow(2) * m).sum() / denom
-        adv = (adv - adv_mean) / (adv_var.sqrt() + 1e-8)
-
-        # indices of (t,b) where policy was sampled
-        idx_tb = torch.nonzero(mask_self_choice, as_tuple=False)  # (N,2)
-        N = int(idx_tb.shape[0])
-
-        # number of (t,b) steps where observations were shown (AO-o/OL-o)
-        Nobs = int((mask_AOo | mask_OLo).sum().item())
-
-        if N == 0:
-            # should not happen, but stay safe
+        train_mask = mask_self_choice & rwd_obs
+        if not train_mask.any():
             return 0.0, 0.0
 
-        # ---------- forward helper (full sequence, needed for attention context) ----------
-        def forward_policy_value():
-            # encode features
+        def forward_bandit():
             left_flat = left_obs.reshape(B * T, C, H, W)
             right_flat = right_obs.reshape(B * T, C, H, W)
-            left_feats = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)   # (T,B,F)
+            left_feats = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)
             right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)
 
-            # build history tokens
             aL = chosen_bandits[..., 0:1]
             aR = chosen_bandits[..., 1:2]
             chosen_feat = aL * left_feats + aR * right_feats
 
-            a_t = torch.argmax(chosen_bandits, dim=-1)  # (T,B)
+            a_t = torch.argmax(chosen_bandits, dim=-1)
             x_val = self.action(a_t) + self.actor(actor) + self.rwd_in(rwd_idx)
 
             q_left_all = self.q_in(left_feats)
             q_right_all = self.q_in(right_feats)
             k_all = self.q_in(chosen_feat)
 
+            zeros_logits = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
+            zeros_gate = torch.zeros((T, B, 1), device=device, dtype=left_feats.dtype)
+            zeros_scalar = torch.zeros((T, B), device=device, dtype=left_feats.dtype)
             if T < 2:
-                policy_logits = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
-                V = torch.zeros((T, B), device=device, dtype=left_feats.dtype)
-                q_teacher_ao = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
-                q_teacher_ol = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
-                return policy_logits, V, q_teacher_ao, q_teacher_ol
+                eps = 1e-5
+                p_self = torch.sigmoid(zeros_logits)
+                return {
+                    "q_self_logits": zeros_logits,
+                    "q_teacher_ao": zeros_logits,
+                    "q_teacher_ol": zeros_logits,
+                    "g_ao": zeros_gate,
+                    "g_ol": zeros_gate,
+                    "ao_before": zeros_scalar,
+                    "ol_before": zeros_scalar,
+                    "q_mix_ao": torch.log(p_self.clamp(eps, 1.0 - eps) / (1.0 - p_self.clamp(eps, 1.0 - eps))),
+                    "q_mix_ol": torch.log(p_self.clamp(eps, 1.0 - eps) / (1.0 - p_self.clamp(eps, 1.0 - eps))),
+                    "left_feats": left_feats,
+                    "right_feats": right_feats,
+                }
 
             q_left_q = q_left_all[1:]
             q_right_q = q_right_all[1:]
@@ -508,42 +413,34 @@ class BanditLearner(nn.Module):
             v_hist = x_val[:-1]
 
             def cond_ctx(q_q, q_all, hist_keep_mask):
-                # key_padding_mask: (B, T-1), True=mask out
                 kpm = ~(hist_keep_mask[:-1].T)
                 ctx_q = self._safe_causal_attn(q_q, k_hist, v_hist, kpm)
                 ctx_q = self.attn_ln(ctx_q + q_q)
                 return self._build_ctx(q_all, ctx_q)
 
-            # contexts
             ctx_left_il    = cond_ctx(q_left_q,  q_left_all,  mask_IL)
             ctx_right_il   = cond_ctx(q_right_q, q_right_all, mask_IL)
-
             ctx_left_ao_s  = cond_ctx(q_left_q,  q_left_all,  mask_AOs)
             ctx_right_ao_s = cond_ctx(q_right_q, q_right_all, mask_AOs)
-
             ctx_left_ol_s  = cond_ctx(q_left_q,  q_left_all,  mask_OLs)
             ctx_right_ol_s = cond_ctx(q_right_q, q_right_all, mask_OLs)
-
             ctx_left_ao_o  = cond_ctx(q_left_q,  q_left_all,  mask_AOo)
             ctx_right_ao_o = cond_ctx(q_right_q, q_right_all, mask_AOo)
-
             ctx_left_ol_o  = cond_ctx(q_left_q,  q_left_all,  mask_OLo)
             ctx_right_ol_o = cond_ctx(q_right_q, q_right_all, mask_OLo)
 
-            # base logits from self contexts
             base_l = (
-                self._head(self.q_base, ctx_left_il,    left_feats)  * mask_IL.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_left_ao_s,  left_feats)  * mask_AOs.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_left_ol_s,  left_feats)  * mask_OLs.unsqueeze(-1).float()
+                self._head(self.q_base, ctx_left_il, left_feats) * mask_IL.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_left_ao_s, left_feats) * mask_AOs.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_left_ol_s, left_feats) * mask_OLs.unsqueeze(-1).float()
             )
             base_r = (
-                self._head(self.q_base, ctx_right_il,   right_feats) * mask_IL.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
+                self._head(self.q_base, ctx_right_il, right_feats) * mask_IL.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
+                + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
             )
-            q_self_logits = torch.cat([base_l, base_r], dim=-1)  # (T,B,2)
+            q_self_logits = torch.cat([base_l, base_r], dim=-1)
 
-            # teacher deltas from observation contexts
             q_teacher_ao = torch.cat(
                 [self._head(self.q_delta_ao, ctx_left_ao_o, left_feats),
                  self._head(self.q_delta_ao, ctx_right_ao_o, right_feats)], dim=-1
@@ -560,117 +457,115 @@ class BanditLearner(nn.Module):
                 self.gate_ol(torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1))
             ).clamp(0.0, 1.0)
 
-            # Match rollout's "has_prev_*": only apply delta if an earlier obs-trial exists
-            ao_any = mask_AOo.float().cumsum(dim=0)
-            ol_any = mask_OLo.float().cumsum(dim=0)
-            ao_before = torch.zeros_like(ao_any); ao_before[1:] = ao_any[:-1]
-            ol_before = torch.zeros_like(ol_any); ol_before[1:] = ol_any[:-1]
-            use_ao = (mask_AOs & (ao_before > 0)).float().unsqueeze(-1)
-            use_ol = (mask_OLs & (ol_before > 0)).float().unsqueeze(-1)
+            ao_cum = mask_AOo.float().cumsum(dim=0)
+            ol_cum = mask_OLo.float().cumsum(dim=0)
+            ao_before = torch.zeros_like(ao_cum)
+            ol_before = torch.zeros_like(ol_cum)
+            ao_before[1:] = ao_cum[:-1]
+            ol_before[1:] = ol_cum[:-1]
 
-            policy_logits = q_self_logits + use_ao * (g_ao * q_teacher_ao) + use_ol * (g_ol * q_teacher_ol)
+            eps = 1e-5
+            p_self = torch.sigmoid(q_self_logits.detach())
+            p_teacher_ao = torch.sigmoid(q_teacher_ao)
+            p_teacher_ol = torch.sigmoid(q_teacher_ol)
+            p_mix_ao = ((1.0 - g_ao) * p_self + g_ao * p_teacher_ao).clamp(eps, 1.0 - eps)
+            p_mix_ol = ((1.0 - g_ol) * p_self + g_ol * p_teacher_ol).clamp(eps, 1.0 - eps)
+            q_mix_ao = torch.log(p_mix_ao / (1.0 - p_mix_ao))
+            q_mix_ol = torch.log(p_mix_ol / (1.0 - p_mix_ol))
 
-            # critic input (same structure as rollout's value head input)
-            ctx_left_cur = (
-                ctx_left_il   * mask_IL.unsqueeze(-1).float()
-              + ctx_left_ao_s * mask_AOs.unsqueeze(-1).float()
-              + ctx_left_ol_s * mask_OLs.unsqueeze(-1).float()
-            )
-            ctx_right_cur = (
-                ctx_right_il   * mask_IL.unsqueeze(-1).float()
-              + ctx_right_ao_s * mask_AOs.unsqueeze(-1).float()
-              + ctx_right_ol_s * mask_OLs.unsqueeze(-1).float()
-            )
-            ctx_left_obs = (
-                ctx_left_ao_o * mask_AOo.unsqueeze(-1).float()
-              + ctx_left_ol_o * mask_OLo.unsqueeze(-1).float()
-            )
-            ctx_right_obs = (
-                ctx_right_ao_o * mask_AOo.unsqueeze(-1).float()
-              + ctx_right_ol_o * mask_OLo.unsqueeze(-1).float()
-            )
+            return {
+                "q_self_logits": q_self_logits,
+                "q_teacher_ao": q_teacher_ao,
+                "q_teacher_ol": q_teacher_ol,
+                "g_ao": g_ao,
+                "g_ol": g_ol,
+                "ao_before": ao_before,
+                "ol_before": ol_before,
+                "q_mix_ao": q_mix_ao,
+                "q_mix_ol": q_mix_ol,
+                "left_feats": left_feats,
+                "right_feats": right_feats,
+            }
 
-            V = self.v_head(
-                torch.cat([ctx_left_cur, ctx_right_cur, ctx_left_obs, ctx_right_obs, left_feats, right_feats], dim=-1)
-            ).squeeze(-1)  # (T,B)
+        bandit_loss_sum = 0.0
+        bandit_steps = 0
 
-            return policy_logits, V, q_teacher_ao, q_teacher_ol
-
-        # ---------- BCE bandit update (one-shot full batch) ----------
-        # Train only where we have a self-choice *and* observed feedback
-        train_mask = (mask_self_choice & rwd_obs)  # (T,B)
-        N = int(train_mask.sum().item())
-        Nobs = int((mask_AOo | mask_OLo).sum().item())
-
-        if N == 0:
-            return 0.0, 0.0
-
-        total_loss = 0.0
-        total_steps = 0
-
-        for _ep in range(int(ppo_epochs)):  # keep as "full-batch steps"; set ppo_epochs=1 for true one-shot
+        for _ in range(int(bandit_epochs)):
             optim_bandit.zero_grad(set_to_none=True)
+            out = forward_bandit()
 
-            policy_logits, V, q_teacher_ao, q_teacher_ol = forward_policy_value()
+            q_self_logits = out["q_self_logits"]
+            g_ao = out["g_ao"]
+            g_ol = out["g_ol"]
+            ao_before = out["ao_before"]
+            ol_before = out["ol_before"]
+            q_mix_ao = out["q_mix_ao"]
+            q_mix_ol = out["q_mix_ol"]
+            left_feats = out["left_feats"]
+            right_feats = out["right_feats"]
 
-            # pick only labeled self-choice steps
-            logits = policy_logits[train_mask]          # (N,2)
-            a = actions[train_mask].long()              # (N,)
-            y = rwd01[train_mask].float()               # (N,)
+            q_self_chosen = q_self_logits.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+            base_loss = F.binary_cross_entropy_with_logits(q_self_chosen[train_mask], rwd01[train_mask])
 
-            chosen_logit = logits.gather(-1, a.unsqueeze(-1)).squeeze(-1)  # (N,)
-            bce_loss = F.binary_cross_entropy_with_logits(chosen_logit, y)
+            use_ao_mix = mask_AOs & (ao_before > 0) & rwd_obs
+            use_ol_mix = mask_OLs & (ol_before > 0) & rwd_obs
+            q_mix_ao_chosen = q_mix_ao.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+            q_mix_ol_chosen = q_mix_ol.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
 
-            # optional entropy regularizer (computed only on those steps)
-            dist = torch.distributions.Categorical(logits=(logits / tau))
-            ent = dist.entropy().mean()
+            mix_losses = []
+            if use_ao_mix.any():
+                mix_losses.append(F.binary_cross_entropy_with_logits(q_mix_ao_chosen[use_ao_mix], rwd01[use_ao_mix]))
+            if use_ol_mix.any():
+                mix_losses.append(F.binary_cross_entropy_with_logits(q_mix_ol_chosen[use_ol_mix], rwd01[use_ol_mix]))
+            mix_loss = torch.stack(mix_losses).mean() if mix_losses else torch.zeros((), device=device)
 
-            loss = bce_loss - ent_coef * ent
+            tc = teacher_correct.clamp(0.0, 1.0)
+            ao_sum = (tc * mask_AOo.float()).cumsum(dim=0)
+            ao_cnt = mask_AOo.float().cumsum(dim=0)
+            ol_sum = (tc * mask_OLo.float()).cumsum(dim=0)
+            ol_cnt = mask_OLo.float().cumsum(dim=0)
 
-            # ----- auxiliary losses on observation trials (computed once; no aux_scale needed) -----
-            aux_ao = torch.zeros((), device=device)
-            aux_ol = torch.zeros((), device=device)
+            ao_rel = ao_sum / (ao_cnt + 1e-6)
+            ol_rel = ol_sum / (ol_cnt + 1e-6)
+            ao_rel_prev = torch.zeros_like(ao_rel)
+            ol_rel_prev = torch.zeros_like(ol_rel)
+            ao_rel_prev[1:] = ao_rel[:-1]
+            ol_rel_prev[1:] = ol_rel[:-1]
 
-            if (Nobs > 0) and ((aux_ao_coef != 0.0) or (aux_ol_coef != 0.0)):
-                # AO-o: imitate teacher action
-                if (aux_ao_coef != 0.0) and mask_AOo.any():
-                    logits_ao = q_teacher_ao[mask_AOo]         # (N_AOo,2)
-                    targ_ao = actions[mask_AOo].long()         # (N_AOo,)
-                    aux_ao = F.cross_entropy(logits_ao, targ_ao)
+            mask_gate_ao = mask_AOs & (ao_before > 0)
+            mask_gate_ol = mask_OLs & (ol_before > 0)
+            gate_losses = []
+            if mask_gate_ao.any():
+                gate_losses.append(F.mse_loss(g_ao.squeeze(-1)[mask_gate_ao], ao_rel_prev[mask_gate_ao]))
+            if mask_gate_ol.any():
+                gate_losses.append(F.mse_loss(g_ol.squeeze(-1)[mask_gate_ol], ol_rel_prev[mask_gate_ol]))
+            gate_loss = torch.stack(gate_losses).mean() if gate_losses else torch.zeros((), device=device)
 
-                # OL-o: predict observed teacher reward on chosen arm
-                ol_mask = (mask_OLo & rwd_obs)
-                if (aux_ol_coef != 0.0) and ol_mask.any():
-                    logits_ol = q_teacher_ol[ol_mask]          # (N_OLo,2)
-                    targ_act = actions[ol_mask].long()         # (N_OLo,)
-                    chosen_logit_ol = logits_ol.gather(-1, targ_act.unsqueeze(-1)).squeeze(-1)
-                    aux_ol = F.binary_cross_entropy_with_logits(chosen_logit_ol, rwd01[ol_mask].float())
+            q_bce = base_loss + mix_loss
+            contrast_loss = lr_repulsion_loss(left_feats, right_feats, margin=0.2)
+            bandit_total = q_bce + gate_coef * gate_loss + contrast_coef * contrast_loss
 
-            loss = loss + aux_ao_coef * aux_ao + aux_ol_coef * aux_ol
-
-            loss.backward()
+            bandit_total.backward()
             torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), max_grad_norm)
             optim_bandit.step()
 
-            total_loss += float(loss.item())
-            total_steps += 1
+            bandit_loss_sum += float(q_bce.item())
+            bandit_steps += 1
 
-        bandit_loss = total_loss / max(1, total_steps)
+        bandit_loss = bandit_loss_sum / max(1, bandit_steps)
 
         # ---------- motor update (separate) ----------
         motor_loss_sum = 0.0
         motor_mb = 0
-
         total_steps = int(xy_pos.shape[0])
-        for _me in range(int(motor_epochs)):
+
+        for _ in range(int(motor_epochs)):
             perm = torch.randperm(total_steps, device=device)
             for start in range(0, total_steps, int(motor_minibatch_size)):
                 idx = perm[start:start + int(motor_minibatch_size)]
-
                 optim_motor.zero_grad(set_to_none=True)
 
                 mu, _ = self.motor_fwd(chosen_bandits_motor[idx], xy_pos[idx], goalvec[idx])
-
                 dist2 = goalvec[idx].norm(dim=-1, keepdim=True) + 1e-6
                 g_hat = goalvec[idx] / dist2
                 speed = (dist2 / math.sqrt(8.0)).clamp(0.0, 1.0)
@@ -687,5 +582,4 @@ class BanditLearner(nn.Module):
                 motor_mb += 1
 
         motor_loss_out = motor_loss_sum / max(1, motor_mb)
-
         return bandit_loss, motor_loss_out
