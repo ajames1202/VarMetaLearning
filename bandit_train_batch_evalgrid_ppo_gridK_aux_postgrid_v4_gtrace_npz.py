@@ -97,7 +97,7 @@ P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
 # ]
 
 TEACHER_MODES_DEFAULT = [
-    ("learning",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
+    ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
 ]
 
 num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
@@ -985,7 +985,7 @@ def main():
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
-    parser.add_argument('--warmup-updates', type=int, default=800)
+    parser.add_argument('--warmup-updates', type=int, default=400)
     parser.add_argument('--patience-evals', type=int, default=100)
     parser.add_argument('--min-delta', type=float, default=1.5)
 
