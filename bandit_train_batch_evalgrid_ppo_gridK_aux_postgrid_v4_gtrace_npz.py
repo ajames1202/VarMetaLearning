@@ -97,7 +97,7 @@ P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
 # ]
 
 TEACHER_MODES_DEFAULT = [
-    ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
+   ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
 ]
 
 num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
