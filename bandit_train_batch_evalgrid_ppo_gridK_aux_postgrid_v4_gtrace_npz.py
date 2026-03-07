@@ -1261,7 +1261,7 @@ def main():
                 best_eval = eval_score
                 bad_evals = 0
                 save_checkpoint(
-                    os.path.join(args.run_dir, "best.pt"),
+                    os.path.join(run_dir, "best.pt"),
                     agent, optim_bandit, optim_motor,
                     extra={
                         "update": update_idx,
@@ -1289,7 +1289,8 @@ def main():
     # -----------------------------
     # Load best checkpoint
     # -----------------------------
-    ckpt_path = os.path.join(args.run_dir, "best.pt")
+
+    ckpt_path = os.path.join(run_dir, "best.pt")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     best_extra = ckpt.get("extra", {})
     best_update = best_extra.get("update", -1)
