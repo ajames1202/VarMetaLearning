@@ -428,6 +428,7 @@ class BanditLearner(nn.Module):
         self_bce_coef: float = 1.0, # self-choice reward BCE on fused beliefs
         aux_ao_coef: float = 0.2,   # AO-o: imitate teacher action (CE)
         aux_ol_coef: float = 0.5,   # OL-o: predict teacher reward on chosen arm (BCE)
+        session_chunk_size: int | None = None,
     ):
         """
         Hybrid update with:
@@ -449,8 +450,14 @@ class BanditLearner(nn.Module):
 
         # ---------- bandit data ----------
         # bandit_obs is a list of dicts {"left": (T,3,h,w), "right": ...}
-        left_obs = torch.stack([torch.as_tensor(b["left"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
-        right_obs = torch.stack([torch.as_tensor(b["right"], device=device, dtype=torch.float32) for b in bandit_obs], dim=0)
+        # Keep the heavy image tensors on CPU. Move only a session chunk to GPU
+        # for the bandit forward/backward pass so larger grid repeats fit in memory.
+        left_obs_cpu = torch.stack([
+            torch.as_tensor(b["left"], dtype=torch.float32) for b in bandit_obs
+        ], dim=0).contiguous()
+        right_obs_cpu = torch.stack([
+            torch.as_tensor(b["right"], dtype=torch.float32) for b in bandit_obs
+        ], dim=0).contiguous()
 
         chosen_bandits = torch.stack(chosen_bandits_buf, dim=0).to(device)     # (B,T,2)
         rewards_bandits = torch.stack(bandit_rewards_buf, dim=0).to(device)    # (B,T) 0/1/2 (2=no_feedback)
@@ -460,7 +467,7 @@ class BanditLearner(nn.Module):
         logp_old_bt = torch.stack(bandit_logp_buf, dim=0).to(device)           # (B,T) (dummy on obs trials)
         v_old_bt = torch.stack(bandit_value_buf, dim=0).to(device)             # (B,T)
 
-        B, T, C, H, W = left_obs.shape
+        B, T, C, H, W = left_obs_cpu.shape
 
         # time-major
         chosen_bandits = chosen_bandits.permute(1, 0, 2)  # (T,B,2)
@@ -483,7 +490,6 @@ class BanditLearner(nn.Module):
         mask_OLo = torch.as_tensor(trial_cond == "OL-o", device=device)
         mask_OLs = torch.as_tensor(trial_cond == "OL-s", device=device)
         mask_self_choice = (mask_IL | mask_AOs | mask_OLs)
-
 
         # reward only credited on self-choice trials with observed feedback
         rew = (rwd01 * (mask_self_choice & rwd_obs).float())  # (T,B)
@@ -516,32 +522,56 @@ class BanditLearner(nn.Module):
             # should not happen, but stay safe
             return 0.0, 0.0
 
-        # ---------- forward helper (full sequence, needed for attention context) ----------
-        def forward_policy_value():
-            # encode features
-            left_flat = left_obs.reshape(B * T, C, H, W)
-            right_flat = right_obs.reshape(B * T, C, H, W)
-            left_feats = self.encode(left_flat).view(B, T, -1).permute(1, 0, 2)   # (T,B,F)
-            right_feats = self.encode(right_flat).view(B, T, -1).permute(1, 0, 2)
+        if session_chunk_size is None:
+            session_chunk_size = min(B, 10)
+        session_chunk_size = int(max(1, min(B, session_chunk_size)))
+
+        # Global normalizers so chunked accumulation matches the original
+        # full-batch mean reductions.
+        total_policy_n = max(int(mask_self_choice.sum().item()), 1)
+        total_reward_n = max(int((mask_self_choice & rwd_obs).sum().item()), 1)
+        total_ao_n = max(int(mask_AOo.sum().item()), 1)
+        total_ol_n = max(int((mask_OLo & rwd_obs).sum().item()), 1)
+
+        # ---------- forward helper (full sequence per session chunk) ----------
+        def forward_policy_value_chunk(b0: int, b1: int):
+            left_obs = left_obs_cpu[b0:b1].to(device, non_blocking=True)
+            right_obs = right_obs_cpu[b0:b1].to(device, non_blocking=True)
+
+            chosen_bandits_mb = chosen_bandits[:, b0:b1]
+            actions_mb = actions[:, b0:b1]
+            actor_mb = actor[:, b0:b1]
+            rwd_idx_mb = rwd_idx[:, b0:b1]
+
+            mask_IL_mb = mask_IL[:, b0:b1]
+            mask_AOo_mb = mask_AOo[:, b0:b1]
+            mask_AOs_mb = mask_AOs[:, b0:b1]
+            mask_OLo_mb = mask_OLo[:, b0:b1]
+            mask_OLs_mb = mask_OLs[:, b0:b1]
+
+            Bc = int(b1 - b0)
+            left_flat = left_obs.reshape(Bc * T, C, H, W)
+            right_flat = right_obs.reshape(Bc * T, C, H, W)
+            left_feats = self.encode(left_flat).view(Bc, T, -1).permute(1, 0, 2)   # (T,Bc,F)
+            right_feats = self.encode(right_flat).view(Bc, T, -1).permute(1, 0, 2)
 
             # build history tokens
-            aL = chosen_bandits[..., 0:1]
-            aR = chosen_bandits[..., 1:2]
+            aL = chosen_bandits_mb[..., 0:1]
+            aR = chosen_bandits_mb[..., 1:2]
             chosen_feat = aL * left_feats + aR * right_feats
 
-            a_t = torch.argmax(chosen_bandits, dim=-1)  # (T,B)
-            x_val = self.action(a_t) + self.actor(actor) + self.rwd_in(rwd_idx)
+            x_val = self.action(actions_mb) + self.actor(actor_mb) + self.rwd_in(rwd_idx_mb)
 
             q_left_all = self.q_in(left_feats)
             q_right_all = self.q_in(right_feats)
             k_all = self.q_in(chosen_feat)
 
             if T < 2:
-                belief_logits = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
-                policy_logits = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
-                V = torch.zeros((T, B), device=device, dtype=left_feats.dtype)
-                q_teacher_ao = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
-                q_teacher_ol = torch.zeros((T, B, 2), device=device, dtype=left_feats.dtype)
+                belief_logits = torch.zeros((T, Bc, 2), device=device, dtype=left_feats.dtype)
+                policy_logits = torch.zeros((T, Bc, 2), device=device, dtype=left_feats.dtype)
+                V = torch.zeros((T, Bc), device=device, dtype=left_feats.dtype)
+                q_teacher_ao = torch.zeros((T, Bc, 2), device=device, dtype=left_feats.dtype)
+                q_teacher_ol = torch.zeros((T, Bc, 2), device=device, dtype=left_feats.dtype)
                 return belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol
 
             q_left_q = q_left_all[1:]
@@ -550,40 +580,40 @@ class BanditLearner(nn.Module):
             v_hist = x_val[:-1]
 
             def cond_ctx(q_q, q_all, hist_keep_mask):
-                # key_padding_mask: (B, T-1), True=mask out
+                # key_padding_mask: (Bc, T-1), True=mask out
                 kpm = ~(hist_keep_mask[:-1].T)
                 ctx_q = self._safe_causal_attn(q_q, k_hist, v_hist, kpm)
                 ctx_q = self.attn_ln(ctx_q + q_q)
                 return self._build_ctx(q_all, ctx_q)
 
             # contexts
-            ctx_left_il    = cond_ctx(q_left_q,  q_left_all,  mask_IL)
-            ctx_right_il   = cond_ctx(q_right_q, q_right_all, mask_IL)
+            ctx_left_il    = cond_ctx(q_left_q,  q_left_all,  mask_IL_mb)
+            ctx_right_il   = cond_ctx(q_right_q, q_right_all, mask_IL_mb)
 
-            ctx_left_ao_s  = cond_ctx(q_left_q,  q_left_all,  mask_AOs)
-            ctx_right_ao_s = cond_ctx(q_right_q, q_right_all, mask_AOs)
+            ctx_left_ao_s  = cond_ctx(q_left_q,  q_left_all,  mask_AOs_mb)
+            ctx_right_ao_s = cond_ctx(q_right_q, q_right_all, mask_AOs_mb)
 
-            ctx_left_ol_s  = cond_ctx(q_left_q,  q_left_all,  mask_OLs)
-            ctx_right_ol_s = cond_ctx(q_right_q, q_right_all, mask_OLs)
+            ctx_left_ol_s  = cond_ctx(q_left_q,  q_left_all,  mask_OLs_mb)
+            ctx_right_ol_s = cond_ctx(q_right_q, q_right_all, mask_OLs_mb)
 
-            ctx_left_ao_o  = cond_ctx(q_left_q,  q_left_all,  mask_AOo)
-            ctx_right_ao_o = cond_ctx(q_right_q, q_right_all, mask_AOo)
+            ctx_left_ao_o  = cond_ctx(q_left_q,  q_left_all,  mask_AOo_mb)
+            ctx_right_ao_o = cond_ctx(q_right_q, q_right_all, mask_AOo_mb)
 
-            ctx_left_ol_o  = cond_ctx(q_left_q,  q_left_all,  mask_OLo)
-            ctx_right_ol_o = cond_ctx(q_right_q, q_right_all, mask_OLo)
+            ctx_left_ol_o  = cond_ctx(q_left_q,  q_left_all,  mask_OLo_mb)
+            ctx_right_ol_o = cond_ctx(q_right_q, q_right_all, mask_OLo_mb)
 
             # base logits from self contexts
             base_l = (
-                self._head(self.q_base, ctx_left_il,    left_feats)  * mask_IL.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_left_ao_s,  left_feats)  * mask_AOs.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_left_ol_s,  left_feats)  * mask_OLs.unsqueeze(-1).float()
+                self._head(self.q_base, ctx_left_il,    left_feats)  * mask_IL_mb.unsqueeze(-1).float()
+              + self._head(self.q_base, ctx_left_ao_s,  left_feats)  * mask_AOs_mb.unsqueeze(-1).float()
+              + self._head(self.q_base, ctx_left_ol_s,  left_feats)  * mask_OLs_mb.unsqueeze(-1).float()
             )
             base_r = (
-                self._head(self.q_base, ctx_right_il,   right_feats) * mask_IL.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs.unsqueeze(-1).float()
-              + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs.unsqueeze(-1).float()
+                self._head(self.q_base, ctx_right_il,   right_feats) * mask_IL_mb.unsqueeze(-1).float()
+              + self._head(self.q_base, ctx_right_ao_s, right_feats) * mask_AOs_mb.unsqueeze(-1).float()
+              + self._head(self.q_base, ctx_right_ol_s, right_feats) * mask_OLs_mb.unsqueeze(-1).float()
             )
-            q_self_logits = torch.cat([base_l, base_r], dim=-1)  # (T,B,2)
+            q_self_logits = torch.cat([base_l, base_r], dim=-1)  # (T,Bc,2)
 
             # teacher heads from observation contexts
             q_teacher_ao = torch.cat(
@@ -603,12 +633,14 @@ class BanditLearner(nn.Module):
             ).clamp(0.0, 1.0)
 
             # Match rollout's "has_prev_*": only apply teacher belief if an earlier obs-trial exists
-            ao_any = mask_AOo.float().cumsum(dim=0)
-            ol_any = mask_OLo.float().cumsum(dim=0)
-            ao_before = torch.zeros_like(ao_any); ao_before[1:] = ao_any[:-1]
-            ol_before = torch.zeros_like(ol_any); ol_before[1:] = ol_any[:-1]
-            use_ao = (mask_AOs & (ao_before > 0)).float().unsqueeze(-1)
-            use_ol = (mask_OLs & (ol_before > 0)).float().unsqueeze(-1)
+            ao_any = mask_AOo_mb.float().cumsum(dim=0)
+            ol_any = mask_OLo_mb.float().cumsum(dim=0)
+            ao_before = torch.zeros_like(ao_any)
+            ol_before = torch.zeros_like(ol_any)
+            ao_before[1:] = ao_any[:-1]
+            ol_before[1:] = ol_any[:-1]
+            use_ao = (mask_AOs_mb & (ao_before > 0)).float().unsqueeze(-1)
+            use_ol = (mask_OLs_mb & (ol_before > 0)).float().unsqueeze(-1)
 
             p_self = torch.sigmoid(q_self_logits)
             p_teacher_ao = torch.sigmoid(q_teacher_ao)
@@ -621,22 +653,22 @@ class BanditLearner(nn.Module):
 
             # control/value input from detached belief summaries + detached contexts/features
             ctx_left_cur = (
-                ctx_left_il   * mask_IL.unsqueeze(-1).float()
-              + ctx_left_ao_s * mask_AOs.unsqueeze(-1).float()
-              + ctx_left_ol_s * mask_OLs.unsqueeze(-1).float()
+                ctx_left_il   * mask_IL_mb.unsqueeze(-1).float()
+              + ctx_left_ao_s * mask_AOs_mb.unsqueeze(-1).float()
+              + ctx_left_ol_s * mask_OLs_mb.unsqueeze(-1).float()
             )
             ctx_right_cur = (
-                ctx_right_il   * mask_IL.unsqueeze(-1).float()
-              + ctx_right_ao_s * mask_AOs.unsqueeze(-1).float()
-              + ctx_right_ol_s * mask_OLs.unsqueeze(-1).float()
+                ctx_right_il   * mask_IL_mb.unsqueeze(-1).float()
+              + ctx_right_ao_s * mask_AOs_mb.unsqueeze(-1).float()
+              + ctx_right_ol_s * mask_OLs_mb.unsqueeze(-1).float()
             )
             ctx_left_obs = (
-                ctx_left_ao_o * mask_AOs.unsqueeze(-1).float()
-              + ctx_left_ol_o * mask_OLs.unsqueeze(-1).float()
+                ctx_left_ao_o * mask_AOs_mb.unsqueeze(-1).float()
+              + ctx_left_ol_o * mask_OLs_mb.unsqueeze(-1).float()
             )
             ctx_right_obs = (
-                ctx_right_ao_o * mask_AOs.unsqueeze(-1).float()
-              + ctx_right_ol_o * mask_OLs.unsqueeze(-1).float()
+                ctx_right_ao_o * mask_AOs_mb.unsqueeze(-1).float()
+              + ctx_right_ol_o * mask_OLs_mb.unsqueeze(-1).float()
             )
 
             control_in = self._control_features(
@@ -657,78 +689,99 @@ class BanditLearner(nn.Module):
             )
 
             policy_logits = self.pi_head(control_in)
-            V = self.v_head(control_in).squeeze(-1)  # (T,B)
+            V = self.v_head(control_in).squeeze(-1)  # (T,Bc)
 
             return belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol
 
-        # ---------- hybrid PPO + BCE belief update (full batch per epoch) ----------
+        # ---------- hybrid PPO + BCE belief update (session-chunked) ----------
         policy_mask = mask_self_choice
         reward_mask = (mask_self_choice & rwd_obs)
+        ol_mask_full = (mask_OLo & rwd_obs)
 
         total_loss = 0.0
         total_steps = 0
 
         for _ep in range(int(ppo_epochs)):
             optim_bandit.zero_grad(set_to_none=True)
+            epoch_loss_value = 0.0
 
-            belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol = forward_policy_value()
-            dist = torch.distributions.Categorical(logits=(policy_logits / tau))
-            logp_new = dist.log_prob(actions)   # (T,B)
-            entropy = dist.entropy()            # (T,B)
+            for b0 in range(0, B, session_chunk_size):
+                b1 = min(B, b0 + session_chunk_size)
 
-            logp_new_mb = logp_new[policy_mask]
-            logp_old_mb = logp_old[policy_mask]
-            adv_mb = adv[policy_mask]
-            ret_mb = ret[policy_mask]
-            V_mb = V[policy_mask]
-            ent_mb = entropy[policy_mask]
+                belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol = forward_policy_value_chunk(b0, b1)
 
-            ratio = torch.exp(logp_new_mb - logp_old_mb)
-            surr1 = ratio * adv_mb
-            surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_mb
-            pg_loss = -torch.min(surr1, surr2).mean()
+                actions_mb = actions[:, b0:b1]
+                logp_old_mb_all = logp_old[:, b0:b1]
+                adv_mb_all = adv[:, b0:b1]
+                ret_mb_all = ret[:, b0:b1]
+                rwd01_mb = rwd01[:, b0:b1]
 
-            v_loss = 0.5 * (ret_mb - V_mb).pow(2).mean()
-            ent_loss = ent_mb.mean()
+                policy_mask_mb = policy_mask[:, b0:b1]
+                reward_mask_mb = reward_mask[:, b0:b1]
+                mask_AOo_mb = mask_AOo[:, b0:b1]
+                ol_mask_mb = ol_mask_full[:, b0:b1]
 
-            # self-choice reward BCE on fused beliefs
-            aux_self = torch.zeros((), device=device)
-            if reward_mask.any():
-                chosen_belief_logit = belief_logits[reward_mask].gather(-1, actions[reward_mask].unsqueeze(-1)).squeeze(-1)
-                aux_self = F.binary_cross_entropy_with_logits(chosen_belief_logit, rwd01[reward_mask])
+                dist = torch.distributions.Categorical(logits=(policy_logits / tau))
+                logp_new = dist.log_prob(actions_mb)   # (T,Bc)
+                entropy = dist.entropy()               # (T,Bc)
 
-            # observation losses
-            aux_ao = torch.zeros((), device=device)
-            aux_ol = torch.zeros((), device=device)
+                ratio = torch.exp(logp_new[policy_mask_mb] - logp_old_mb_all[policy_mask_mb])
+                surr1 = ratio * adv_mb_all[policy_mask_mb]
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_mb_all[policy_mask_mb]
+                pg_loss = -torch.min(surr1, surr2).sum() / total_policy_n
 
-            if (Nobs > 0) and ((aux_ao_coef != 0.0) or (aux_ol_coef != 0.0)):
-                if (aux_ao_coef != 0.0) and mask_AOo.any():
-                    logits_ao = q_teacher_ao[mask_AOo]
-                    targ_ao = actions[mask_AOo].long()
-                    aux_ao = F.cross_entropy(logits_ao, targ_ao)
+                v_loss = 0.5 * (ret_mb_all[policy_mask_mb] - V[policy_mask_mb]).pow(2).sum() / total_policy_n
+                ent_loss = entropy[policy_mask_mb].sum() / total_policy_n
 
-                ol_mask = (mask_OLo & rwd_obs)
-                if (aux_ol_coef != 0.0) and ol_mask.any():
-                    logits_ol = q_teacher_ol[ol_mask]
-                    targ_act = actions[ol_mask].long()
-                    chosen_logit = logits_ol.gather(-1, targ_act.unsqueeze(-1)).squeeze(-1)
-                    aux_ol = F.binary_cross_entropy_with_logits(chosen_logit, rwd01[ol_mask])
+                aux_self = torch.zeros((), device=device)
+                if reward_mask_mb.any():
+                    chosen_belief_logit = belief_logits[reward_mask_mb].gather(
+                        -1, actions_mb[reward_mask_mb].unsqueeze(-1)
+                    ).squeeze(-1)
+                    aux_self = F.binary_cross_entropy_with_logits(
+                        chosen_belief_logit,
+                        rwd01_mb[reward_mask_mb],
+                        reduction="sum",
+                    ) / total_reward_n
 
-            loss = (
-                pg_loss
-                + vf_coef * v_loss
-                - ent_coef * ent_loss
-                + self_bce_coef * aux_self
-                + aux_ao_coef * aux_ao
-                + aux_ol_coef * aux_ol
-            )
+                aux_ao = torch.zeros((), device=device)
+                aux_ol = torch.zeros((), device=device)
 
-            loss.backward()
+                if (Nobs > 0) and ((aux_ao_coef != 0.0) or (aux_ol_coef != 0.0)):
+                    if (aux_ao_coef != 0.0) and mask_AOo_mb.any():
+                        logits_ao = q_teacher_ao[mask_AOo_mb]
+                        targ_ao = actions_mb[mask_AOo_mb].long()
+                        aux_ao = F.cross_entropy(logits_ao, targ_ao, reduction="sum") / total_ao_n
+
+                    if (aux_ol_coef != 0.0) and ol_mask_mb.any():
+                        logits_ol = q_teacher_ol[ol_mask_mb]
+                        targ_act = actions_mb[ol_mask_mb].long()
+                        chosen_logit = logits_ol.gather(-1, targ_act.unsqueeze(-1)).squeeze(-1)
+                        aux_ol = F.binary_cross_entropy_with_logits(
+                            chosen_logit,
+                            rwd01_mb[ol_mask_mb],
+                            reduction="sum",
+                        ) / total_ol_n
+
+                loss = (
+                    pg_loss
+                    + vf_coef * v_loss
+                    - ent_coef * ent_loss
+                    + self_bce_coef * aux_self
+                    + aux_ao_coef * aux_ao
+                    + aux_ol_coef * aux_ol
+                )
+
+                loss.backward()
+                epoch_loss_value += float(loss.item())
+
+                del belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol
+                del dist, logp_new, entropy, loss
 
             torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), max_grad_norm)
             optim_bandit.step()
 
-            total_loss += float(loss.item())
+            total_loss += epoch_loss_value
             total_steps += 1
 
         bandit_loss = total_loss / max(1, total_steps)

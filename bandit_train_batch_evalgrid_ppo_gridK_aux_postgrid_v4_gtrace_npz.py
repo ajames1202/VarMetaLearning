@@ -105,6 +105,15 @@ num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
 TEACHER_CFG_KEYS = sorted({k for _, cfg in TEACHER_MODES_DEFAULT for k in cfg.keys()})
 
 
+def _ray_get_in_batches(futures, batch_size: int):
+    """Fetch Ray results in chunks to avoid large temporary result piles on the driver."""
+    out = []
+    batch_size = max(1, int(batch_size))
+    for i in range(0, len(futures), batch_size):
+        out.extend(ray.get(futures[i:i + batch_size]))
+    return out
+
+
 def eval_grid_score(
     workers,
     agent_state_cpu,
@@ -115,13 +124,7 @@ def eval_grid_score(
     n_sessions_per_cell: int,
     seed: int,
 ):
-    """Evaluate the *full grid* and return:
-      - macro_avg: mean over all grid cells
-      - worst5_avg: mean over the worst 5 cells
-      - cell_means: dict[(p_lo, mode_name)] -> mean cell score (0..100)
-
-    Cell score = mean( pct_hi_IL, pct_hi_AO, pct_hi_OL ).
-    """
+    """Evaluate the full grid and return macro + worst-cell summaries."""
     rng = np.random.default_rng(seed)
 
     futures = []
@@ -142,28 +145,29 @@ def eval_grid_score(
                 )
                 meta.append((float(p_lo), str(mode_name)))
 
-    results = ray.get(futures)
+    results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
-    # cell_scores: Dict[Tuple[float, str], List[float]] = {}
     il_scores: Dict[Tuple[float, str], List[float]] = {}
     ao_scores: Dict[Tuple[float, str], List[float]] = {}
     ol_scores: Dict[Tuple[float, str], List[float]] = {}
     for (p_lo, mode_name), res in zip(meta, results):
-        # pct_hi_il = float(res[13])
-        # pct_hi_ao = float(res[14])
-        # pct_hi_ol = float(res[15])
-        cum_rew_il = float(res[10])
-        cum_rew_ao = float(res[11])
-        cum_rew_ol = float(res[12])
+        (
+            _, _, _,
+            _, _, _, _,
+            _, _,
+            _,
+            cum_rew_il, cum_rew_ao, cum_rew_ol,
+            _, _, _,
+            *_,
+        ) = res
         cell = (p_lo, mode_name)
-        il_scores.setdefault(cell, []).append((cum_rew_il))
-        ao_scores.setdefault(cell, []).append((cum_rew_ao))
-        ol_scores.setdefault(cell, []).append((cum_rew_ol))
+        il_scores.setdefault(cell, []).append(float(cum_rew_il))
+        ao_scores.setdefault(cell, []).append(float(cum_rew_ao))
+        ol_scores.setdefault(cell, []).append(float(cum_rew_ol))
 
-    # cell_means = {k: float(np.mean(v)) for k, v in cell_scores.items()}
-    il_mean = float(np.mean([np.mean(v) for v in il_scores.values()])) #mean il over all rollouts
-    ao_mean = float(np.mean([np.mean(v) for v in ao_scores.values()])) #mean ao over all rollouts
-    ol_mean = float(np.mean([np.mean(v) for v in ol_scores.values()])) #mean ol over all rollouts
+    il_mean = float(np.mean([np.mean(v) for v in il_scores.values()])) if il_scores else 0.0
+    ao_mean = float(np.mean([np.mean(v) for v in ao_scores.values()])) if ao_scores else 0.0
+    ol_mean = float(np.mean([np.mean(v) for v in ol_scores.values()])) if ol_scores else 0.0
     all_scores = np.array([il_mean, ao_mean, ol_mean], dtype=np.float32)
     macro_avg = float(all_scores.mean()) if all_scores.size else 0.0
     worst5_avg = float(np.sort(all_scores)[: min(5, all_scores.size)].mean()) if all_scores.size else 0.0
@@ -212,7 +216,7 @@ def eval_post_grid(
                 )
                 meta.append((float(p_lo), str(mode_name)))
 
-    results = ray.get(futures)
+    results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
     # collect per-cell arrays
     per_cell: Dict[Tuple[float, str], Dict[str, List[Any]]] = {}
@@ -927,7 +931,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
                  batch_actor, batch_trial_cond, batch_teacher_correct,
-                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5):
+                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5, session_chunk_size: int = 10):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -949,6 +953,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
         self_bce_coef=self_bce_coef,
         aux_ao_coef=aux_ao_coef,
         aux_ol_coef=aux_ol_coef,
+        session_chunk_size=session_chunk_size,
     )
 
 
@@ -971,6 +976,8 @@ def main():
 
     # Aux losses (supervised) for observation trials
     parser.add_argument('--aux-mb-size', type=int, default=256)
+    parser.add_argument('--train-session-chunk-size', type=int, default=10,
+                        help='Number of full sessions to move to GPU at once inside update2. Lower this if training still OOMs.')
     parser.add_argument('--self-bce-coef', type=float, default=1.0, help='Self-choice fused-belief BCE weight')
     parser.add_argument('--aux-ao-coef', type=float, default=0.2, help='AO-o teacher action imitation weight')
     parser.add_argument('--aux-ol-coef', type=float, default=0.5, help='OL-o teacher reward prediction weight')
@@ -1209,6 +1216,7 @@ def main():
             self_bce_coef=args.self_bce_coef,
             aux_ao_coef=args.aux_ao_coef,
             aux_ol_coef=args.aux_ol_coef,
+            session_chunk_size=args.train_session_chunk_size,
         )
 
         mean_cum_rew_il = float(np.mean(cum_rewards_list_il))
