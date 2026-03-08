@@ -96,9 +96,14 @@ P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
 #     ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
 # ]
 
+# TEACHER_MODES_DEFAULT = [
+#    ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+# ]
+
 TEACHER_MODES_DEFAULT = [
-   ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
+    ("learning",  {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
 ]
+
 
 num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
 # Keys used by teacher configs; used to reset env attrs each session to avoid cross-contamination.
