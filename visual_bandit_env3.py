@@ -580,7 +580,7 @@ class TwoChoiceReachingEnv(gym.Env):
 
         terminated = False
         if trial_ended:
-            print("Trial = ", self.trial_index, ", reached:", reached, ", Condition = ", self.trial_cond[self.trial_index], ", K = ", self.K, ", obs_trial=", self.obs_trial, ", selected_side=", chose_side, ", selected_high_reward=", selected_high, ", reward=", reward)
+            # print("Trial = ", self.trial_index, ", reached:", reached, ", Condition = ", self.trial_cond[self.trial_index], ", K = ", self.K, ", obs_trial=", self.obs_trial, ", selected_side=", chose_side, ", selected_high_reward=", selected_high, ", reward=", reward)
             old_pair_idx = self.curr_pair_idx
             # print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
             if self.trial_cond == "AO-o":
@@ -707,7 +707,7 @@ if __name__ == "__main__":
         render_mode="human",
         seed=0,
         session_K=3,
-        session_N=5,
+        session_N=30,
         trial_ms=60000,
         randomize_sides=True,
     )
@@ -720,7 +720,7 @@ if __name__ == "__main__":
         ep_reward = 0.0
         while not done:
             # random policy: small bias upward
-            a = np.array([np.random.uniform(-0.1, 0.1), np.random.uniform(-0.1, -0.1)], dtype=np.float32)
+            a = np.array([np.random.uniform(-0.01, 0.01), np.random.uniform(-0.01, -0.01)], dtype=np.float32)
             obs, r, term, trunc, info = env.step(a)
             # print("a:", a)
             ep_reward += r

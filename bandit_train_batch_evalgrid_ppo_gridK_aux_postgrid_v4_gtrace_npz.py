@@ -570,14 +570,14 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         return v
 
     while not done:
-        obs_tensor = (
-            torch.as_tensor(obs, device=device)
-            .permute(2, 0, 1).unsqueeze(0)
-            .to(torch.float32).div_(255.0)
-        )
-
-        # CHOICE at trial start
+        # CHOICE at trial start — obs_tensor is only needed here (for CNN encoding).
+        # Skipping it on every motor step eliminates ~8 000 large tensor ops per session.
         if ep_start_flag == 1.0:
+            obs_tensor = (
+                torch.as_tensor(obs, device=device)
+                .permute(2, 0, 1).unsqueeze(0)
+                .to(torch.float32).div_(255.0)
+            )
             left_view, right_view = extract_lr_views(obs_tensor, env, crop_size=112, pad=6)
             curr_trial_condition = info.get("curr_trial_condition")
 
@@ -585,8 +585,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             right_feats = agent.encode(right_view)  # (1,F)
 
             if return_obs:
-                left_obs.append(left_view.squeeze(0).detach().cpu().numpy())
-                right_obs.append(right_view.squeeze(0).detach().cpu().numpy())
+                # Store uint8 (0-255) instead of float32 (0-1) — 4× smaller Ray transfer.
+                # update2 (learner) decodes back to float32 on the GPU.
+                left_obs.append(left_view.squeeze(0).mul(255.0).clamp_(0, 255).byte().cpu().numpy())
+                right_obs.append(right_view.squeeze(0).mul(255.0).clamp_(0, 255).byte().cpu().numpy())
 
             # Self-choice trials
             if curr_trial_condition not in ("AO-o", "OL-o"):
@@ -869,23 +871,28 @@ class RolloutWorker:
                     # Fallback: store raw value
                     self._teacher_defaults[k] = getattr(uw, k)
 
+        # Build the agent once and reuse it across sessions (load_state_dict only).
+        _hidden = 128
+        _fdim   = 128
+        self._agent = bl.BanditLearner(
+            input_size=_fdim + 1,
+            feature_dim=_fdim,
+            rnn_hidden_size=_hidden,
+            action_dim=2,
+            num_pairs=session_K,
+            max_trials=session_N * session_K,
+        ).to(self.device)
+        self._agent.eval()
+
+        # Limit intra-op threads so workers don't fight over CPU cores.
+        torch.set_num_threads(1)
+
     def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True):
         """Run one session with given pair probs. teacher_eps is optional (only used if env supports it)."""
-        hidden_size = 128
-        feature_dim = 128
-        input_size = feature_dim + 1
-
-        agent = bl.BanditLearner(
-            input_size=input_size,
-            feature_dim=feature_dim,
-            rnn_hidden_size=hidden_size,
-            action_dim=2,
-            num_pairs=self.session_K,
-            max_trials=self.session_N * self.session_K,
-        ).to(self.device)
-
-        agent.load_state_dict(agent_state_dict)
-        agent.eval()
+        # Reuse the pre-built agent — just hot-swap weights (much cheaper than full construction).
+        self._agent.load_state_dict(agent_state_dict)
+        self._agent.eval()
+        agent = self._agent
 
         self.env.unwrapped.pair_probs = probs_this_session
 
@@ -936,7 +943,12 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
                  batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards, batch_meta_ep_start,
                  batch_actor, batch_trial_cond, batch_teacher_correct,
-                 batch_logp_old, batch_v_old, device, ppo_epochs: int = 4, ppo_minibatch_size: int = 256, aux_mb_size: int = 256, self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5, session_chunk_size: int = 10):
+                 batch_logp_old, batch_v_old, device,
+                 ppo_epochs: int = 4, ppo_minibatch_size: int = 256,
+                 aux_mb_size: int = 256,
+                 self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5,
+                 gate_ao_coef: float = 0.5, gate_ol_coef: float = 0.5, gate_ol_sg: bool = True,
+                 session_chunk_size: int = 10):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -958,6 +970,9 @@ def _call_update2(agent, optim_bandit, optim_motor,
         self_bce_coef=self_bce_coef,
         aux_ao_coef=aux_ao_coef,
         aux_ol_coef=aux_ol_coef,
+        gate_ao_coef=gate_ao_coef,
+        gate_ol_coef=gate_ol_coef,
+        gate_ol_sg=gate_ol_sg,
         session_chunk_size=session_chunk_size,
     )
 
@@ -986,6 +1001,15 @@ def main():
     parser.add_argument('--self-bce-coef', type=float, default=1.0, help='Self-choice fused-belief BCE weight')
     parser.add_argument('--aux-ao-coef', type=float, default=0.2, help='AO-o teacher action imitation weight')
     parser.add_argument('--aux-ol-coef', type=float, default=0.5, help='OL-o teacher reward prediction weight')
+
+    # Gate reliability losses  L_gate,ao = BCE(g_ao, ao_rel_target)
+    #                           L_gate,ol = BCE(sg(g_ol), ol_rel_target)
+    parser.add_argument('--gate-ao-coef', type=float, default=0.5,
+                        help='Weight for AO gate reliability BCE loss (g_ao vs running AO-o teacher accuracy).')
+    parser.add_argument('--gate-ol-coef', type=float, default=0.5,
+                        help='Weight for OL gate reliability BCE loss (g_ol vs running OL-o teacher accuracy).')
+    parser.add_argument('--no-gate-ol-sg', dest='gate_ol_sg', action='store_false', default=True,
+                        help='Disable stop-gradient on g_ol in the OL gate loss (default: sg enabled, matching ↓ in formula).')
 
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
@@ -1094,111 +1118,103 @@ def main():
                    for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
     assert len(train_cells) == num_grid_cells, f'Expected {num_grid_cells} grid cells, got {len(train_cells)}'
 
+    # -----------------------------------------------------------------
+    # Helper: build shuffled cell list and dispatch all B rollout futures
+    # at once using a single ray.put state-dict reference (avoids the
+    # original W×serialise overhead and the mid-batch blocking barrier).
+    # -----------------------------------------------------------------
+    def _build_cell_list():
+        cells = train_cells * int(args.grid_repeats)
+        rng_train.shuffle(cells)
+        return cells
+
+    def _dispatch_rollouts(cells, agent_state_ref, update_idx):
+        """Fire all B run_session tasks without waiting; returns future list."""
+        futures = []
+        for i, (p_lo, mode_name, cfg) in enumerate(cells):
+            probs = sample_probs_this_session(
+                session_K, p_hi=float(args.p_hi), p_lo=float(p_lo), rng=rng_train)
+            print_flag = (i == 0) and (update_idx % 10 == 0)
+            futures.append(
+                workers[i % W].run_session.remote(
+                    agent_state_ref,
+                    probs,
+                    print_this_session=print_flag,
+                    teacher_cfg=cfg,
+                )
+            )
+        return futures
+
+    def _collect_rollouts(rollout_results):
+        """Unpack ray results into training batch lists."""
+        bxy, bgv, bcbm = [], [], []
+        bobs, bcb, bbr, bmes = [], [], [], []
+        bac, btc, btcor = [], [], []
+        blp, bvold = [], []
+        cr_il, cr_ao, cr_ol = [], [], []
+        hrc_il, hrc_ao, hrc_ol = [], [], []
+
+        for res in rollout_results:
+            (
+                xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
+                obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf,
+                actor_buf, trial_cond_buf,
+                teacher_correct_buf,
+                cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
+                pct_hi_il, pct_hi_ao, pct_hi_ol,
+                high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol,
+                logp_old_buf, v_old_buf, _, _
+            ) = res
+
+            bxy.extend(xy_pos_buf)
+            bgv.extend(goal_vec_buf)
+            bcbm.extend(chosen_bandits_motor_buf)
+            bobs.append(obs_bandit)
+            bcb.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
+            bbr.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
+            bmes.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
+            bac.append(torch.as_tensor(np.stack(actor_buf), dtype=torch.long))
+            btc.append(np.stack(trial_cond_buf))
+            btcor.append(torch.as_tensor(np.stack(teacher_correct_buf), dtype=torch.float32))
+            blp.append(torch.as_tensor(np.stack(logp_old_buf), dtype=torch.float32))
+            bvold.append(torch.as_tensor(np.stack(v_old_buf), dtype=torch.float32))
+            cr_il.append(cum_rewards_il)
+            cr_ao.append(cum_rewards_ao)
+            cr_ol.append(cum_rewards_ol)
+            hrc_il.append(high_reward_choices_il)
+            hrc_ao.append(high_reward_choices_ao)
+            hrc_ol.append(high_reward_choices_ol)
+
+        return (bxy, bgv, bcbm, bobs, bcb, bbr, bmes, bac, btc, btcor, blp, bvold,
+                cr_il, cr_ao, cr_ol, hrc_il, hrc_ao, hrc_ol)
+
+    # -----------------------------------------------------------------
+    # Pre-launch the very first batch so workers are busy immediately.
+    # -----------------------------------------------------------------
+    cells_cur = _build_cell_list()
+    agent_state_ref = ray.put({k: v.detach().cpu() for k, v in agent.state_dict().items()})
+    pending_futures = _dispatch_rollouts(cells_cur, agent_state_ref, update_idx=0)
 
     for update_idx in range(num_updates):
-        total_sessions_collected = 0
-
-        # Build a balanced list of grid cells for this update: K repeats of all 20 cells, then shuffle.
-        cells_update = train_cells * int(args.grid_repeats)
-        rng_train.shuffle(cells_update)
-
-        batch_xy_pos = []
-        batch_goal_vec = []
-        batch_chosen_bandits_motor = []
-        batch_bandit_obs = []
-        batch_chosen_bandits = []
-        batch_bandit_rewards = []
-        batch_meta_ep_start = []
-        batch_actor = []
-        batch_trial_cond = []
-        batch_teacher_correct = []
-        batch_actions = []
-        batch_logp_old = []
-        batch_v_old = []
-        batch_policy_mask = []
-
-
-        cum_rewards_list_il = []
-        cum_rewards_list_ao = []
-        cum_rewards_list_ol = []
-
-        cum_high_reward_choices_il = []
-        cum_high_reward_choices_ao = [] 
-        cum_high_reward_choices_ol = []
-
         p_hi = args.p_hi
-        p_lo_min = args.p_lo_min
-        p_lo_max = args.p_lo_max
 
-        while total_sessions_collected < B:
-            remaining = B - total_sessions_collected
-            num_launch = min(W, remaining)
-            # Take the next num_launch grid cells for this update (balanced coverage)
-            slice_cells = cells_update[total_sessions_collected: total_sessions_collected + num_launch]
-            probs_list = []
-            teacher_cfg_list = []
-            # (Optional debug) keep p_lo/mode for logging if you want
-            # cell_meta = []
-            for (p_lo, mode_name, cfg) in slice_cells:
-                probs_this_session = sample_probs_this_session(session_K, p_hi=float(args.p_hi), p_lo=float(p_lo), rng=rng_train)
-                probs_list.append(probs_this_session)
-                teacher_cfg_list.append(cfg)
-                # cell_meta.append((p_lo, mode_name))
+        # ---- collect the rollouts that were dispatched BEFORE this update ----
+        rollout_results = ray.get(pending_futures)
 
-            agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
+        # ---- dispatch the NEXT batch immediately (overlaps with GPU update) ----
+        if update_idx + 1 < num_updates:
+            cells_next     = _build_cell_list()
+            agent_state_ref = ray.put({k: v.detach().cpu() for k, v in agent.state_dict().items()})
+            pending_futures = _dispatch_rollouts(cells_next, agent_state_ref, update_idx + 1)
 
-            rollout_futures = []
-            for w_id in range(num_launch):
-                print_flag = (w_id == 0) and (total_sessions_collected == 0) and (update_idx % 10 == 0)
-                # print(f'w_id={w_id} probs={probs_list[w_id]} teacher_cfg={teacher_cfg_list[w_id]}')
-                rollout_futures.append(
-                    workers[w_id].run_session.remote(
-                        agent_state_cpu,
-                        probs_list[w_id],
-                        print_this_session=print_flag,
-                        teacher_cfg=teacher_cfg_list[w_id]
-                    )
-                )
-
-            rollout_results = ray.get(rollout_futures)
-
-            for res in rollout_results:
-                (
-                    xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
-                    obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf,
-                    actor_buf, trial_cond_buf,
-                    teacher_correct_buf,
-                    cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
-                    pct_hi_il, pct_hi_ao, pct_hi_ol,
-                    high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol, logp_old_buf, v_old_buf, _, _
-                ) = res
-
-                batch_xy_pos.extend(xy_pos_buf)
-                batch_goal_vec.extend(goal_vec_buf)
-                batch_chosen_bandits_motor.extend(chosen_bandits_motor_buf)
-                batch_bandit_obs.append(obs_bandit)
-                batch_chosen_bandits.append(torch.as_tensor(np.stack(chosen_bandits_buf), dtype=torch.float32))
-                batch_bandit_rewards.append(torch.as_tensor(np.stack(bandit_rewards_buf), dtype=torch.float32))
-                batch_meta_ep_start.append(torch.as_tensor(np.stack(meta_ep_start_buf), dtype=torch.float32))
-                batch_actor.append(torch.as_tensor(np.stack(actor_buf), dtype=torch.long))
-                batch_trial_cond.append(np.stack(trial_cond_buf))
-                batch_teacher_correct.append(torch.as_tensor(np.stack(teacher_correct_buf), dtype=torch.float32))
-                batch_logp_old.append(torch.as_tensor(np.stack(logp_old_buf), dtype=torch.float32))
-                batch_v_old.append(torch.as_tensor(np.stack(v_old_buf), dtype=torch.float32))
-
-
-                cum_rewards_list_il.append(cum_rewards_il)
-                cum_rewards_list_ao.append(cum_rewards_ao)
-                cum_rewards_list_ol.append(cum_rewards_ol)
-
-                cum_high_reward_choices_il.append(high_reward_choices_il)
-                cum_high_reward_choices_ao.append(high_reward_choices_ao)
-                cum_high_reward_choices_ol.append(high_reward_choices_ol)
-
-
-                total_sessions_collected += 1
-                if total_sessions_collected >= B:
-                    break
+        # ---- unpack results ----
+        (batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
+         batch_bandit_obs, batch_chosen_bandits, batch_bandit_rewards,
+         batch_meta_ep_start, batch_actor, batch_trial_cond,
+         batch_teacher_correct, batch_logp_old, batch_v_old,
+         cum_rewards_list_il, cum_rewards_list_ao, cum_rewards_list_ol,
+         cum_high_reward_choices_il, cum_high_reward_choices_ao,
+         cum_high_reward_choices_ol) = _collect_rollouts(rollout_results)
 
         var_loss, motor_loss = _call_update2(
             agent, optim_bandit, optim_motor,
@@ -1221,6 +1237,9 @@ def main():
             self_bce_coef=args.self_bce_coef,
             aux_ao_coef=args.aux_ao_coef,
             aux_ol_coef=args.aux_ol_coef,
+            gate_ao_coef=args.gate_ao_coef,
+            gate_ol_coef=args.gate_ol_coef,
+            gate_ol_sg=args.gate_ol_sg,
             session_chunk_size=args.train_session_chunk_size,
         )
 
