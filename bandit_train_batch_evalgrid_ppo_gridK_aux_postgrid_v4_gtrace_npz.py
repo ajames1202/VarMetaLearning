@@ -12,6 +12,7 @@
 
 import argparse
 import copy
+import json
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -25,13 +26,11 @@ import ray
 
 import visual_bandit_env3 as vbe
 
-# Prefer updated learner if present; fall back to original.
 import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
 from datetime import datetime
-import time
 
 
 
@@ -89,21 +88,15 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
 # Default training/eval grid (can edit here)
 P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
 
-# Teacher modes (env attributes are set only if they exist)
-# TEACHER_MODES_DEFAULT = [
-#     ("expert",      {"expert_teacher": True,  "unrealiable_teacher": False, "eps": 0.10}),
-#     ("slow",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.05, 0.05], "tau": [0.33, 0.33, 0.33]}),
-#     ("fast",        {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.50, 0.50], "tau": [0.33, 0.33, 0.33]}),
-#     ("unreliable",  {"expert_teacher": False, "unrealiable_teacher": True}),
-# ]
-
-# TEACHER_MODES_DEFAULT = [
-#    ("expert",  {"expert_teacher": True, "unrealiable_teacher": False, "eps": 0.10}),
-# ]
-
-TEACHER_MODES_DEFAULT = [
-    ("learning",  {"expert_teacher": False, "unrealiable_teacher": False, "alpha": [0.0, 0.288, 0.288], "tau": [0.33, 0.33, 0.33]}),
+_DEFAULT_TEACHER_MODES = [
+    ["expert", {"expert_teacher": True, "unrealiable_teacher": False, "eps": 0.10}],
 ]
+
+_raw_teacher_modes = json.loads(
+    os.environ.get("TEACHER_MODES_DEFAULT", json.dumps(_DEFAULT_TEACHER_MODES))
+)
+
+TEACHER_MODES_DEFAULT = [(name, cfg) for name, cfg in _raw_teacher_modes]
 
 
 num_grid_cells = len(P_LO_GRID_DEFAULT) * len(TEACHER_MODES_DEFAULT)
@@ -247,6 +240,7 @@ def eval_post_grid(
             "cum_rew_il": [], "cum_rew_ao": [], "cum_rew_ol": [],
             "pertrial_il": [], "pertrial_ao": [], "pertrial_ol": [],
             "gtrace_ao": [], "gtrace_ol": [],
+            "ao_rel": [], "ol_rel": [],   # per-session reliability target traces
         })
         d["pct_hi_il"].append(float(pct_hi_il))
         d["pct_hi_ao"].append(float(pct_hi_ao))
@@ -266,6 +260,8 @@ def eval_post_grid(
             x = np.asarray(x, dtype=np.float32)
             return float(x.mean()), float(x.std(ddof=0))
 
+        n_sess = len(d["pct_hi_il"])
+
         il_m, il_s = _mstd(d["pct_hi_il"])
         ao_m, ao_s = _mstd(d["pct_hi_ao"])
         ol_m, ol_s = _mstd(d["pct_hi_ol"])
@@ -273,40 +269,47 @@ def eval_post_grid(
         rao_m, rao_s = _mstd(d["cum_rew_ao"])
         rol_m, rol_s = _mstd(d["cum_rew_ol"])
 
-        pt_il = np.stack(d["pertrial_il"], axis=0)
+        # per-trial hit rates: (n_sessions, session_N) float32 with possible NaN at
+        # unvisited positions → use nanmean/nanstd; convert std → SE for plotting
+        pt_il = np.stack(d["pertrial_il"], axis=0)   # (S, T) in [0,1] or NaN
         pt_ao = np.stack(d["pertrial_ao"], axis=0)
         pt_ol = np.stack(d["pertrial_ol"], axis=0)
+        pt_il_mean = np.nanmean(pt_il, axis=0)
+        pt_ao_mean = np.nanmean(pt_ao, axis=0)
+        pt_ol_mean = np.nanmean(pt_ol, axis=0)
+        # per-position valid count (may differ if some positions were never reached)
+        pt_il_n = np.sum(~np.isnan(pt_il), axis=0).clip(min=1)
+        pt_ao_n = np.sum(~np.isnan(pt_ao), axis=0).clip(min=1)
+        pt_ol_n = np.sum(~np.isnan(pt_ol), axis=0).clip(min=1)
+        pt_il_se = np.nanstd(pt_il, axis=0, ddof=0) / np.sqrt(pt_il_n)
+        pt_ao_se = np.nanstd(pt_ao, axis=0, ddof=0) / np.sqrt(pt_ao_n)
+        pt_ol_se = np.nanstd(pt_ol, axis=0, ddof=0) / np.sqrt(pt_ol_n)
 
-        g_ao = np.stack(d["gtrace_ao"], axis=0)
+        # g traces: use nanmean/SE across sessions
+        g_ao = np.stack(d["gtrace_ao"], axis=0)   # (S, T)
         g_ol = np.stack(d["gtrace_ol"], axis=0)
-        gao_mu = np.nanmean(g_ao, axis=0)
-        gao_sd = np.nanstd(g_ao, axis=0, ddof=0)
-        gol_mu = np.nanmean(g_ol, axis=0)
-        gol_sd = np.nanstd(g_ol, axis=0, ddof=0)
+        gao_n   = np.sum(~np.isnan(g_ao), axis=0).clip(min=1)
+        gol_n   = np.sum(~np.isnan(g_ol), axis=0).clip(min=1)
+        gao_mu  = np.nanmean(g_ao, axis=0)
+        gol_mu  = np.nanmean(g_ol, axis=0)
+        gao_sd  = np.nanstd(g_ao,  axis=0, ddof=0)
+        gol_sd  = np.nanstd(g_ol,  axis=0, ddof=0)
+        gao_se  = gao_sd / np.sqrt(gao_n)   # uncertainty on the mean
+        gol_se  = gol_sd / np.sqrt(gol_n)
 
         cell_stats[cell] = {
-            "pct_hi_il_mean": il_m,
-            "pct_hi_il_std": il_s,
-            "pct_hi_ao_mean": ao_m,
-            "pct_hi_ao_std": ao_s,
-            "pct_hi_ol_mean": ol_m,
-            "pct_hi_ol_std": ol_s,
-            "cum_rew_il_mean": ril_m,
-            "cum_rew_il_std": ril_s,
-            "cum_rew_ao_mean": rao_m,
-            "cum_rew_ao_std": rao_s,
-            "cum_rew_ol_mean": rol_m,
-            "cum_rew_ol_std": rol_s,
-            "pertrial_il_mean": pt_il.mean(axis=0),
-            "pertrial_il_std": pt_il.std(axis=0, ddof=0),
-            "pertrial_ao_mean": pt_ao.mean(axis=0),
-            "pertrial_ao_std": pt_ao.std(axis=0, ddof=0),
-            "pertrial_ol_mean": pt_ol.mean(axis=0),
-            "pertrial_ol_std": pt_ol.std(axis=0, ddof=0),
-            "gtrace_ao_mean": gao_mu,
-            "gtrace_ao_std": gao_sd,
-            "gtrace_ol_mean": gol_mu,
-            "gtrace_ol_std": gol_sd,
+            "n_sessions": n_sess,
+            "pct_hi_il_mean": il_m,  "pct_hi_il_std": il_s,
+            "pct_hi_ao_mean": ao_m,  "pct_hi_ao_std": ao_s,
+            "pct_hi_ol_mean": ol_m,  "pct_hi_ol_std": ol_s,
+            "cum_rew_il_mean": ril_m, "cum_rew_il_std": ril_s,
+            "cum_rew_ao_mean": rao_m, "cum_rew_ao_std": rao_s,
+            "cum_rew_ol_mean": rol_m, "cum_rew_ol_std": rol_s,
+            "pertrial_il_mean": pt_il_mean, "pertrial_il_se": pt_il_se,
+            "pertrial_ao_mean": pt_ao_mean, "pertrial_ao_se": pt_ao_se,
+            "pertrial_ol_mean": pt_ol_mean, "pertrial_ol_se": pt_ol_se,
+            "gtrace_ao_mean": gao_mu, "gtrace_ao_se": gao_se, "gtrace_ao_std": gao_sd,
+            "gtrace_ol_mean": gol_mu, "gtrace_ol_se": gol_se, "gtrace_ol_std": gol_sd,
             "gtrace_ao_mean_over_trials": float(np.nanmean(gao_mu)),
             "gtrace_ol_mean_over_trials": float(np.nanmean(gol_mu)),
         }
@@ -343,9 +346,14 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     pair_index_counter_il = np.ones(session_K, dtype=np.int32) * -1
     pair_index_counter_ao = np.ones(session_K, dtype=np.int32) * -1
     pair_index_counter_ol = np.ones(session_K, dtype=np.int32) * -1
+    # numerator: high-reward choices at each within-pair position
     high_reward_choices_il = np.zeros(session_N, dtype=np.int32)
-    high_reward_choice_ao = np.zeros(session_N, dtype=np.int32)
-    high_reward_choice_ol = np.zeros(session_N, dtype=np.int32)
+    high_reward_choice_ao  = np.zeros(session_N, dtype=np.int32)
+    high_reward_choice_ol  = np.zeros(session_N, dtype=np.int32)
+    # denominator: total choices (high + low) at each position — needed for a proper hit rate
+    total_choices_il = np.zeros(session_N, dtype=np.int32)
+    total_choices_ao = np.zeros(session_N, dtype=np.int32)
+    total_choices_ol = np.zeros(session_N, dtype=np.int32)
 
     # scalar accuracy counters for self-choice trials
     hi_cnt_il = hi_cnt_ao = hi_cnt_ol = 0
@@ -736,13 +744,22 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
                 if sh == 1:
                     hi_cnt_ol += 1
 
-            # legacy per-index counters (kept for your per-trial plot)
-            if (curr_trial_condition == "IL") and (sh == 1):
-                high_reward_choices_il[pair_index_counter_il[pair_index_ep]] += 1
-            elif (curr_trial_condition == "AO-s") and (sh == 1):
-                high_reward_choice_ao[pair_index_counter_ao[pair_index_ep]] += 1
-            elif (curr_trial_condition == "OL-s") and (sh == 1):
-                high_reward_choice_ol[pair_index_counter_ol[pair_index_ep]] += 1        
+            # legacy per-index counters (per-trial plot)
+            if curr_trial_condition == "IL":
+                pos = pair_index_counter_il[pair_index_ep]
+                total_choices_il[pos] += 1
+                if sh == 1:
+                    high_reward_choices_il[pos] += 1
+            elif curr_trial_condition == "AO-s":
+                pos = pair_index_counter_ao[pair_index_ep]
+                total_choices_ao[pos] += 1
+                if sh == 1:
+                    high_reward_choice_ao[pos] += 1
+            elif curr_trial_condition == "OL-s":
+                pos = pair_index_counter_ol[pair_index_ep]
+                total_choices_ol[pos] += 1
+                if sh == 1:
+                    high_reward_choice_ol[pos] += 1
 
 
             pair_probs = env.unwrapped.pair_probs
@@ -805,8 +822,18 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     pct_hi_ol = 100.0 * float(hi_cnt_ol) / float(max(tot_ol, 1))
 
     high_reward_choices_il = np.array(high_reward_choices_il, dtype=np.int32)
-    high_reward_choices_ao = np.array(high_reward_choice_ao, dtype=np.int32)
-    high_reward_choices_ol = np.array(high_reward_choice_ol, dtype=np.int32)
+    high_reward_choices_ao = np.array(high_reward_choice_ao,  dtype=np.int32)
+    high_reward_choices_ol = np.array(high_reward_choice_ol,  dtype=np.int32)
+
+    # Convert to proper hit-rate in [0,1] using the actual denominator at each position.
+    # Positions never visited (total_choices == 0) get NaN so they don't pollute the mean.
+    def _hit_rate(num, den):
+        den = np.asarray(den, dtype=np.float32)
+        return np.where(den > 0, num.astype(np.float32) / den, np.nan)
+
+    pertrial_rate_il = _hit_rate(high_reward_choices_il, total_choices_il)
+    pertrial_rate_ao = _hit_rate(high_reward_choices_ao, total_choices_ao)
+    pertrial_rate_ol = _hit_rate(high_reward_choices_ol, total_choices_ol)
 
     # Mean gate value per within-pair trial index (NaN where not observed in this session)
     g_trace_ao = np.where(g_trace_ao_cnt > 0, g_trace_ao_sum / np.maximum(g_trace_ao_cnt, 1), np.nan).astype(np.float32)
@@ -829,7 +856,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         teacher_correct_buf,
         cum_rewards_il, cum_rewards_ao, cum_rewards_ol,
         pct_hi_il, pct_hi_ao, pct_hi_ol,
-        high_reward_choices_il, high_reward_choices_ao, high_reward_choices_ol,
+        pertrial_rate_il, pertrial_rate_ao, pertrial_rate_ol,   # proper [0,1] hit rates
         bandit_logp_buf, bandit_value_buf,
         g_trace_ao, g_trace_ol
     )
@@ -1197,10 +1224,8 @@ def main():
     for update_idx in range(num_updates):
         p_hi = args.p_hi
 
-        t0 = time.perf_counter()
         # ---- collect the rollouts that were dispatched BEFORE this update ----
         rollout_results = ray.get(pending_futures)
-        t_rollout = time.perf_counter() - t0
 
         # ---- dispatch the NEXT batch immediately (overlaps with GPU update) ----
         if update_idx + 1 < num_updates:
@@ -1244,9 +1269,6 @@ def main():
             session_chunk_size=args.train_session_chunk_size,
         )
 
-        t_update = time.perf_counter() - (t0 + t_rollout)
-
-
         mean_cum_rew_il = float(np.mean(cum_rewards_list_il))
         mean_cum_rew_ao = float(np.mean(cum_rewards_list_ao))
         mean_cum_rew_ol = float(np.mean(cum_rewards_list_ol))
@@ -1262,7 +1284,6 @@ def main():
         #train_score = mean_hi_choices_il + mean_hi_choices_ao + mean_hi_choices_ol
 
         if update_idx % 10 == 0:
-            print(f"[timing] rollout={t_rollout:.1f}s  update={t_update:.1f}s")
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"mean_hi_choices_il={mean_hi_choices_il:.1f} mean_hi_choices_ao={mean_hi_choices_ao:.1f} mean_hi_choices_ol={mean_hi_choices_ol:.1f} "
                   f"mean_cum_rew_il={mean_cum_rew_il:.1f} mean_cum_rew_ao={mean_cum_rew_ao:.1f} mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
@@ -1472,7 +1493,7 @@ def main():
                     )
 
         # ------------------
-        # Save raw g traces (mean/std) per cell as a compact NPZ (easy to load later)
+        # Save raw g traces (mean/std/se) per cell
         # ------------------
         npz_path = os.path.join(run_dir, "PostGrid_gTrace_arrays.npz")
         npz_payload: Dict[str, Any] = {}
@@ -1484,16 +1505,113 @@ def main():
                     continue
                 tag = f"mode={mode_name}__pLo={float(p_lo):.2f}"
                 npz_payload[f"gAO_mean__{tag}"] = np.asarray(st["gtrace_ao_mean"], dtype=np.float32)
-                npz_payload[f"gAO_std__{tag}"]  = np.asarray(st["gtrace_ao_std"], dtype=np.float32)
+                npz_payload[f"gAO_std__{tag}"]  = np.asarray(st["gtrace_ao_std"],  dtype=np.float32)
+                npz_payload[f"gAO_se__{tag}"]   = np.asarray(st["gtrace_ao_se"],   dtype=np.float32)
                 npz_payload[f"gOL_mean__{tag}"] = np.asarray(st["gtrace_ol_mean"], dtype=np.float32)
-                npz_payload[f"gOL_std__{tag}"]  = np.asarray(st["gtrace_ol_std"], dtype=np.float32)
+                npz_payload[f"gOL_std__{tag}"]  = np.asarray(st["gtrace_ol_std"],  dtype=np.float32)
+                npz_payload[f"gOL_se__{tag}"]   = np.asarray(st["gtrace_ol_se"],   dtype=np.float32)
+                npz_payload[f"n_sessions__{tag}"] = np.array(st["n_sessions"], dtype=np.int32)
         if len(npz_payload) > 0:
             np.savez(npz_path, **npz_payload)
 
         # ------------------
-        # Per-cell plots (per-trial + summary high-arm pick rate)
+        # Save comprehensive per-trial / performance arrays for notebook analysis
+        # Includes: pertrial hit rates, cumulative pick rate, regret, TTC,
+        #           and gate calibration (reliability targets) per cell.
+        # Key format: {metric}__{tag}   tag = "mode={mode}__pLo={p_lo:.2f}"
         # ------------------
+        perf_npz_path = os.path.join(run_dir, "PostGrid_perf_arrays.npz")
+        perf_payload: Dict[str, Any] = {}
+
+        _TTC_THRESHOLDS = [0.70, 0.80, 0.90]
+
+        def _compute_ttc(sm: np.ndarray, thresholds) -> np.ndarray:
+            """First trial index where smoothed mean >= each threshold; session_N if never."""
+            out = []
+            for thr in thresholds:
+                idx = np.where(sm >= thr)[0]
+                out.append(int(idx[0]) if len(idx) > 0 else int(session_N))
+            return np.array(out, dtype=np.int32)
+
+        def _rolling(x: np.ndarray, w: int = 5) -> np.ndarray:
+            if len(x) < w or w <= 1:
+                return x.copy()
+            kernel = np.ones(w) / w
+            return np.convolve(np.pad(x, w // 2, mode="edge"), kernel, mode="valid")[:len(x)]
+
+        for p_lo in p_lo_grid:
+            for mode_name, _cfg in teacher_modes:
+                k = (float(p_lo), str(mode_name))
+                st = cell_stats.get(k)
+                if st is None:
+                    continue
+                tag = f"mode={mode_name}__pLo={float(p_lo):.2f}"
+                gap = p_hi - float(p_lo)
+
+                # ── per-trial hit rates (mean and SE, shape (T,)) ──
+                for cond in ("il", "ao", "ol"):
+                    perf_payload[f"pertrial_{cond}_mean__{tag}"] = np.asarray(st[f"pertrial_{cond}_mean"], dtype=np.float32)
+                    perf_payload[f"pertrial_{cond}_se__{tag}"]   = np.asarray(st[f"pertrial_{cond}_se"],   dtype=np.float32)
+
+                # ── cumulative pick rate (T,): running mean of per-trial hit rate ──
+                for cond in ("il", "ao", "ol"):
+                    raw  = np.nan_to_num(np.asarray(st[f"pertrial_{cond}_mean"], np.float32), nan=0.5)
+                    denom = np.arange(1, len(raw) + 1, dtype=np.float32)
+                    cum = np.cumsum(raw) / denom
+                    perf_payload[f"cum_pickrate_{cond}__{tag}"] = cum.astype(np.float32)
+
+                # ── regret = 1 − P(high-reward choice), smoothed (T,) ──
+                for cond in ("il", "ao", "ol"):
+                    raw = np.nan_to_num(np.asarray(st[f"pertrial_{cond}_mean"], np.float32), nan=0.5)
+                    perf_payload[f"regret_{cond}__{tag}"] = (1.0 - _rolling(raw)).astype(np.float32)
+
+                # ── TTC: first trial >= threshold, shape (3,) one value per threshold ──
+                for cond in ("il", "ao", "ol"):
+                    raw = np.nan_to_num(np.asarray(st[f"pertrial_{cond}_mean"], np.float32), nan=0.5)
+                    sm  = _rolling(raw)
+                    perf_payload[f"ttc_{cond}__{tag}"] = _compute_ttc(sm, _TTC_THRESHOLDS)
+
+                # ── TTC threshold values (scalar array, same for all cells) ──
+                perf_payload["ttc_thresholds"] = np.array(_TTC_THRESHOLDS, dtype=np.float32)
+
+                # ── scalar summary stats (wrapped as 0-d or 1-d arrays) ──
+                for stat in ("pct_hi_il_mean", "pct_hi_il_std",
+                             "pct_hi_ao_mean", "pct_hi_ao_std",
+                             "pct_hi_ol_mean", "pct_hi_ol_std",
+                             "cum_rew_il_mean", "cum_rew_ao_mean", "cum_rew_ol_mean"):
+                    perf_payload[f"{stat}__{tag}"] = np.array(st[stat], dtype=np.float32)
+
+                perf_payload[f"n_sessions__{tag}"] = np.array(st["n_sessions"], dtype=np.int32)
+                perf_payload[f"gap__{tag}"]        = np.array(gap, dtype=np.float32)
+
+                # ── gate calibration: ao_rel_target / ol_rel_target if present ──
+                if "ao_rel_target_mean" in st:
+                    perf_payload[f"ao_rel_target_mean__{tag}"] = np.asarray(st["ao_rel_target_mean"], dtype=np.float32)
+                    perf_payload[f"ol_rel_target_mean__{tag}"] = np.asarray(st["ol_rel_target_mean"], dtype=np.float32)
+                # always save gate means for calibration subplot
+                perf_payload[f"gAO_mean__{tag}"] = np.asarray(st["gtrace_ao_mean"], dtype=np.float32)
+                perf_payload[f"gAO_se__{tag}"]   = np.asarray(st["gtrace_ao_se"],   dtype=np.float32)
+                perf_payload[f"gOL_mean__{tag}"] = np.asarray(st["gtrace_ol_mean"], dtype=np.float32)
+                perf_payload[f"gOL_se__{tag}"]   = np.asarray(st["gtrace_ol_se"],   dtype=np.float32)
+
+        if perf_payload:
+            np.savez(perf_npz_path, **perf_payload)
+            print(f"[PostGrid] Saved performance arrays → {perf_npz_path}")
+
+        # ------------------
+        # Helper: rolling mean smoothing (preserves endpoints)
+        # ------------------
+        def _smooth(x: np.ndarray, w: int = 5) -> np.ndarray:
+            if len(x) < w:
+                return x.copy()
+            kernel = np.ones(w) / w
+            pad = w // 2
+            return np.convolve(
+                np.pad(x, pad, mode="edge"), kernel, mode="valid"
+            )[:len(x)]
+
         trials = np.arange(session_N)
+
         for p_lo in p_lo_grid:
             for mode_name, _cfg in teacher_modes:
                 k = (float(p_lo), str(mode_name))
@@ -1502,69 +1620,226 @@ def main():
                 st = cell_stats[k]
                 gap = p_hi - float(p_lo)
 
-                # per-trial curve
-                fig, ax = plt.subplots(figsize=(6, 4))
-                ax.plot(trials, st["pertrial_il_mean"], label="IL")
-                ax.plot(trials, st["pertrial_ao_mean"], label="AO")
-                ax.plot(trials, st["pertrial_ol_mean"], label="OL")
-                ax.set_xlabel("Trial index")
-                ax.set_ylabel("Mean high-reward choice")
+                # ----------------------------------------------------------
+                # 1. Per-trial curve  (smoothed mean ± SE, raw mean faint behind)
+                # ----------------------------------------------------------
+                il_raw = np.nan_to_num(np.asarray(st["pertrial_il_mean"], dtype=np.float32), nan=0.5)
+                ao_raw = np.nan_to_num(np.asarray(st["pertrial_ao_mean"], dtype=np.float32), nan=0.5)
+                ol_raw = np.nan_to_num(np.asarray(st["pertrial_ol_mean"], dtype=np.float32), nan=0.5)
+                il_se  = np.asarray(st["pertrial_il_se"], dtype=np.float32)
+                ao_se  = np.asarray(st["pertrial_ao_se"], dtype=np.float32)
+                ol_se  = np.asarray(st["pertrial_ol_se"], dtype=np.float32)
+                W_sm = 5
+                il_sm = _smooth(il_raw, W_sm)
+                ao_sm = _smooth(ao_raw, W_sm)
+                ol_sm = _smooth(ol_raw, W_sm)
+                # SE also smoothed so bands match the smoothed mean
+                il_se_sm = _smooth(il_se, W_sm)
+                ao_se_sm = _smooth(ao_se, W_sm)
+                ol_se_sm = _smooth(ol_se, W_sm)
+
+                fig, ax = plt.subplots(figsize=(7, 4))
+                # raw (faint background)
+                ax.plot(trials, il_raw, color="C0", alpha=0.20, lw=1)
+                ax.plot(trials, ao_raw, color="C1", alpha=0.20, lw=1)
+                ax.plot(trials, ol_raw, color="C2", alpha=0.20, lw=1)
+                # ±1 SE band on smoothed values
+                ax.fill_between(trials,
+                    np.clip(il_sm - il_se_sm, 0, 1), np.clip(il_sm + il_se_sm, 0, 1),
+                    color="C0", alpha=0.15)
+                ax.fill_between(trials,
+                    np.clip(ao_sm - ao_se_sm, 0, 1), np.clip(ao_sm + ao_se_sm, 0, 1),
+                    color="C1", alpha=0.15)
+                ax.fill_between(trials,
+                    np.clip(ol_sm - ol_se_sm, 0, 1), np.clip(ol_sm + ol_se_sm, 0, 1),
+                    color="C2", alpha=0.15)
+                # smoothed mean (bold)
+                ax.plot(trials, il_sm, color="C0", lw=2, label="IL")
+                ax.plot(trials, ao_sm, color="C1", lw=2, label="AO")
+                ax.plot(trials, ol_sm, color="C2", lw=2, label="OL")
+                ax.axhline(0.5, color="k", ls="--", lw=0.8, alpha=0.4, label="chance")
+                ax.set_ylim(-0.02, 1.02)
+                ax.set_xlabel("Trial index (within pair)")
+                ax.set_ylabel("P(high-reward choice)")
                 ax.set_title(f"Per-trial (mode={mode_name}, p_lo={float(p_lo):.2f}, gap={gap:.2f})")
-                ax.grid(True)
-                ax.legend()
+                ax.grid(True, alpha=0.4)
+                ax.legend(fontsize=9)
                 fig.savefig(
                     os.path.join(run_dir, f"PostGrid_PerTrial_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
-                    dpi=150,
-                    bbox_inches="tight",
+                    dpi=150, bbox_inches="tight",
                 )
                 plt.close(fig)
 
-                # pick-rate bar
+                # ----------------------------------------------------------
+                # 2. Cumulative pick-rate curve  (monotonically informative)
+                # ----------------------------------------------------------
+                il_cum = np.cumsum(il_raw) / (trials + 1)
+                ao_cum = np.cumsum(ao_raw) / (trials + 1)
+                ol_cum = np.cumsum(ol_raw) / (trials + 1)
+
+                fig, ax = plt.subplots(figsize=(7, 4))
+                ax.plot(trials, il_cum, label="IL",  color="C0", lw=2)
+                ax.plot(trials, ao_cum, label="AO",  color="C1", lw=2)
+                ax.plot(trials, ol_cum, label="OL",  color="C2", lw=2)
+                ax.axhline(0.5, color="k", ls="--", lw=0.8, alpha=0.4, label="chance")
+                ax.set_ylim(0.4, 1.02)
+                ax.set_xlabel("Trial index (within pair)")
+                ax.set_ylabel("Cumulative P(high-reward choice)")
+                ax.set_title(f"Cumulative pick-rate (mode={mode_name}, p_lo={float(p_lo):.2f}, gap={gap:.2f})")
+                ax.grid(True, alpha=0.4)
+                ax.legend(fontsize=9)
+                fig.savefig(
+                    os.path.join(run_dir, f"PostGrid_CumPickRate_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                    dpi=150, bbox_inches="tight",
+                )
+                plt.close(fig)
+
+                # ----------------------------------------------------------
+                # 3. Regret curve  (normalised: 0 = optimal, 1 = always-wrong)
+                # regret_t = (p_hi - mean_reward_t) / (p_hi - p_lo)
+                # We proxy mean_reward_t ≈ p_hi * P(high) + p_lo * (1 - P(high))
+                # so regret = p_hi - [p_hi*P + p_lo*(1-P)] / gap
+                #           = (p_hi - p_lo)*(1 - P) / (p_hi - p_lo) = 1 - P(high)
+                # → normalised regret_t = 1 - P(high-reward choice at t)
+                # ----------------------------------------------------------
+                if gap > 0:
+                    reg_il = 1.0 - _smooth(il_raw, W_sm)
+                    reg_ao = 1.0 - _smooth(ao_raw, W_sm)
+                    reg_ol = 1.0 - _smooth(ol_raw, W_sm)
+
+                    fig, ax = plt.subplots(figsize=(7, 4))
+                    ax.plot(trials, reg_il, color="C0", lw=2, label="IL")
+                    ax.plot(trials, reg_ao, color="C1", lw=2, label="AO")
+                    ax.plot(trials, reg_ol, color="C2", lw=2, label="OL")
+                    ax.axhline(0.5, color="k", ls="--", lw=0.8, alpha=0.4, label="chance")
+                    ax.set_ylim(-0.02, 1.02)
+                    ax.set_xlabel("Trial index (within pair)")
+                    ax.set_ylabel("Normalised regret  (1 − P(high))")
+                    ax.set_title(f"Regret (mode={mode_name}, p_lo={float(p_lo):.2f}, gap={gap:.2f})")
+                    ax.grid(True, alpha=0.4)
+                    ax.legend(fontsize=9)
+                    fig.savefig(
+                        os.path.join(run_dir, f"PostGrid_Regret_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                        dpi=150, bbox_inches="tight",
+                    )
+                    plt.close(fig)
+
+                # ----------------------------------------------------------
+                # 4. Time-to-criterion: first trial where smoothed P ≥ threshold
+                #    for three thresholds. Plotted as a simple table/bar chart.
+                # ----------------------------------------------------------
+                thresholds = [0.70, 0.80, 0.90]
+                ttc = {"IL": [], "AO": [], "OL": []}
+                for thr in thresholds:
+                    for lbl, sm in [("IL", il_sm), ("AO", ao_sm), ("OL", ol_sm)]:
+                        idx_arr = np.where(sm >= thr)[0]
+                        ttc[lbl].append(int(idx_arr[0]) if len(idx_arr) > 0 else session_N)
+
+                fig, ax = plt.subplots(figsize=(6, 4))
+                x = np.arange(len(thresholds))
+                w = 0.25
+                for i, (lbl, color) in enumerate([("IL", "C0"), ("AO", "C1"), ("OL", "C2")]):
+                    ax.bar(x + i * w, ttc[lbl], width=w, label=lbl, color=color)
+                ax.set_xticks(x + w)
+                ax.set_xticklabels([f"≥{int(t*100)}%" for t in thresholds])
+                ax.set_ylabel("First trial index")
+                ax.set_ylim(0, session_N + 1)
+                ax.set_title(f"Time-to-criterion (mode={mode_name}, p_lo={float(p_lo):.2f})")
+                ax.axhline(session_N, color="k", ls="--", lw=0.8, alpha=0.4, label=f"never ({session_N})")
+                ax.grid(True, axis="y", alpha=0.4)
+                ax.legend(fontsize=9)
+                fig.tight_layout()
+                fig.savefig(
+                    os.path.join(run_dir, f"PostGrid_TTC_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                    dpi=150, bbox_inches="tight",
+                )
+                plt.close(fig)
+
+                # ----------------------------------------------------------
+                # 5. Pick-rate bar (existing, kept)
+                # ----------------------------------------------------------
                 fig, ax = plt.subplots(figsize=(6, 4))
                 means = [st["pct_hi_il_mean"], st["pct_hi_ao_mean"], st["pct_hi_ol_mean"]]
-                stds = [st["pct_hi_il_std"], st["pct_hi_ao_std"], st["pct_hi_ol_std"]]
+                stds  = [st["pct_hi_il_std"],  st["pct_hi_ao_std"],  st["pct_hi_ol_std"]]
                 x = np.arange(3)
-                ax.bar(x, means, yerr=stds, capsize=3)
+                ax.bar(x, means, yerr=stds, capsize=4, color=["C0", "C1", "C2"])
                 ax.set_xticks(x)
                 ax.set_xticklabels(["IL", "AO", "OL"])
                 ax.set_ylabel("High-arm pick rate (%)")
+                ax.set_ylim(0, 110)
                 ax.set_title(f"High-arm pick rate (mode={mode_name}, p_lo={float(p_lo):.2f})")
-                ax.grid(True, axis="y")
+                ax.grid(True, axis="y", alpha=0.4)
                 fig.savefig(
                     os.path.join(run_dir, f"PostGrid_PctHi_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
-                    dpi=150,
-                    bbox_inches="tight",
+                    dpi=150, bbox_inches="tight",
                 )
                 plt.close(fig)
 
-                # g traces: gate value over within-pair trial index (AO-s vs OL-s)
-                fig, ax = plt.subplots(figsize=(6, 4))
-                ax.plot(trials, st["gtrace_ao_mean"], label="g (AO)")
+                # ----------------------------------------------------------
+                # 6. Gate g over trials  (±1 SE — uncertainty on the mean, not session variability)
+                # ----------------------------------------------------------
+                gao_m  = np.asarray(st["gtrace_ao_mean"], dtype=np.float32)
+                gol_m  = np.asarray(st["gtrace_ol_mean"], dtype=np.float32)
+                gao_se = np.asarray(st["gtrace_ao_se"],   dtype=np.float32)
+                gol_se = np.asarray(st["gtrace_ol_se"],   dtype=np.float32)
+
+                fig, ax = plt.subplots(figsize=(7, 4))
+                ax.plot(trials, gao_m, color="C0", lw=2, label="g (AO)")
                 ax.fill_between(
                     trials,
-                    st["gtrace_ao_mean"] - st["gtrace_ao_std"],
-                    st["gtrace_ao_mean"] + st["gtrace_ao_std"],
-                    alpha=0.2,
+                    np.clip(gao_m - gao_se, 0.0, 1.0),
+                    np.clip(gao_m + gao_se, 0.0, 1.0),
+                    color="C0", alpha=0.25,
                 )
-                ax.plot(trials, st["gtrace_ol_mean"], label="g (OL)")
+                ax.plot(trials, gol_m, color="C1", lw=2, label="g (OL)")
                 ax.fill_between(
                     trials,
-                    st["gtrace_ol_mean"] - st["gtrace_ol_std"],
-                    st["gtrace_ol_mean"] + st["gtrace_ol_std"],
-                    alpha=0.2,
+                    np.clip(gol_m - gol_se, 0.0, 1.0),
+                    np.clip(gol_m + gol_se, 0.0, 1.0),
+                    color="C1", alpha=0.25,
                 )
-                ax.set_ylim(-0.05, 1.05)
-                ax.set_xlabel("Trial index")
-                ax.set_ylabel("Gate g")
+                ax.axhline(0.5, color="k", ls="--", lw=0.8, alpha=0.3)
+                ax.set_ylim(-0.02, 1.02)
+                ax.set_xlabel("Trial index (within pair)")
+                ax.set_ylabel("Gate g  (±1 SE across sessions)")
                 ax.set_title(f"Gate g over trials (mode={mode_name}, p_lo={float(p_lo):.2f}, gap={gap:.2f})")
-                ax.grid(True)
-                ax.legend()
+                ax.grid(True, alpha=0.4)
+                ax.legend(fontsize=9)
                 fig.savefig(
                     os.path.join(run_dir, f"PostGrid_gTrace_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
-                    dpi=150,
-                    bbox_inches="tight",
+                    dpi=150, bbox_inches="tight",
                 )
                 plt.close(fig)
+
+                # ----------------------------------------------------------
+                # 7. Gate g vs teacher reliability calibration
+                #    X-axis: trial index; two axes: g (left) and rel_target (right)
+                #    rel_target computed from cell_stats if stored, else skip.
+                # ----------------------------------------------------------
+                if "ao_rel_target_mean" in st:
+                    fig, ax1 = plt.subplots(figsize=(7, 4))
+                    ax2 = ax1.twinx()
+                    ax1.plot(trials, gao_m,  color="C0", lw=2, label="g_ao")
+                    ax1.plot(trials, gol_m,  color="C1", lw=2, label="g_ol")
+                    ax2.plot(trials, np.asarray(st["ao_rel_target_mean"]), color="C0",
+                             lw=1.5, ls="--", label="rel_ao (target)")
+                    ax2.plot(trials, np.asarray(st["ol_rel_target_mean"]), color="C1",
+                             lw=1.5, ls="--", label="rel_ol (target)")
+                    ax1.set_ylim(-0.02, 1.02)
+                    ax2.set_ylim(-0.02, 1.02)
+                    ax1.set_xlabel("Trial index")
+                    ax1.set_ylabel("Gate g")
+                    ax2.set_ylabel("Running teacher reliability")
+                    ax1.set_title(f"Gate vs reliability (mode={mode_name}, p_lo={float(p_lo):.2f})")
+                    lines1, labs1 = ax1.get_legend_handles_labels()
+                    lines2, labs2 = ax2.get_legend_handles_labels()
+                    ax1.legend(lines1 + lines2, labs1 + labs2, fontsize=9, loc="lower right")
+                    ax1.grid(True, alpha=0.4)
+                    fig.savefig(
+                        os.path.join(run_dir, f"PostGrid_GateCalib_mode-{mode_name}_pLo-{float(p_lo):.2f}.png"),
+                        dpi=150, bbox_inches="tight",
+                    )
+                    plt.close(fig)
 
         # ------------------
         # Summary plots: per-teacher curves + heatmaps over the grid
