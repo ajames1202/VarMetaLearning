@@ -489,7 +489,7 @@ class TwoChoiceReachingEnv(gym.Env):
         elif self.obs_trial and self.expert_teacher:
             # print(f"[Env] Trial {self.trial_index} (K={self.K}, obs_trial): expert teacher mode")
             high_side = "L" if self.curr_probs[0] >= self.curr_probs[1] else "R"
-            chosen_side = high_side if np.random.rand() < self.eps else ("R" if high_side == "L" else "L")
+            chosen_side = high_side if np.random.rand() < self.eps else ("R" if high_side == "R" else "L")
             left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
             right_c = np.array([self.right_rect.centerx, self.right_rect.centery], np.float32)
 
@@ -580,7 +580,7 @@ class TwoChoiceReachingEnv(gym.Env):
 
         terminated = False
         if trial_ended:
-            # print("Trial = ", self.trial_index, ", reached:", reached, ", Condition = ", self.trial_cond[self.trial_index], ", K = ", self.K, ", obs_trial=", self.obs_trial)
+            print("Trial = ", self.trial_index, ", reached:", reached, ", Condition = ", self.trial_cond[self.trial_index], ", K = ", self.K, ", obs_trial=", self.obs_trial, ", selected_side=", chose_side, ", selected_high_reward=", selected_high, ", reward=", reward)
             old_pair_idx = self.curr_pair_idx
             # print("End trial = ", self.trial_index, ", pair_index_in_session=", old_pair_idx)
             if self.trial_cond == "AO-o":
