@@ -486,7 +486,7 @@ class TwoChoiceReachingEnv(gym.Env):
                 self.cursor = right_c
         elif self.obs_trial and self.expert_teacher:
             high_side = "L" if self.curr_probs[0] >= self.curr_probs[1] else "R"
-            chosen_side = high_side if np.random.rand() < self.eps else ("R" if high_side == "L" else "L")
+            chosen_side = high_side if np.random.rand() < self.eps else ("R" if high_side == "R" else "L")
             left_c  = np.array([self.left_rect.centerx,  self.left_rect.centery],  np.float32)
             right_c = np.array([self.right_rect.centerx, self.right_rect.centery], np.float32)
 
