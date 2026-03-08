@@ -7,6 +7,8 @@ from torch import nn
 import torch.nn.functional as F
 
 
+
+
 class CNNEncoder(nn.Module):
     """Small CNN for processing visual inputs (expects NCHW).
 

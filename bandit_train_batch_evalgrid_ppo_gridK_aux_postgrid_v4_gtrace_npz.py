@@ -31,6 +31,7 @@ import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 from torch.utils.tensorboard import SummaryWriter
 import os
 from datetime import datetime
+import time
 
 
 
@@ -1198,8 +1199,11 @@ def main():
     for update_idx in range(num_updates):
         p_hi = args.p_hi
 
+        t0 = time.perf_counter()
         # ---- collect the rollouts that were dispatched BEFORE this update ----
         rollout_results = ray.get(pending_futures)
+        t_rollout = time.perf_counter() - t0
+
 
         # ---- dispatch the NEXT batch immediately (overlaps with GPU update) ----
         if update_idx + 1 < num_updates:
@@ -1242,6 +1246,8 @@ def main():
             gate_ol_sg=args.gate_ol_sg,
             session_chunk_size=args.train_session_chunk_size,
         )
+        t_update = time.perf_counter() - (t0 + t_rollout)
+
 
         mean_cum_rew_il = float(np.mean(cum_rewards_list_il))
         mean_cum_rew_ao = float(np.mean(cum_rewards_list_ao))
@@ -1258,6 +1264,7 @@ def main():
         #train_score = mean_hi_choices_il + mean_hi_choices_ao + mean_hi_choices_ol
 
         if update_idx % 10 == 0:
+            print(f"[timing] rollout={t_rollout:.1f}s  update={t_update:.1f}s")
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"mean_hi_choices_il={mean_hi_choices_il:.1f} mean_hi_choices_ao={mean_hi_choices_ao:.1f} mean_hi_choices_ol={mean_hi_choices_ol:.1f} "
                   f"mean_cum_rew_il={mean_cum_rew_il:.1f} mean_cum_rew_ao={mean_cum_rew_ao:.1f} mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
