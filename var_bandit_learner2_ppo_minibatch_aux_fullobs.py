@@ -632,10 +632,12 @@ class BanditLearner(nn.Module):
             k_all = self.q_in(chosen_feat)
 
             if T < 2:
-                zeros2 = torch.zeros((T, Bc, 2), device=device, dtype=left_feats.dtype)
+                zeros2  = torch.zeros((T, Bc, 2), device=device, dtype=left_feats.dtype)
                 zeros1s = torch.zeros((T, Bc, 1), device=device, dtype=left_feats.dtype)
                 zerosS  = torch.zeros((T, Bc),    device=device, dtype=left_feats.dtype)
-                return zeros2, zeros2, zerosS, zeros2, zeros2, zeros1s, zeros1s, zeros1s, zeros1s
+                # belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol,
+                # g_ao, g_ol, use_ao, use_ol, g_ao_for_loss, g_ol_for_loss
+                return zeros2, zeros2, zerosS, zeros2, zeros2, zeros1s, zeros1s, zeros1s, zeros1s, zeros1s, zeros1s
 
             q_left_q = q_left_all[1:]
             q_right_q = q_right_all[1:]
@@ -719,6 +721,23 @@ class BanditLearner(nn.Module):
                 self.gate_ol(torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1))
             ).clamp(0.0, 1.0)
 
+            # Separate gate inputs with detached contexts for the reliability BCE loss.
+            # This isolates the gate loss gradient to gate_ao / gate_ol MLP parameters only —
+            # it does NOT propagate back into the encoder or attention.  The un-detached g_ao / g_ol
+            # above continue to be used for belief fusion, so PPO/BCE losses can still shape
+            # the gate via the belief-quality gradient path.
+            # Cost: one extra tiny MLP forward (4H→64→1) per chunk — negligible.
+            gate_inp_ao = torch.cat([
+                ctx_left_ao_s.detach(), ctx_right_ao_s.detach(),
+                ctx_left_ao_o.detach(), ctx_right_ao_o.detach(),
+            ], dim=-1)
+            gate_inp_ol = torch.cat([
+                ctx_left_ol_s.detach(), ctx_right_ol_s.detach(),
+                ctx_left_ol_o.detach(), ctx_right_ol_o.detach(),
+            ], dim=-1)
+            g_ao_for_loss = torch.sigmoid(self.gate_ao(gate_inp_ao)).clamp(0.0, 1.0)
+            g_ol_for_loss = torch.sigmoid(self.gate_ol(gate_inp_ol)).clamp(0.0, 1.0)
+
             # Match rollout's "has_prev_*": only apply teacher belief if an earlier obs-trial exists
             ao_any = mask_AOo_mb.float().cumsum(dim=0)
             ol_any = mask_OLo_mb.float().cumsum(dim=0)
@@ -778,7 +797,9 @@ class BanditLearner(nn.Module):
             policy_logits = self.pi_head(control_in)
             V = self.v_head(control_in).squeeze(-1)  # (T,Bc)
 
-            return belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol, g_ao, g_ol, use_ao, use_ol
+            return (belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol,
+                    g_ao, g_ol, use_ao, use_ol,
+                    g_ao_for_loss, g_ol_for_loss)
 
         # ---------- hybrid PPO + BCE belief update (session-chunked) ----------
         policy_mask = mask_self_choice
@@ -796,7 +817,8 @@ class BanditLearner(nn.Module):
                 b1 = min(B, b0 + session_chunk_size)
 
                 belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol, \
-                    g_ao_mb, g_ol_mb, use_ao_mb, use_ol_mb = forward_policy_value_chunk(b0, b1)
+                    g_ao_mb, g_ol_mb, use_ao_mb, use_ol_mb, \
+                    g_ao_loss_mb, g_ol_loss_mb = forward_policy_value_chunk(b0, b1)
 
                 actions_mb = actions[:, b0:b1]
                 logp_old_mb_all = logp_old[:, b0:b1]
@@ -862,6 +884,11 @@ class BanditLearner(nn.Module):
                 #
                 # "active" = AO-s (or OL-s) step AND at least one prior obs-trial exists,
                 # i.e. the gate is actually used in belief fusion (use_ao / use_ol > 0).
+                #
+                # g_ao_loss_mb / g_ol_loss_mb are recomputed with DETACHED context inputs
+                # so the reliability BCE gradient only updates gate_ao / gate_ol MLP weights.
+                # It does NOT flow back into the encoder or attention — keeping those shaped
+                # purely by the PPO / belief-quality losses.
                 # ----------------------------------------------------------------
                 gate_ao_loss = torch.zeros((), device=device)
                 gate_ol_loss = torch.zeros((), device=device)
@@ -869,21 +896,21 @@ class BanditLearner(nn.Module):
                 if gate_ao_coef != 0.0:
                     active_ao = use_ao_mb.squeeze(-1).bool()   # (T,Bc) — AO-s with prior AO-o
                     if active_ao.any():
-                        g_ao_vals  = g_ao_mb[active_ao].squeeze(-1)          # (N,)
-                        tgt_ao     = ao_rel_target[:, b0:b1][active_ao]      # (N,) in [0,1]
+                        g_ao_vals = g_ao_loss_mb[active_ao].squeeze(-1)      # (N,)
+                        tgt_ao    = ao_rel_target[:, b0:b1][active_ao]       # (N,) in [0,1]
                         gate_ao_loss = F.binary_cross_entropy(
                             g_ao_vals.clamp(1e-6, 1.0 - 1e-6),
-                            tgt_ao.detach(),                                  # target is data; detach for clarity
+                            tgt_ao.detach(),
                             reduction="sum",
                         ) / total_gate_ao_n
 
                 if gate_ol_coef != 0.0:
                     active_ol = use_ol_mb.squeeze(-1).bool()   # (T,Bc) — OL-s with prior OL-o
                     if active_ol.any():
-                        g_ol_vals = g_ol_mb[active_ol].squeeze(-1)           # (N,)
+                        g_ol_vals = g_ol_loss_mb[active_ol].squeeze(-1)      # (N,)
                         if gate_ol_sg:
-                            # ↓ stop-gradient: the gate loss does NOT propagate into
-                            # the belief / context network (only into gate_ol MLP itself).
+                            # ↓ stop-gradient on g_ol: reliability BCE updates only gate_ol
+                            # MLP weights; belief fusion path (p_belief) is unaffected.
                             g_ol_vals = g_ol_vals.detach()
                         tgt_ol = ol_rel_target[:, b0:b1][active_ol]          # (N,) in [0,1]
                         gate_ol_loss = F.binary_cross_entropy(
@@ -908,6 +935,7 @@ class BanditLearner(nn.Module):
 
                 del belief_logits, policy_logits, V, q_teacher_ao, q_teacher_ol
                 del g_ao_mb, g_ol_mb, use_ao_mb, use_ol_mb
+                del g_ao_loss_mb, g_ol_loss_mb
                 del dist, logp_new, entropy, loss
 
             torch.nn.utils.clip_grad_norm_(list(self.bandit_parameters()), max_grad_norm)
