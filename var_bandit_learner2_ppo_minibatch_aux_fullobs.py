@@ -7,8 +7,6 @@ from torch import nn
 import torch.nn.functional as F
 
 
-
-
 class CNNEncoder(nn.Module):
     """Small CNN for processing visual inputs (expects NCHW).
 
@@ -458,10 +456,17 @@ class BanditLearner(nn.Module):
             modify q_base / q_delta_* / attn / gates.
           - Advantages/returns are computed from rollout-time values (bandit_value_buf) using sparse-GAE.
         """
-        # ---------- motor data ----------
-        xy_pos = torch.as_tensor(np.stack(xy_pos_buf), device=device, dtype=torch.float32)
-        goalvec = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
-        chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
+        # ---------- motor data (optional — skipped when direct-choice rollout is used) ----------
+        # When meta_ep_rollout uses cursor teleportation, xy_pos_buf / goal_vec_buf /
+        # chosen_bandits_motor_buf are all empty lists.  In that case the motor network
+        # is not used during rollout so there is nothing to train; we skip the motor
+        # update entirely and return 0.0 as motor loss.
+        _has_motor_data = len(xy_pos_buf) > 0
+
+        if _has_motor_data:
+            xy_pos             = torch.as_tensor(np.stack(xy_pos_buf),             device=device, dtype=torch.float32)
+            goalvec            = torch.as_tensor(np.asarray(goal_vec_buf, np.float32), device=device)
+            chosen_bandits_motor = torch.as_tensor(np.stack(chosen_bandits_motor_buf), device=device, dtype=torch.float32)
 
         # ---------- bandit data ----------
         # bandit_obs is a list of dicts {"left": (T,3,h,w), "right": ...}
@@ -948,7 +953,10 @@ class BanditLearner(nn.Module):
 
         bandit_loss = total_loss / max(1, total_steps)
 
-        # ---------- motor update (separate) ----------
+        # ---------- motor update (skipped when direct-choice rollout is active) ----------
+        if not _has_motor_data:
+            return bandit_loss, 0.0
+
         motor_loss_sum = 0.0
         motor_mb = 0
 

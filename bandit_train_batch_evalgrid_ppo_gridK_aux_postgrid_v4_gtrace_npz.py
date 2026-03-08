@@ -354,11 +354,6 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
     meta_ep_len = 0
     ep_start_flag = 1.0
 
-    # motor buffers (flat)
-    xy_pos_buf: List[np.ndarray] = []
-    goal_vec_buf: List[np.ndarray] = []
-    chosen_bandits_motor_buf: List[np.ndarray] = []
-
     # bandit buffers (per trial)
     left_obs = [] if return_obs else None
     right_obs = [] if return_obs else None
@@ -633,36 +628,39 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             meta_ep_len += 1
             ep_start_flag = 0.0
 
-        # MOTOR step
-        W, H = env.unwrapped.W, env.unwrapped.H
-        x_pix, y_pix = env.unwrapped.cursor
-        xy_norm = np.array([(x_pix/(W-1))*2-1, (y_pix/(H-1))*2-1], dtype=np.float32)
+        # ── DIRECT CHOICE: teleport cursor to target instead of running motor policy ──
+        # Self-choice trials (IL, AO-s, OL-s): cursor is set to agent's chosen bandit center.
+        #   → env registers the selection on the very next step (1 step per trial instead of ~100).
+        # Obs trials (AO-o, OL-o): try to discover teacher's side from env attributes so we
+        #   can teleport there too.  If the attribute is not found the cursor stays put and
+        #   the env advances the teacher's cursor internally each step until trial_ended fires.
+        if ep_start_flag == 0.0:   # just made a choice above
+            uw = env.unwrapped
+            left_c  = np.array([uw.left_rect.centerx,  uw.left_rect.centery], np.float32)
+            right_c = np.array([uw.right_rect.centerx, uw.right_rect.centery], np.float32)
 
-        left_c  = np.array([env.unwrapped.left_rect.centerx,  env.unwrapped.left_rect.centery],  np.float32)
-        right_c = np.array([env.unwrapped.right_rect.centerx, env.unwrapped.right_rect.centery], np.float32)
-        left_c_norm  = np.array([(left_c[0]/(W-1))*2-1,  (left_c[1]/(H-1))*2-1],  np.float32)
-        right_c_norm = np.array([(right_c[0]/(W-1))*2-1, (right_c[1]/(H-1))*2-1], np.float32)
+            if curr_trial_condition not in ("AO-o", "OL-o"):
+                # Direct teleport to agent's chosen bandit
+                uw.cursor = left_c if a_t == 0 else right_c
+            else:
+                # Attempt to read teacher's chosen side from env (attribute name varies by
+                # env version). If found, teleport there so obs trials also end in 1 step.
+                for _attr in ('teacher_side', 'teacher_chosen_side', 'teacher_target_side',
+                              'obs_target_side', 'selected_target_this_trial'):
+                    _ts = getattr(uw, _attr, None)
+                    if _ts is not None:
+                        uw.cursor = left_c if int(_ts) == 0 else right_c
+                        break
 
-        chosen_center = left_c_norm if choice_target.argmax(dim=-1).item() == 0 else right_c_norm
-        g_norm = chosen_center - xy_norm
-
-        xy_pos_t   = torch.as_tensor(xy_norm).unsqueeze(0).to(device)
-        goal_vec_t = torch.as_tensor(g_norm).unsqueeze(0).to(device)
-
-        mu, log_std = agent.motor_fwd(choice_target.detach(), xy_pos=xy_pos_t, goal_vec=goal_vec_t)
-
-        xy_pos_buf.append(xy_norm)
-        goal_vec_buf.append(g_norm)
-        chosen_bandits_motor_buf.append(choice_target.squeeze(0).detach().cpu().numpy())
-
-        std = torch.exp(log_std)
-        y = mu + std * torch.randn_like(std)
-        action = torch.tanh(y)
-        action_np = action.squeeze(0).detach().cpu().numpy()
-
-        next_obs, reward, term, _, info = env.step(action_np)
-        obs = next_obs
-        done = term
+        # Poll env until this trial ends.  Use a zero motor action — cursor is already
+        # at target for self-choice trials so the env registers arrival on the first call.
+        _dummy = np.zeros(2, dtype=np.float32)
+        while True:
+            next_obs, reward, term, _, info = env.step(_dummy)
+            obs   = next_obs
+            done  = term
+            if info.get("trial_ended") or done:
+                break
 
         # Trial ended => append memory token
         if info.get("trial_ended"):
@@ -825,7 +823,7 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
 
 
     return (
-        xy_pos_buf, goal_vec_buf, chosen_bandits_motor_buf,
+        [], [], [],   # motor buffers removed (direct-choice rollout)
         obs_bandit, chosen_bandits_buf, bandit_rewards_buf, meta_ep_start_buf,
         actor_buf, trial_cond_buf,
         teacher_correct_buf,
@@ -1204,7 +1202,6 @@ def main():
         rollout_results = ray.get(pending_futures)
         t_rollout = time.perf_counter() - t0
 
-
         # ---- dispatch the NEXT batch immediately (overlaps with GPU update) ----
         if update_idx + 1 < num_updates:
             cells_next     = _build_cell_list()
@@ -1246,6 +1243,7 @@ def main():
             gate_ol_sg=args.gate_ol_sg,
             session_chunk_size=args.train_session_chunk_size,
         )
+
         t_update = time.perf_counter() - (t0 + t_rollout)
 
 
