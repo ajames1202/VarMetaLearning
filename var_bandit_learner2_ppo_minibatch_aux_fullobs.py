@@ -811,12 +811,12 @@ class BanditLearner(nn.Module):
                 ctx_right_obs.detach(),
                 left_feats.detach(),
                 right_feats.detach(),
-                p_self_pg.detach(),
-                p_teacher_ao_pg.detach(),
-                p_teacher_ol_pg.detach(),
-                p_belief_pg.detach(),
-                g_ao.detach(),   # live
-                g_ol.detach(),   # live
+                p_self_pg,
+                p_teacher_ao_pg,
+                p_teacher_ol_pg,
+                p_belief_pg,
+                g_ao,   # live
+                g_ol,   # live
                 use_ao.detach(),
                 use_ol.detach(),
             )
