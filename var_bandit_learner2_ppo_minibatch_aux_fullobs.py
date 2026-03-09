@@ -759,7 +759,7 @@ class BanditLearner(nn.Module):
             p_teacher_ao = torch.sigmoid(q_teacher_ao)
             p_teacher_ol = torch.sigmoid(q_teacher_ol)
 
-            p_belief = p_self
+            p_belief = p_self.detach()
             p_belief = torch.where(use_ao.bool(), (1.0 - g_ao) * p_belief + g_ao * p_teacher_ao, p_belief)
             p_belief = torch.where(use_ol.bool(), (1.0 - g_ol) * p_belief + g_ol * p_teacher_ol, p_belief)
             belief_logits = self._belief_logit_from_probs(p_belief)
@@ -784,6 +784,26 @@ class BanditLearner(nn.Module):
               + ctx_right_ol_o * mask_OLs_mb.unsqueeze(-1).float()
             )
 
+                        # --------------------------------
+            # 2) PPO-facing fused belief:
+            #    self/teacher detached, gates live
+            # --------------------------------
+            p_self_pg = p_self.detach()
+            p_teacher_ao_pg = p_teacher_ao.detach()
+            p_teacher_ol_pg = p_teacher_ol.detach()
+
+            p_belief_pg = p_self_pg
+            p_belief_pg = torch.where(
+                use_ao.bool(),
+                (1.0 - g_ao) * p_belief_pg + g_ao * p_teacher_ao_pg,
+                p_belief_pg
+            )
+            p_belief_pg = torch.where(
+                use_ol.bool(),
+                (1.0 - g_ol) * p_belief_pg + g_ol * p_teacher_ol_pg,
+                p_belief_pg
+            )
+
             control_in = self._control_features(
                 ctx_left_cur.detach(),
                 ctx_right_cur.detach(),
@@ -791,12 +811,12 @@ class BanditLearner(nn.Module):
                 ctx_right_obs.detach(),
                 left_feats.detach(),
                 right_feats.detach(),
-                p_self.detach(),
-                p_teacher_ao.detach(),
-                p_teacher_ol.detach(),
-                p_belief,
-                g_ao,
-                g_ol,
+                p_self_pg,
+                p_teacher_ao_pg,
+                p_teacher_ol_pg,
+                p_belief_pg,
+                g_ao,   # live
+                g_ol,   # live
                 use_ao.detach(),
                 use_ol.detach(),
             )

@@ -575,8 +575,8 @@ if __name__ == "__main__":
         H = 400,
         render_mode="human",
         seed=0,
-        session_K=3,
-        session_N=5,
+        session_K=5,
+        session_N=10,
         trial_ms=60000,
         randomize_sides=True,
     )
