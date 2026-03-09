@@ -759,7 +759,7 @@ class BanditLearner(nn.Module):
             p_teacher_ao = torch.sigmoid(q_teacher_ao)
             p_teacher_ol = torch.sigmoid(q_teacher_ol)
 
-            p_belief = p_self.detach()
+            p_belief = p_self
             p_belief = torch.where(use_ao.bool(), (1.0 - g_ao) * p_belief + g_ao * p_teacher_ao, p_belief)
             p_belief = torch.where(use_ol.bool(), (1.0 - g_ol) * p_belief + g_ol * p_teacher_ol, p_belief)
             belief_logits = self._belief_logit_from_probs(p_belief)
