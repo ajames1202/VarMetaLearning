@@ -1047,7 +1047,7 @@ def main():
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
     parser.add_argument('--warmup-updates', type=int, default=400)
     parser.add_argument('--patience-evals', type=int, default=100)
-    parser.add_argument('--min-delta', type=float, default=1.5)
+    parser.add_argument('--min-delta', type=float, default=2.5)
 
     # Post-training eval / plots
     parser.add_argument('--eval-sessions', type=int, default=200)
