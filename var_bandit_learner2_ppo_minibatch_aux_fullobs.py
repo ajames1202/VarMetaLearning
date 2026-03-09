@@ -794,9 +794,9 @@ class BanditLearner(nn.Module):
                 p_self.detach(),
                 p_teacher_ao.detach(),
                 p_teacher_ol.detach(),
-                p_belief.detach(),
-                g_ao.detach(),
-                g_ol.detach(),
+                p_belief,
+                g_ao,
+                g_ol,
                 use_ao.detach(),
                 use_ol.detach(),
             )
@@ -899,32 +899,6 @@ class BanditLearner(nn.Module):
                 # ----------------------------------------------------------------
                 gate_ao_loss = torch.zeros((), device=device)
                 gate_ol_loss = torch.zeros((), device=device)
-
-                if gate_ao_coef != 0.0:
-                    active_ao = use_ao_mb.squeeze(-1).bool()   # (T,Bc) — AO-s with prior AO-o
-                    if active_ao.any():
-                        g_ao_vals = g_ao_loss_mb[active_ao].squeeze(-1)      # (N,)
-                        tgt_ao    = ao_rel_target[:, b0:b1][active_ao]       # (N,) in [0,1]
-                        gate_ao_loss = F.binary_cross_entropy(
-                            g_ao_vals.clamp(1e-6, 1.0 - 1e-6),
-                            tgt_ao.detach(),
-                            reduction="sum",
-                        ) / total_gate_ao_n
-
-                if gate_ol_coef != 0.0:
-                    active_ol = use_ol_mb.squeeze(-1).bool()   # (T,Bc) — OL-s with prior OL-o
-                    if active_ol.any():
-                        g_ol_vals = g_ol_loss_mb[active_ol].squeeze(-1)      # (N,)
-                        if gate_ol_sg:
-                            # ↓ stop-gradient on g_ol: reliability BCE updates only gate_ol
-                            # MLP weights; belief fusion path (p_belief) is unaffected.
-                            g_ol_vals = g_ol_vals.detach()
-                        tgt_ol = ol_rel_target[:, b0:b1][active_ol]          # (N,) in [0,1]
-                        gate_ol_loss = F.binary_cross_entropy(
-                            g_ol_vals.clamp(1e-6, 1.0 - 1e-6),
-                            tgt_ol.detach(),
-                            reduction="sum",
-                        ) / total_gate_ol_n
 
                 loss = (
                     pg_loss
