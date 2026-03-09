@@ -31,6 +31,7 @@ import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 from torch.utils.tensorboard import SummaryWriter
 import os
 from datetime import datetime
+import time
 
 
 
@@ -1245,6 +1246,7 @@ def main():
 
     for update_idx in range(num_updates):
         p_hi = args.p_hi
+        t0 = time.perf_counter()
 
         # ---- dispatch this update's rollouts (after weights are current) ----
         cells_cur = _build_cell_list()
@@ -1264,6 +1266,9 @@ def main():
          cum_rewards_list_il, cum_rewards_list_ao, cum_rewards_list_ol,
          cum_high_reward_choices_il, cum_high_reward_choices_ao,
          cum_high_reward_choices_ol) = _collect_rollouts(rollout_results)
+        
+        t_rollout = time.perf_counter() - t0
+
 
         var_loss, motor_loss = _call_update2(
             agent, optim_bandit, optim_motor,
@@ -1292,6 +1297,9 @@ def main():
             session_chunk_size=args.train_session_chunk_size,
         )
 
+        t_update = time.perf_counter() - (t0 + t_rollout)
+
+
         mean_cum_rew_il = float(np.mean(cum_rewards_list_il))
         mean_cum_rew_ao = float(np.mean(cum_rewards_list_ao))
         mean_cum_rew_ol = float(np.mean(cum_rewards_list_ol))
@@ -1310,6 +1318,8 @@ def main():
             print(f"[upd {update_idx:04d}] var_loss={var_loss:.4f} motor_loss={motor_loss:.4f} "
                   f"mean_hi_choices_il={mean_hi_choices_il:.1f} mean_hi_choices_ao={mean_hi_choices_ao:.1f} mean_hi_choices_ol={mean_hi_choices_ol:.1f} "
                   f"mean_cum_rew_il={mean_cum_rew_il:.1f} mean_cum_rew_ao={mean_cum_rew_ao:.1f} mean_cum_rew_ol={mean_cum_rew_ol:.1f}")
+            print(f"[timing] rollout={t_rollout:.1f}s  update={t_update:.1f}s")
+
 
         # Grid-eval + early stopping (after warmup)
         if (update_idx >= args.warmup_updates) and (update_idx % args.eval_interval == 0):
