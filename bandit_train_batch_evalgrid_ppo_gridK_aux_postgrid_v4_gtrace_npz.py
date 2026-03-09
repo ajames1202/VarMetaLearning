@@ -1007,6 +1007,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=0)
+    # FIX 5: Each Ray worker holds a live pygame env + BanditLearner in RAM for the
+    # entire run.  40 workers can consume several GB before any rollout results arrive.
+    # Prefer 16–24 workers; throughput barely changes because sessions run sequentially
+    # within each worker.
     parser.add_argument('--num-workers', type=int, default=4)
     # If you want *balanced* training over the full 5×4 grid each update:
     #   episodes_per_update = grid_repeats * 20
@@ -1109,7 +1113,12 @@ def main():
         tmp_dir = os.path.expanduser("~/tmp/ray")
         os.makedirs(tmp_dir, exist_ok=True)
 
-        ray.init(_temp_dir=tmp_dir, include_dashboard=False, ignore_reinit_error=True)
+        # FIX 1: Hard-cap the Ray shared-memory object store.
+        # Without a limit Ray can consume most of RAM for object storage, leaving
+        # workers vulnerable to the OOM killer when many large result objects pile up.
+        # Tune this value to ~25–33% of your node's total RAM.
+        ray.init(_temp_dir=tmp_dir, include_dashboard=False, ignore_reinit_error=True,
+                 object_store_memory=6 * 1024 ** 3)  # 6 GB cap
 
     # rollout workers
     workers = [
@@ -1215,23 +1224,37 @@ def main():
                 cr_il, cr_ao, cr_ol, hrc_il, hrc_ao, hrc_ol)
 
     # -----------------------------------------------------------------
-    # Pre-launch the very first batch so workers are busy immediately.
+    # Training loop: dispatch → collect (batched) → update → eval.
+    #
+    # FIX 4: Dispatch is now at the TOP of each update iteration rather than
+    # being pre-launched before eval.  The previous "overlap" design fired the
+    # next training batch (320 futures) BEFORE eval ran, then eval fired up to
+    # 400 more futures on top — both sets of results lived simultaneously in the
+    # Ray object store, easily exceeding available RAM and triggering the OOM
+    # killer.  Moving dispatch after eval eliminates that peak entirely.
+    #
+    # FIX 2: We explicitly `del agent_state_ref` before calling `ray.put` so
+    # Ray can reclaim the previous state-dict from the object store promptly
+    # instead of keeping two copies alive at once.
+    #
+    # FIX 3: `_ray_get_in_batches` collects results in small chunks so that all
+    # 320 obs dicts (≈2 GB for --grid-repeats 16 × 20 cells) never land in
+    # driver memory simultaneously.
     # -----------------------------------------------------------------
-    cells_cur = _build_cell_list()
-    agent_state_ref = ray.put({k: v.detach().cpu() for k, v in agent.state_dict().items()})
-    pending_futures = _dispatch_rollouts(cells_cur, agent_state_ref, update_idx=0)
+    agent_state_ref = None  # initialised on first loop iteration
 
     for update_idx in range(num_updates):
         p_hi = args.p_hi
 
-        # ---- collect the rollouts that were dispatched BEFORE this update ----
-        rollout_results = ray.get(pending_futures)
+        # ---- dispatch this update's rollouts (after weights are current) ----
+        cells_cur = _build_cell_list()
+        if agent_state_ref is not None:
+            del agent_state_ref          # FIX 2: release previous Ray object ref
+        agent_state_ref = ray.put({k: v.detach().cpu() for k, v in agent.state_dict().items()})
+        pending_futures = _dispatch_rollouts(cells_cur, agent_state_ref, update_idx)
 
-        # ---- dispatch the NEXT batch immediately (overlaps with GPU update) ----
-        if update_idx + 1 < num_updates:
-            cells_next     = _build_cell_list()
-            agent_state_ref = ray.put({k: v.detach().cpu() for k, v in agent.state_dict().items()})
-            pending_futures = _dispatch_rollouts(cells_next, agent_state_ref, update_idx + 1)
+        # ---- collect in small batches to avoid ~2 GB simultaneous spike ----
+        rollout_results = _ray_get_in_batches(pending_futures, batch_size=max(W * 4, 32))  # FIX 3
 
         # ---- unpack results ----
         (batch_xy_pos, batch_goal_vec, batch_chosen_bandits_motor,
