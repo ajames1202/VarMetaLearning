@@ -119,16 +119,25 @@ def eval_grid_score(
     agent_state_cpu,
     session_K: int,
     p_hi: float,
-    p_lo_grid: List[float],
-    teacher_modes: List[Tuple[str, Dict[str, Any]]],
+    p_lo_grid,
+    teacher_modes,
     n_sessions_per_cell: int,
     seed: int,
+    alpha: float = 0.5,
 ):
-    """Evaluate the full grid and return macro + worst-cell summaries."""
+    """
+    Returns:
+        macro      : mean over cells of cell_mean
+        robust     : mean over cells of cell_min
+        eval_score : mean over cells of ((1-alpha)*cell_mean + alpha*cell_min)
+        il_mean    : global mean IL over cells
+        ao_mean    : global mean AO over cells
+        ol_mean    : global mean OL over cells
+    """
     rng = np.random.default_rng(seed)
 
     futures = []
-    meta = []  # (p_lo, mode_name)
+    meta = []
     for p_lo in p_lo_grid:
         for mode_name, cfg in teacher_modes:
             for _ in range(int(n_sessions_per_cell)):
@@ -147,9 +156,10 @@ def eval_grid_score(
 
     results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
-    il_scores: Dict[Tuple[float, str], List[float]] = {}
-    ao_scores: Dict[Tuple[float, str], List[float]] = {}
-    ol_scores: Dict[Tuple[float, str], List[float]] = {}
+    il_scores = {}
+    ao_scores = {}
+    ol_scores = {}
+
     for (p_lo, mode_name), res in zip(meta, results):
         (
             _, _, _,
@@ -158,20 +168,43 @@ def eval_grid_score(
             _,
             cum_rew_il, cum_rew_ao, cum_rew_ol,
             _, _, _,
-            *_,
+            *_
         ) = res
+
         cell = (p_lo, mode_name)
         il_scores.setdefault(cell, []).append(float(cum_rew_il))
         ao_scores.setdefault(cell, []).append(float(cum_rew_ao))
         ol_scores.setdefault(cell, []).append(float(cum_rew_ol))
 
+    # global condition means for debug
     il_mean = float(np.mean([np.mean(v) for v in il_scores.values()])) if il_scores else 0.0
     ao_mean = float(np.mean([np.mean(v) for v in ao_scores.values()])) if ao_scores else 0.0
     ol_mean = float(np.mean([np.mean(v) for v in ol_scores.values()])) if ol_scores else 0.0
-    all_scores = np.array([il_mean, ao_mean, ol_mean], dtype=np.float32)
-    macro_avg = float(all_scores.mean()) if all_scores.size else 0.0
-    worst5_avg = float(np.sort(all_scores)[: min(5, all_scores.size)].mean()) if all_scores.size else 0.0
-    return macro_avg, worst5_avg, il_mean, ao_mean, ol_mean
+
+    cell_means = []
+    cell_mins = []
+    cell_scores = []
+
+    for cell in il_scores.keys():
+        vals = np.array([
+            np.mean(il_scores[cell]),
+            np.mean(ao_scores[cell]),
+            np.mean(ol_scores[cell]),
+        ], dtype=np.float32)
+
+        cell_mean = float(vals.mean())
+        cell_min = float(vals.min())
+        score = float((1.0 - alpha) * cell_mean + alpha * cell_min)
+
+        cell_means.append(cell_mean)
+        cell_mins.append(cell_min)
+        cell_scores.append(score)
+
+    macro = float(np.mean(cell_means)) if cell_means else 0.0
+    robust = float(np.mean(cell_mins)) if cell_mins else 0.0
+    eval_score = float(np.mean(cell_scores)) if cell_scores else 0.0
+
+    return macro, robust, eval_score, il_mean, ao_mean, ol_mean
 
 # -----------------------------
 # Post-training grid eval (teacher modes × reward probs)
@@ -1046,8 +1079,8 @@ def main():
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
     parser.add_argument('--warmup-updates', type=int, default=400)
-    parser.add_argument('--patience-evals', type=int, default=100)
-    parser.add_argument('--min-delta', type=float, default=2.5)
+    parser.add_argument('--patience-evals', type=int, default=10)
+    parser.add_argument('--min-delta', type=float, default=0.5)
 
     # Post-training eval / plots
     parser.add_argument('--eval-sessions', type=int, default=200)
@@ -1057,7 +1090,7 @@ def main():
                         help='Run post-training eval on a grid of (teacher_mode × p_lo) and save plots/CSV.')
     parser.add_argument('--no-post-grid-eval', dest='post_grid_eval', action='store_false',
                         help='Disable post-training grid eval.')
-    parser.add_argument('--post-grid-sessions-per-cell', type=int, default=20,
+    parser.add_argument('--post-grid-sessions-per-cell', type=int, default=50,
                         help='Eval sessions per grid cell (teacher_mode × p_lo).')
 
     # Backward-compat alias
@@ -1328,7 +1361,7 @@ def main():
             p_lo_grid = P_LO_GRID_DEFAULT
             teacher_modes = TEACHER_MODES_DEFAULT
 
-            macro, worst5, il_mean, ao_mean, ol_mean = eval_grid_score(
+            macro, robust, eval_score, il_mean, ao_mean, ol_mean = eval_grid_score(
                 workers=workers,
                 agent_state_cpu=agent_state_cpu,
                 session_K=session_K,
@@ -1337,15 +1370,17 @@ def main():
                 teacher_modes=teacher_modes,
                 n_sessions_per_cell=args.eval_sessions_per_cell,
                 seed=args.seed + 10_000 + update_idx,
+                alpha=0.5,
             )
+
             # Use a composite score to avoid "good on easy cells only"
             # eval_score = 0.7 * macro + 0.3 * worst5
-            eval_score = il_mean + ao_mean + ol_mean  # simpler unweighted sum of means
+            # eval_score = il_mean + ao_mean + ol_mean  # simpler unweighted sum of means
 
             print(f"[eval upd {update_idx:04d}] il_mean={il_mean:.2f} ao_mean={ao_mean:.2f} ol_mean={ol_mean:.2f} macro={macro:.2f} worst5={worst5:.2f} eval_score={eval_score:.2f}")
 
             writer.add_scalar("EvalGrid/macro", macro, update_idx)
-            writer.add_scalar("EvalGrid/worst5", worst5, update_idx)
+            writer.add_scalar("EvalGrid/robust", robust, update_idx)
             writer.add_scalar("EvalGrid/score", eval_score, update_idx)
 
             if eval_score > best_eval + args.min_delta:
@@ -1358,7 +1393,7 @@ def main():
                         "update": update_idx,
                         "eval_score": float(eval_score),
                         "macro": float(macro),
-                        "worst5": float(worst5),
+                        "robust": float(robust),
                         "p_lo_grid": list(p_lo_grid),
                         "teacher_modes": [m for m, _ in teacher_modes],
                     }
@@ -1389,6 +1424,7 @@ def main():
     print(f"Loaded best checkpoint from update {best_update}, best_score={best_score:.2f}")
     agent.load_state_dict(ckpt["model_state"])
     agent.eval()
+    agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
 
     # # -----------------------------
     # # Fixed-prob eval + per-trial plot
