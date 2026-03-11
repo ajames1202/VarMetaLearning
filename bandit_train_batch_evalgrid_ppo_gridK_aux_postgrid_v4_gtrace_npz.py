@@ -1389,7 +1389,7 @@ def main():
             # eval_score = 0.7 * macro + 0.3 * worst5
             # eval_score = il_mean + ao_mean + ol_mean  # simpler unweighted sum of means
 
-            print(f"[eval upd {update_idx:04d}] il_mean={il_mean:.2f} ao_mean={ao_mean:.2f} ol_mean={ol_mean:.2f} macro={macro:.2f} worst5={worst5:.2f} eval_score={eval_score:.2f}")
+            print(f"[eval upd {update_idx:04d}] il_mean={il_mean:.2f} ao_mean={ao_mean:.2f} ol_mean={ol_mean:.2f} macro={macro:.2f} robust={robust:.2f} eval_score={eval_score:.2f}")
 
             writer.add_scalar("EvalGrid/macro", macro, update_idx)
             writer.add_scalar("EvalGrid/robust", robust, update_idx)
