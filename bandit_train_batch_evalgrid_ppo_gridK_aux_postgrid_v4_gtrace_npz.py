@@ -498,11 +498,11 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             use_ao = torch.full_like(g_ao, 1.0 if any(c == "AO-o" for c in cond_tokens) else 0.0)
             use_ol = zeros_gate
 
-            #ablation test, set g_ol to 0.1
-            # g_ao = torch.full_like(
-            #     torch.sigmoid(agent.gate_ao(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
-            #     0.0
-            # )
+            # #ablation test, set g_ao to 0.0
+            g_ao = torch.full_like(
+                torch.sigmoid(agent.gate_ao(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
+                0.0
+            )
 
         elif curr_cond == "OL-s":
             ctx_l_cur = _ctx_for(ql, {"OL-s"})
@@ -524,10 +524,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             use_ao = zeros_gate
             use_ol = torch.full_like(g_ol, 1.0 if any(c == "OL-o" for c in cond_tokens) else 0.0)
 
-            #ablation test, set g_ol to 0.1
+            #ablation test, set g_ol to 0.1 (for ablation_1) or 0.0 (for ablation_2)
             g_ol = torch.full_like(
                 torch.sigmoid(agent.gate_ol(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
-                0.1
+                0.0
             )
 
         elif curr_cond == "AO-o":
