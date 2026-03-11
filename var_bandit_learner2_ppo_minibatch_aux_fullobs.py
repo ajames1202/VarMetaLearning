@@ -729,10 +729,10 @@ class BanditLearner(nn.Module):
             ).clamp(0.0, 1.0)
 
             #Ablation test, setting g_ol to 0.1
-            g_ol = torch.full_like(g_ol, 0.1)
+            g_ol = torch.full_like(g_ol, 0.0)
 
             #Ablation test, setting g_ol to 0.1
-            g_ao = torch.full_like(g_ao, 0.1)
+            g_ao = torch.full_like(g_ao, 0.0)
 
             # Separate gate inputs with detached contexts for the reliability BCE loss.
             # This isolates the gate loss gradient to gate_ao / gate_ol MLP parameters only —
