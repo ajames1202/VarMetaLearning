@@ -588,22 +588,51 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         elif curr_cond == "OL-s":
             p_belief = torch.where(use_ol.bool(), (1.0 - g_ol) * p_belief + g_ol * p_teacher_ol, p_belief)
 
+        # control_in = agent._control_features(
+        #     ctx_l_cur.detach(),
+        #     ctx_r_cur.detach(),
+        #     ctx_l_obs.detach(),
+        #     ctx_r_obs.detach(),
+        #     lf_seq.detach(),
+        #     rf_seq.detach(),
+        #     p_self.detach(),
+        #     p_teacher_ao.detach(),
+        #     p_teacher_ol.detach(),
+        #     p_belief.detach(),
+        #     g_ao.detach(),
+        #     g_ol.detach(),
+        #     use_ao.detach(),
+        #     use_ol.detach(),
+        # )
+
+        ctx_l_cur_zer = torch.zeros(ctx_l_cur)
+        ctx_r_cur_zer = torch.zer(ctx_r_cur)
+        ctx_l_obs_zer = torch.zeros(ctx_l_obs)
+        ctx_r_obs_zer = torch.zeros(ctx_r_obs)
+        p_self_zer = torch.zeros(p_self)
+        p_teacher_ao_zer = torch.zeros(p_teacher_ao)
+        p_teacher_ol_zer = torch.zeros(p_teacher_ol)
+        g_ao_zer = torch.zeros(g_ao)
+        g_ol_zer = torch.zeros(g_ol)
+
+
         control_in = agent._control_features(
-            ctx_l_cur.detach(),
-            ctx_r_cur.detach(),
-            ctx_l_obs.detach(),
-            ctx_r_obs.detach(),
+            ctx_l_cur_zer.detach(),
+            ctx_r_cur_zer.detach(),
+            ctx_l_obs_zer.detach(),
+            ctx_r_obs_zer.detach(),
             lf_seq.detach(),
             rf_seq.detach(),
-            p_self.detach(),
-            p_teacher_ao.detach(),
-            p_teacher_ol.detach(),
+            p_self_zer.detach(),
+            p_teacher_ao_zer.detach(),
+            p_teacher_ol_zer.detach(),
             p_belief.detach(),
-            g_ao.detach(),
-            g_ol.detach(),
+            g_ao_zer.detach(),
+            g_ol_zer.detach(),
             use_ao.detach(),
             use_ol.detach(),
         )
+
 
         policy_logits = agent.pi_head(control_in)
         v = agent.v_head(control_in)

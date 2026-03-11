@@ -810,19 +810,48 @@ class BanditLearner(nn.Module):
                 p_belief_pg
             )
 
+            
+
+            # control_in = self._control_features(
+            #     ctx_left_cur.detach(),
+            #     ctx_right_cur.detach(),
+            #     ctx_left_obs.detach(),
+            #     ctx_right_obs.detach(),
+            #     left_feats.detach(),
+            #     right_feats.detach(),
+            #     p_self_pg.detach(),              # do not detach for ppo
+            #     p_teacher_ao_pg.detach(),
+            #     p_teacher_ol_pg.detach(),
+            #     p_belief_pg.detach(),   # do not detach for ppo
+            #     g_ao.detach(),   # live
+            #     g_ol.detach(),   # live
+            #     use_ao.detach(),
+            #     use_ol.detach(),
+            # )
+
+            ctx_left_cur_zer = torch.zeros_like(ctx_left_cur)
+            ctx_right_cur_zer = torch.zeros_like(ctx_right_cur)
+            ctx_left_obs_zer = torch.zeros_like(ctx_left_obs)
+            ctx_right_obs_zer = torch.zeros_like(ctx_right_obs)
+            p_self_pg_zer = torch.zeros_like(p_self_pg)
+            p_teacher_ao_pg_zer = torch.zeros_like(p_teacher_ao_pg)
+            p_teacher_ol_pg_zer = torch.zeros_like(p_teacher_ol_pg)
+            g_ao_zer = torch.zeros_like(g_ao)
+            g_ol_zer = torch.zeros_like(g_ol)
+
             control_in = self._control_features(
-                ctx_left_cur.detach(),
-                ctx_right_cur.detach(),
-                ctx_left_obs.detach(),
-                ctx_right_obs.detach(),
+                ctx_left_cur_zer.detach(),
+                ctx_right_cur_zer.detach(),
+                ctx_left_obs_zer.detach(),
+                ctx_right_obs_zer.detach(),
                 left_feats.detach(),
                 right_feats.detach(),
-                p_self_pg.detach(),              # do not detach for ppo
-                p_teacher_ao_pg.detach(),
-                p_teacher_ol_pg.detach(),
+                p_self_pg_zer.detach(),              # do not detach for ppo
+                p_teacher_ao_pg_zer.detach(),
+                p_teacher_ol_pg_zer.detach(),
                 p_belief_pg.detach(),   # do not detach for ppo
-                g_ao.detach(),   # live
-                g_ol.detach(),   # live
+                g_ao_zer.detach(),   # live
+                g_ol_zer.detach(),   # live
                 use_ao.detach(),
                 use_ol.detach(),
             )
