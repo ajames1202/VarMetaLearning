@@ -13,6 +13,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -26,7 +27,7 @@ import ray
 
 import visual_bandit_env3 as vbe
 
-import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
+import var_bandit_learner2_ppo_minibatch_aux_fullobs_capacity_globalage as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
@@ -124,6 +125,7 @@ def eval_grid_score(
     n_sessions_per_cell: int,
     seed: int,
     alpha: float = 0.5,
+    memory_lambda: float = 1.0,
 ):
     """
     Returns:
@@ -150,6 +152,7 @@ def eval_grid_score(
                         print_this_session=False,
                         teacher_cfg=cfg,
                         return_obs=False,
+                        memory_lambda=memory_lambda,
                     )
                 )
                 meta.append((float(p_lo), str(mode_name)))
@@ -176,7 +179,6 @@ def eval_grid_score(
         ao_scores.setdefault(cell, []).append(float(cum_rew_ao))
         ol_scores.setdefault(cell, []).append(float(cum_rew_ol))
 
-    # global condition means for debug
     il_mean = float(np.mean([np.mean(v) for v in il_scores.values()])) if il_scores else 0.0
     ao_mean = float(np.mean([np.mean(v) for v in ao_scores.values()])) if ao_scores else 0.0
     ol_mean = float(np.mean([np.mean(v) for v in ol_scores.values()])) if ol_scores else 0.0
@@ -219,20 +221,13 @@ def eval_post_grid(
     teacher_modes: List[Tuple[str, Dict[str, Any]]],
     n_sessions_per_cell: int,
     seed: int,
+    memory_lambda: float = 1.0,
 ):
-    """Evaluate a grid and return per-cell means + std.
-
-    Returns:
-      cell_stats[(p_lo, mode_name)] = {
-        'pct_hi_il_mean', 'pct_hi_il_std', ...
-        'cum_rew_il_mean', ...
-        'pertrial_il_mean': (session_N,), ...
-      }
-    """
+    """Evaluate a grid and return per-cell means + std."""
     rng = np.random.default_rng(seed)
 
     futures = []
-    meta = []  # (p_lo, mode_name)
+    meta = []
     for p_lo in p_lo_grid:
         for mode_name, cfg in teacher_modes:
             for _ in range(int(n_sessions_per_cell)):
@@ -245,13 +240,13 @@ def eval_post_grid(
                         print_this_session=False,
                         teacher_cfg=cfg,
                         return_obs=False,
+                        memory_lambda=memory_lambda,
                     )
                 )
                 meta.append((float(p_lo), str(mode_name)))
 
     results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
-    # collect per-cell arrays
     per_cell: Dict[Tuple[float, str], Dict[str, List[Any]]] = {}
     for (p_lo, mode_name), res in zip(meta, results):
         (
@@ -264,7 +259,7 @@ def eval_post_grid(
             high_reward_choices_il,
             high_reward_choices_ao,
             high_reward_choices_ol,
-            _, _,  # logp_old_buf, v_old_buf
+            _, _,
             g_trace_ao, g_trace_ol,
         ) = res
 
@@ -274,7 +269,7 @@ def eval_post_grid(
             "cum_rew_il": [], "cum_rew_ao": [], "cum_rew_ol": [],
             "pertrial_il": [], "pertrial_ao": [], "pertrial_ol": [],
             "gtrace_ao": [], "gtrace_ol": [],
-            "ao_rel": [], "ol_rel": [],   # per-session reliability target traces
+            "ao_rel": [], "ol_rel": [],
         })
         d["pct_hi_il"].append(float(pct_hi_il))
         d["pct_hi_ao"].append(float(pct_hi_ao))
@@ -288,54 +283,46 @@ def eval_post_grid(
         d["gtrace_ao"].append(np.asarray(g_trace_ao, dtype=np.float32))
         d["gtrace_ol"].append(np.asarray(g_trace_ol, dtype=np.float32))
 
-    cell_stats: Dict[Tuple[float, str], Dict[str, Any]] = {}
+    cell_stats = {}
     for cell, d in per_cell.items():
-        def _mstd(x):
+        def _mean_std(x):
             x = np.asarray(x, dtype=np.float32)
-            return float(x.mean()), float(x.std(ddof=0))
+            return float(np.mean(x)), float(np.std(x, ddof=0))
 
-        n_sess = len(d["pct_hi_il"])
+        il_m, il_s = _mean_std(d["pct_hi_il"])
+        ao_m, ao_s = _mean_std(d["pct_hi_ao"])
+        ol_m, ol_s = _mean_std(d["pct_hi_ol"])
+        ril_m, ril_s = _mean_std(d["cum_rew_il"])
+        rao_m, rao_s = _mean_std(d["cum_rew_ao"])
+        rol_m, rol_s = _mean_std(d["cum_rew_ol"])
 
-        il_m, il_s = _mstd(d["pct_hi_il"])
-        ao_m, ao_s = _mstd(d["pct_hi_ao"])
-        ol_m, ol_s = _mstd(d["pct_hi_ol"])
-        ril_m, ril_s = _mstd(d["cum_rew_il"])
-        rao_m, rao_s = _mstd(d["cum_rew_ao"])
-        rol_m, rol_s = _mstd(d["cum_rew_ol"])
-
-        # per-trial hit rates: (n_sessions, session_N) float32 with possible NaN at
-        # unvisited positions → use nanmean/nanstd; convert std → SE for plotting
-        pt_il = np.stack(d["pertrial_il"], axis=0)   # (S, T) in [0,1] or NaN
+        pt_il = np.stack(d["pertrial_il"], axis=0)
         pt_ao = np.stack(d["pertrial_ao"], axis=0)
         pt_ol = np.stack(d["pertrial_ol"], axis=0)
-        pt_il_mean = np.nanmean(pt_il, axis=0)
-        pt_ao_mean = np.nanmean(pt_ao, axis=0)
-        pt_ol_mean = np.nanmean(pt_ol, axis=0)
-        # per-position valid count (may differ if some positions were never reached)
-        pt_il_n = np.sum(~np.isnan(pt_il), axis=0).clip(min=1)
-        pt_ao_n = np.sum(~np.isnan(pt_ao), axis=0).clip(min=1)
-        pt_ol_n = np.sum(~np.isnan(pt_ol), axis=0).clip(min=1)
-        pt_il_se = np.nanstd(pt_il, axis=0, ddof=0) / np.sqrt(pt_il_n)
-        pt_ao_se = np.nanstd(pt_ao, axis=0, ddof=0) / np.sqrt(pt_ao_n)
-        pt_ol_se = np.nanstd(pt_ol, axis=0, ddof=0) / np.sqrt(pt_ol_n)
+        pt_il_mean = pt_il.mean(axis=0)
+        pt_ao_mean = pt_ao.mean(axis=0)
+        pt_ol_mean = pt_ol.mean(axis=0)
+        pt_il_se = pt_il.std(axis=0, ddof=0) / np.sqrt(max(1, pt_il.shape[0]))
+        pt_ao_se = pt_ao.std(axis=0, ddof=0) / np.sqrt(max(1, pt_ao.shape[0]))
+        pt_ol_se = pt_ol.std(axis=0, ddof=0) / np.sqrt(max(1, pt_ol.shape[0]))
 
-        # g traces: use nanmean/SE across sessions
-        g_ao = np.stack(d["gtrace_ao"], axis=0)   # (S, T)
+        g_ao = np.stack(d["gtrace_ao"], axis=0)
         g_ol = np.stack(d["gtrace_ol"], axis=0)
-        gao_n   = np.sum(~np.isnan(g_ao), axis=0).clip(min=1)
-        gol_n   = np.sum(~np.isnan(g_ol), axis=0).clip(min=1)
-        gao_mu  = np.nanmean(g_ao, axis=0)
-        gol_mu  = np.nanmean(g_ol, axis=0)
-        gao_sd  = np.nanstd(g_ao,  axis=0, ddof=0)
-        gol_sd  = np.nanstd(g_ol,  axis=0, ddof=0)
-        gao_se  = gao_sd / np.sqrt(gao_n)   # uncertainty on the mean
-        gol_se  = gol_sd / np.sqrt(gol_n)
+        gao_n = np.sum(~np.isnan(g_ao), axis=0).clip(min=1)
+        gol_n = np.sum(~np.isnan(g_ol), axis=0).clip(min=1)
+        gao_mu = np.nanmean(g_ao, axis=0)
+        gol_mu = np.nanmean(g_ol, axis=0)
+        gao_sd = np.nanstd(g_ao, axis=0, ddof=0)
+        gol_sd = np.nanstd(g_ol, axis=0, ddof=0)
+        gao_se = gao_sd / np.sqrt(gao_n)
+        gol_se = gol_sd / np.sqrt(gol_n)
 
+        n_sess = len(d["pct_hi_il"])
         cell_stats[cell] = {
             "n_sessions": n_sess,
-            "pct_hi_il_mean": il_m,  "pct_hi_il_std": il_s,
-            "pct_hi_ao_mean": ao_m,  "pct_hi_ao_std": ao_s,
-            "pct_hi_ol_mean": ol_m,  "pct_hi_ol_std": ol_s,
+            "pct_hi_il_mean": il_m, "pct_hi_il_std": il_s,
+            "pct_hi_ao_mean": ao_m, "pct_hi_ao_std": ao_s,
+            "pct_hi_ol_mean": ol_m, "pct_hi_ol_std": ol_s,
             "cum_rew_il_mean": ril_m, "cum_rew_il_std": ril_s,
             "cum_rew_ao_mean": rao_m, "cum_rew_ao_std": rao_s,
             "cum_rew_ol_mean": rol_m, "cum_rew_ol_std": rol_s,
@@ -350,12 +337,7 @@ def eval_post_grid(
 
     return cell_stats
 
-
-# -----------------------------
-# Rollout
-# -----------------------------
-
-def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False, return_obs: bool = True):
+def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False, return_obs: bool = True, memory_lambda: float = 1.0):
     """One full session rollout producing buffers used by update2.
 
     Returns a tuple:
@@ -364,6 +346,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
       teacher_correct_buf: [-1 for non-observation trials, else 0/1 if teacher chose high reward]
       summary stats: cum_rewards_il/ao/ol, high_reward_choices_{il,ao,ol} (arrays over trials)
     """
+
+    if not (0.0 < float(memory_lambda) <= 1.0):
+        raise ValueError(f"memory_lambda must be in (0,1], got {memory_lambda}")
 
     def log(*args, **kwargs):
         if print_this_session and worker_id == 0:
@@ -445,7 +430,30 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
         v = torch.stack(v_tokens, dim=0)  # (Lpast,1,H)
         keep = torch.as_tensor([c in keep_conds for c in cond_tokens], device=device, dtype=torch.bool)  # (Lpast,)
         kpm = (~keep).unsqueeze(0)  # (1,Lpast) True=mask
-        ctx_attn = agent._safe_causal_attn(q_tok, k, v, kpm)  # (1,1,H)
+
+        # Global age: newest past memory has age 0, oldest has age Lpast-1.
+        # We apply score_i <- score_i + log(m_i), with m_i = memory_lambda ** age_i.
+        Lpast = len(k_tokens)
+        if float(memory_lambda) < 1.0:
+            ages = torch.arange(Lpast - 1, -1, -1, device=device, dtype=q_tok.dtype)
+            log_lambda = math.log(float(memory_lambda))
+            log_m = ages * log_lambda  # more negative for older memories
+        else:
+            log_m = torch.zeros(Lpast, device=device, dtype=q_tok.dtype)
+
+        # Prepend BOS bias = 0.0
+        attn_log_bias = torch.cat([
+            torch.zeros(1, device=device, dtype=q_tok.dtype),
+            log_m
+        ], dim=0)  # (Lpast + 1,)
+
+        ctx_attn = agent._safe_causal_attn(
+            q_tok,
+            k,
+            v,
+            kpm,
+            attn_log_bias=attn_log_bias,
+        )  # (1,1,H)
         return agent.attn_ln(ctx_attn + q_tok)
 
     def _belief_policy_value(curr_cond: str, lf: torch.Tensor, rf: torch.Tensor):
@@ -499,10 +507,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             use_ol = zeros_gate
 
             # #ablation test, set g_ao to 0.0
-            g_ao = torch.full_like(
-                torch.sigmoid(agent.gate_ao(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
-                0.0
-            )
+            # g_ao = torch.full_like(
+            #     torch.sigmoid(agent.gate_ao(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
+            #     0.0
+            # )
 
         elif curr_cond == "OL-s":
             ctx_l_cur = _ctx_for(ql, {"OL-s"})
@@ -525,10 +533,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             use_ol = torch.full_like(g_ol, 1.0 if any(c == "OL-o" for c in cond_tokens) else 0.0)
 
             #ablation test, set g_ol to 0.1 (for ablation_1) or 0.0 (for ablation_2)
-            g_ol = torch.full_like(
-                torch.sigmoid(agent.gate_ol(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
-                0.0
-            )
+            # g_ol = torch.full_like(
+            #     torch.sigmoid(agent.gate_ol(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
+            #     0.0
+            # )
 
         elif curr_cond == "AO-o":
             ctx_l_cur = zeros_ctx_l
@@ -988,7 +996,7 @@ class RolloutWorker:
         # Limit intra-op threads so workers don't fight over CPU cores.
         torch.set_num_threads(1)
 
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True):
+    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True, memory_lambda: float = 1.0):
         """Run one session with given pair probs. teacher_eps is optional (only used if env supports it)."""
         # Reuse the pre-built agent — just hot-swap weights (much cheaper than full construction).
         self._agent.load_state_dict(agent_state_dict)
@@ -1030,7 +1038,8 @@ class RolloutWorker:
                 self.session_K, self.session_N,
                 worker_id=self.worker_id,
                 print_this_session=print_this_session,
-                return_obs=return_obs
+                return_obs=return_obs,
+                memory_lambda=memory_lambda,
             )
 
 
@@ -1049,7 +1058,8 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  aux_mb_size: int = 256,
                  self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5,
                  gate_ao_coef: float = 0.5, gate_ol_coef: float = 0.5, gate_ol_sg: bool = True,
-                 session_chunk_size: int = 10):
+                 session_chunk_size: int = 10,
+                 memory_lambda: float = 1.0):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -1075,6 +1085,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
         gate_ol_coef=gate_ol_coef,
         gate_ol_sg=gate_ol_sg,
         session_chunk_size=session_chunk_size,
+        memory_lambda=memory_lambda,
     )
 
 
@@ -1119,6 +1130,10 @@ def main():
     # Grid eval + early stop (eval-based, not train EMA)
     parser.add_argument('--eval-interval', type=int, default=20)
     parser.add_argument('--eval-sessions-per-cell', type=int, default=5)
+    parser.add_argument('--train-memory-lambda', type=float, default=1.0,
+                        help='Training-time lag-dependent retention factor. 1.0=no decay; smaller values produce lower-capacity memory families.')
+    parser.add_argument('--eval-memory-lambda', type=float, default=None,
+                        help='Eval-time lag-dependent retention factor. Default: match --train-memory-lambda.')
     parser.add_argument('--warmup-updates', type=int, default=400)
     parser.add_argument('--patience-evals', type=int, default=10)
     parser.add_argument('--min-delta', type=float, default=0.5)
@@ -1145,6 +1160,9 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    if args.eval_memory_lambda is None:
+        args.eval_memory_lambda = float(args.train_memory_lambda)
 
     # TensorBoard writer
     log_dir = os.path.join("runs", f"bandit_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
@@ -1181,6 +1199,8 @@ def main():
 
     run_dir = os.path.join(plot_dir, datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
+
+    print(f"[Memory] train_memory_lambda={args.train_memory_lambda:.4f} eval_memory_lambda={args.eval_memory_lambda:.4f}")
 
 
     # Ray init
@@ -1251,6 +1271,7 @@ def main():
                     probs,
                     print_this_session=print_flag,
                     teacher_cfg=cfg,
+                    memory_lambda=args.train_memory_lambda,
                 )
             )
         return futures
@@ -1369,6 +1390,7 @@ def main():
             gate_ol_coef=args.gate_ol_coef,
             gate_ol_sg=args.gate_ol_sg,
             session_chunk_size=args.train_session_chunk_size,
+            memory_lambda=args.train_memory_lambda,
         )
 
         t_update = time.perf_counter() - (t0 + t_rollout)
@@ -1412,6 +1434,7 @@ def main():
                 n_sessions_per_cell=args.eval_sessions_per_cell,
                 seed=args.seed + 10_000 + update_idx,
                 alpha=0.5,
+                memory_lambda=args.eval_memory_lambda,
             )
 
             # Use a composite score to avoid "good on easy cells only"
@@ -1437,6 +1460,8 @@ def main():
                         "robust": float(robust),
                         "p_lo_grid": list(p_lo_grid),
                         "teacher_modes": [m for m, _ in teacher_modes],
+                        "train_memory_lambda": float(args.train_memory_lambda),
+                        "eval_memory_lambda": float(args.eval_memory_lambda),
                     }
                 )
             else:
@@ -1576,6 +1601,7 @@ def main():
             teacher_modes=teacher_modes,
             n_sessions_per_cell=int(args.post_grid_sessions_per_cell),
             seed=int(args.seed + 40_000 + best_update),
+            memory_lambda=args.eval_memory_lambda,
         )
 
         # ------------------

@@ -269,48 +269,95 @@ class BanditLearner(nn.Module):
 
     def _safe_causal_attn(
         self,
-        query: torch.Tensor,  # (L,B,H)
-        key: torch.Tensor,    # (L,B,H)
-        value: torch.Tensor,  # (L,B,H)
-        key_padding_mask: torch.Tensor,  # (B,L) True=ignore
+        query: torch.Tensor,          # (Lq,B,H)
+        key: torch.Tensor,            # (Lk,B,H)
+        value: torch.Tensor,          # (Lk,B,H)
+        key_padding_mask: torch.Tensor,   # (B,Lk) True=ignore
+        attn_log_bias: torch.Tensor = None,
     ) -> torch.Tensor:
-        """Causal attention with a BOS token so we never softmax over all-masked keys."""
+        """
+        Causal attention with a BOS token so we never softmax over all-masked keys.
 
-        L, B, H = query.shape
+        Optional:
+          attn_log_bias can be:
+            - (src_len,)               shared over batch and query positions
+            - (Lq, src_len)            shared over batch
+            - (B, src_len)             shared over query positions
+            - (B, Lq, src_len)         full per-batch bias
+
+        where src_len = Lk + 1 after prepending BOS.
+
+        The bias is added directly to the attention logits before softmax.
+        """
+
+        Lq, B, H = query.shape
         dev = query.device
         dtype = query.dtype
-        
 
         bos_k = self.bos_token.expand(1, B, H)
         bos_v = torch.zeros((1, B, H), device=dev, dtype=dtype)
 
-        key2 = torch.cat([bos_k, key], dim=0)   # (L+1,B,H)
+        key2 = torch.cat([bos_k, key], dim=0)   # (src_len,B,H)
         val2 = torch.cat([bos_v, value], dim=0)
 
-        Lq, B, H = query.shape
-        key_len = key.shape[0]          # past tokens
-        src_len = key_len + 1           # + BOS
-
+        key_len = key.shape[0]
+        src_len = key_len + 1
 
         bos_kpm = torch.zeros((B, 1), device=dev, dtype=torch.bool)
-        kpm2 = torch.cat([bos_kpm, key_padding_mask], dim=1)  # (B,L+1)
+        kpm2 = torch.cat([bos_kpm, key_padding_mask], dim=1)  # (B,src_len)
 
-        # Query i may attend to BOS and keys up to i (history).
-        # With BOS prepended, disallow keys >= i+2.
-        # attn_mask = torch.triu(torch.ones((L, L + 1), device=dev, dtype=torch.bool), diagonal=2)
+        # Query i may attend to BOS and valid history only.
         offset = max(0, key_len - Lq)
-        attn_mask = torch.triu(
+        causal_forbid = torch.triu(
             torch.ones((Lq, src_len), device=dev, dtype=torch.bool),
             diagonal=offset + 2
         )
 
+        # Base additive float mask: 0 for allowed, -inf for forbidden
+        base_mask = torch.zeros((Lq, src_len), device=dev, dtype=dtype)
+        base_mask = base_mask.masked_fill(causal_forbid, float("-inf"))  # (Lq,src_len)
+
+        # Expand to (B,Lq,src_len)
+        attn_mask = base_mask.unsqueeze(0).expand(B, -1, -1).clone()
+
+        # Optional log-bias
+        if attn_log_bias is not None:
+            if attn_log_bias.dim() == 1:
+                # (src_len,) -> (B,Lq,src_len)
+                bias = attn_log_bias.view(1, 1, src_len).expand(B, Lq, src_len)
+            elif attn_log_bias.dim() == 2:
+                if tuple(attn_log_bias.shape) == (Lq, src_len):
+                    bias = attn_log_bias.unsqueeze(0).expand(B, -1, -1)
+                elif tuple(attn_log_bias.shape) == (B, src_len):
+                    bias = attn_log_bias.unsqueeze(1).expand(-1, Lq, -1)
+                else:
+                    raise ValueError(
+                        f"attn_log_bias with dim=2 must be (Lq,src_len)=({Lq},{src_len}) "
+                        f"or (B,src_len)=({B},{src_len}), got {tuple(attn_log_bias.shape)}"
+                    )
+            elif attn_log_bias.dim() == 3:
+                if tuple(attn_log_bias.shape) != (B, Lq, src_len):
+                    raise ValueError(
+                        f"attn_log_bias with dim=3 must be (B,Lq,src_len)=({B},{Lq},{src_len}), "
+                        f"got {tuple(attn_log_bias.shape)}"
+                    )
+                bias = attn_log_bias
+            else:
+                raise ValueError("attn_log_bias must have dim 1, 2, or 3")
+
+            attn_mask = attn_mask + bias
+
+        # Fold padding mask into same float mask
+        attn_mask = attn_mask.masked_fill(kpm2.unsqueeze(1), float("-inf"))  # (B,Lq,src_len)
+
+        # PyTorch MHA expects (B*num_heads, Lq, src_len) for 3D masks
+        attn_mask = attn_mask.repeat_interleave(self.attn.num_heads, dim=0)
 
         out, _ = self.attn(
             query=query,
             key=key2,
             value=val2,
             attn_mask=attn_mask,
-            key_padding_mask=kpm2,
             need_weights=False,
         )
         return out
@@ -438,6 +485,7 @@ class BanditLearner(nn.Module):
         gate_ol_coef: float = 0.5,  # weight for OL gate reliability loss
         gate_ol_sg: bool = True,    # if True, stop-gradient through g_ol in the OL gate loss
         session_chunk_size: int | None = None,
+        memory_lambda: float = 1.0,
     ):
         """
         Hybrid update with:
@@ -456,6 +504,9 @@ class BanditLearner(nn.Module):
             modify q_base / q_delta_* / attn / gates.
           - Advantages/returns are computed from rollout-time values (bandit_value_buf) using sparse-GAE.
         """
+        if not (0.0 < float(memory_lambda) <= 1.0):
+            raise ValueError(f"memory_lambda must be in (0,1], got {memory_lambda}")
+
         # ---------- motor data (optional — skipped when direct-choice rollout is used) ----------
         # When meta_ep_rollout uses cursor teleportation, xy_pos_buf / goal_vec_buf /
         # chosen_bandits_motor_buf are all empty lists.  In that case the motor network
@@ -680,7 +731,24 @@ class BanditLearner(nn.Module):
             )
 
             # Single attention call + layer-norm residual
-            ctx_stacked = self._safe_causal_attn(q_all_stacked, k_rep, v_rep, kpm_stacked)
+            # Global-age decay during training: for query time t and source time j,
+            # age = t - j (with the newest accessible memory having age 0).
+            attn_log_bias = None
+            if float(memory_lambda) < 1.0:
+                Lhist = int(k_hist.shape[0])
+                q_pos = torch.arange(Lhist, device=device, dtype=q_all_stacked.dtype).unsqueeze(1)
+                k_pos = torch.arange(Lhist, device=device, dtype=q_all_stacked.dtype).unsqueeze(0)
+                ages = (q_pos - k_pos).clamp(min=0)
+                attn_log_bias = torch.zeros((Lhist, Lhist + 1), device=device, dtype=q_all_stacked.dtype)
+                attn_log_bias[:, 1:] = ages * math.log(float(memory_lambda))
+
+            ctx_stacked = self._safe_causal_attn(
+                q_all_stacked,
+                k_rep,
+                v_rep,
+                kpm_stacked,
+                attn_log_bias=attn_log_bias,
+            )
             ctx_stacked = self.attn_ln(ctx_stacked + q_all_stacked)  # (T-1, 10*Bc, H)
 
             # Unpack and build full-length contexts
@@ -729,10 +797,10 @@ class BanditLearner(nn.Module):
             ).clamp(0.0, 1.0)
 
             #Ablation test, setting g_ol to 0.1
-            g_ol = torch.full_like(g_ol, 0.0)
+            # g_ol = torch.full_like(g_ol, 0.0)
 
             #Ablation test, setting g_ol to 0.1
-            g_ao = torch.full_like(g_ao, 0.0)
+            # g_ao = torch.full_like(g_ao, 0.0)
 
             # Separate gate inputs with detached contexts for the reliability BCE loss.
             # This isolates the gate loss gradient to gate_ao / gate_ol MLP parameters only —
