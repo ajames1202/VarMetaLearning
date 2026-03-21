@@ -27,7 +27,7 @@ import ray
 
 import visual_bandit_env3 as vbe
 
-import var_bandit_learner2_ppo_minibatch_aux_fullobs_capacity_globalage as bl
+import var_bandit_learner2_ppo_minibatch_aux_fullobs as bl
 
 from torch.utils.tensorboard import SummaryWriter
 import os
