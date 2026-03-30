@@ -486,6 +486,7 @@ class BanditLearner(nn.Module):
         gate_ol_sg: bool = True,    # if True, stop-gradient through g_ol in the OL gate loss
         session_chunk_size: int | None = None,
         memory_lambda: float = 1.0,
+        ablation_g: float | None = None,   # if set to a float in [0,1], use fixed gate values instead of learned gates (for ablation
     ):
         """
         Hybrid update with:
@@ -797,7 +798,9 @@ class BanditLearner(nn.Module):
             ).clamp(0.0, 1.0)
 
             #Ablation test, setting g_ol to 0.1
-            # g_ol = torch.full_like(g_ol, 0.0)
+            if ablation_g is not None:
+                g_ol = torch.full_like(g_ol, ablation_g)
+                g_ao = torch.full_like(g_ao, ablation_g)
 
             #Ablation test, setting g_ol to 0.1
             # g_ao = torch.full_like(g_ao, 0.0)

@@ -126,6 +126,7 @@ def eval_grid_score(
     seed: int,
     alpha: float = 0.5,
     memory_lambda: float = 1.0,
+    ablation_g: float = None,
 ):
     """
     Returns:
@@ -153,6 +154,7 @@ def eval_grid_score(
                         teacher_cfg=cfg,
                         return_obs=False,
                         memory_lambda=memory_lambda,
+                        ablation_g=ablation_g
                     )
                 )
                 meta.append((float(p_lo), str(mode_name)))
@@ -222,6 +224,7 @@ def eval_post_grid(
     n_sessions_per_cell: int,
     seed: int,
     memory_lambda: float = 1.0,
+    ablation_g: float = None,
 ):
     """Evaluate a grid and return per-cell means + std."""
     rng = np.random.default_rng(seed)
@@ -241,6 +244,7 @@ def eval_post_grid(
                         teacher_cfg=cfg,
                         return_obs=False,
                         memory_lambda=memory_lambda,
+                        ablation_g=ablation_g
                     )
                 )
                 meta.append((float(p_lo), str(mode_name)))
@@ -337,7 +341,7 @@ def eval_post_grid(
 
     return cell_stats
 
-def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False, return_obs: bool = True, memory_lambda: float = 1.0):
+def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False, return_obs: bool = True, memory_lambda: float = 1.0, ablation_g: float | None = None):
     """One full session rollout producing buffers used by update2.
 
     Returns a tuple:
@@ -509,8 +513,10 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             # #ablation test, set g_ao to 0.0
             # g_ao = torch.full_like(
             #     torch.sigmoid(agent.gate_ao(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
-            #     0.0
+            #     0.5
             # )
+            if ablation_g is not None:
+                g_ao = torch.full_like(g_ao, float(ablation_g))
 
         elif curr_cond == "OL-s":
             ctx_l_cur = _ctx_for(ql, {"OL-s"})
@@ -537,6 +543,9 @@ def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_i
             #     torch.sigmoid(agent.gate_ol(torch.cat([ctx_l_cur, ctx_r_cur, ctx_l_obs, ctx_r_obs], dim=-1))),
             #     0.0
             # )
+
+            if ablation_g is not None:
+                g_ol = torch.full_like(g_ol, float(ablation_g))
 
         elif curr_cond == "AO-o":
             ctx_l_cur = zeros_ctx_l
@@ -996,7 +1005,7 @@ class RolloutWorker:
         # Limit intra-op threads so workers don't fight over CPU cores.
         torch.set_num_threads(1)
 
-    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True, memory_lambda: float = 1.0):
+    def run_session(self, agent_state_dict, probs_this_session, print_this_session: bool = False, teacher_cfg: dict = None, return_obs: bool = True, memory_lambda: float = 1.0, ablation_g: float = None):
         """Run one session with given pair probs. teacher_eps is optional (only used if env supports it)."""
         # Reuse the pre-built agent — just hot-swap weights (much cheaper than full construction).
         self._agent.load_state_dict(agent_state_dict)
@@ -1040,6 +1049,7 @@ class RolloutWorker:
                 print_this_session=print_this_session,
                 return_obs=return_obs,
                 memory_lambda=memory_lambda,
+                ablation_g=ablation_g
             )
 
 
@@ -1059,7 +1069,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
                  self_bce_coef: float = 1.0, aux_ao_coef: float = 0.2, aux_ol_coef: float = 0.5,
                  gate_ao_coef: float = 0.5, gate_ol_coef: float = 0.5, gate_ol_sg: bool = True,
                  session_chunk_size: int = 10,
-                 memory_lambda: float = 1.0):
+                 memory_lambda: float = 1.0, ablation_g: float = None):
     return agent.update2(
         optim_bandit, optim_motor,
         batch_xy_pos,
@@ -1086,6 +1096,7 @@ def _call_update2(agent, optim_bandit, optim_motor,
         gate_ol_sg=gate_ol_sg,
         session_chunk_size=session_chunk_size,
         memory_lambda=memory_lambda,
+        ablation_g=ablation_g
     )
 
 
@@ -1156,6 +1167,8 @@ def main():
     parser.add_argument('--p-lo-min', type=float, default=0.10)
     parser.add_argument('--p-lo-max', type=float, default=0.6)
     parser.add_argument('--p-lo-steps', type=int, default=14)
+    parser.add_argument('--ablation-g', type=float, default=None)
+
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1163,6 +1176,9 @@ def main():
 
     if args.eval_memory_lambda is None:
         args.eval_memory_lambda = float(args.train_memory_lambda)
+
+    if args.ablation_g is not None and not (0.0 <= float(args.ablation_g) <= 1.0):
+        raise ValueError(f"ablation_g must be in [0,1], got {args.ablation_g}")    
 
     # TensorBoard writer
     log_dir = os.path.join("runs", f"bandit_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
@@ -1272,6 +1288,7 @@ def main():
                     print_this_session=print_flag,
                     teacher_cfg=cfg,
                     memory_lambda=args.train_memory_lambda,
+                    ablation_g=args.ablation_g
                 )
             )
         return futures
@@ -1391,6 +1408,7 @@ def main():
             gate_ol_sg=args.gate_ol_sg,
             session_chunk_size=args.train_session_chunk_size,
             memory_lambda=args.train_memory_lambda,
+            ablation_g=args.ablation_g
         )
 
         t_update = time.perf_counter() - (t0 + t_rollout)
@@ -1435,6 +1453,7 @@ def main():
                 seed=args.seed + 10_000 + update_idx,
                 alpha=0.5,
                 memory_lambda=args.eval_memory_lambda,
+                ablation_g=args.ablation_g
             )
 
             # Use a composite score to avoid "good on easy cells only"
@@ -1602,6 +1621,7 @@ def main():
             n_sessions_per_cell=int(args.post_grid_sessions_per_cell),
             seed=int(args.seed + 40_000 + best_update),
             memory_lambda=args.eval_memory_lambda,
+            ablation_g=args.ablation_g
         )
 
         # ------------------
