@@ -341,6 +341,173 @@ def eval_post_grid(
 
     return cell_stats
 
+def eval_post_grid2(
+    workers,
+    agent_state_cpu,
+    session_K: int,
+    p_hi: float,
+    p_lo_grid: List[float],
+    teacher_modes: List[Tuple[str, Dict[str, Any]]],
+    n_sessions_per_cell: int,
+    seed: int,
+    memory_lambda: float = 1.0,
+    ablation_g: float = None,
+):
+    """Evaluate a grid and return per-cell summaries + raw per-session arrays."""
+    rng = np.random.default_rng(seed)
+
+    futures = []
+    meta = []
+    for p_lo in p_lo_grid:
+        for mode_name, cfg in teacher_modes:
+            for eval_idx in range(int(n_sessions_per_cell)):
+                probs = sample_probs_this_session(session_K, float(p_hi), float(p_lo), rng)
+                w = workers[len(futures) % len(workers)]
+                futures.append(
+                    w.run_session.remote(
+                        agent_state_cpu,
+                        probs,
+                        print_this_session=False,
+                        teacher_cfg=cfg,
+                        return_obs=False,
+                        memory_lambda=memory_lambda,
+                        ablation_g=ablation_g,
+                    )
+                )
+                meta.append((float(p_lo), str(mode_name), int(eval_idx)))
+
+    results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
+
+    per_cell: Dict[Tuple[float, str], Dict[str, List[Any]]] = {}
+    for (p_lo, mode_name, eval_idx), res in zip(meta, results):
+        (
+            _, _, _,
+            _, _, _, _,
+            _, _,
+            _,
+            cum_rew_il, cum_rew_ao, cum_rew_ol,
+            pct_hi_il, pct_hi_ao, pct_hi_ol,
+            high_reward_choices_il,
+            high_reward_choices_ao,
+            high_reward_choices_ol,
+            _, _,
+            g_trace_ao, g_trace_ol,
+        ) = res
+
+        cell = (p_lo, mode_name)
+        d = per_cell.setdefault(cell, {
+            "eval_idx": [],
+            "pct_hi_il": [], "pct_hi_ao": [], "pct_hi_ol": [],
+            "cum_rew_il": [], "cum_rew_ao": [], "cum_rew_ol": [],
+            "pertrial_il": [], "pertrial_ao": [], "pertrial_ol": [],
+            "gtrace_ao": [], "gtrace_ol": [],
+        })
+
+        d["eval_idx"].append(int(eval_idx))
+
+        d["pct_hi_il"].append(float(pct_hi_il))
+        d["pct_hi_ao"].append(float(pct_hi_ao))
+        d["pct_hi_ol"].append(float(pct_hi_ol))
+
+        d["cum_rew_il"].append(float(cum_rew_il))
+        d["cum_rew_ao"].append(float(cum_rew_ao))
+        d["cum_rew_ol"].append(float(cum_rew_ol))
+
+        d["pertrial_il"].append(np.asarray(high_reward_choices_il, dtype=np.float32))
+        d["pertrial_ao"].append(np.asarray(high_reward_choices_ao, dtype=np.float32))
+        d["pertrial_ol"].append(np.asarray(high_reward_choices_ol, dtype=np.float32))
+
+        d["gtrace_ao"].append(np.asarray(g_trace_ao, dtype=np.float32))
+        d["gtrace_ol"].append(np.asarray(g_trace_ol, dtype=np.float32))
+
+    cell_stats = {}
+    for cell, d in per_cell.items():
+        def _mean_std(x):
+            x = np.asarray(x, dtype=np.float32)
+            return float(np.mean(x)), float(np.std(x, ddof=0))
+
+        # raw per-session arrays
+        pct_hi_il_all = np.asarray(d["pct_hi_il"], dtype=np.float32)
+        pct_hi_ao_all = np.asarray(d["pct_hi_ao"], dtype=np.float32)
+        pct_hi_ol_all = np.asarray(d["pct_hi_ol"], dtype=np.float32)
+
+        cum_rew_il_all = np.asarray(d["cum_rew_il"], dtype=np.float32)
+        cum_rew_ao_all = np.asarray(d["cum_rew_ao"], dtype=np.float32)
+        cum_rew_ol_all = np.asarray(d["cum_rew_ol"], dtype=np.float32)
+
+        eval_idx_all = np.asarray(d["eval_idx"], dtype=np.int32)
+
+        il_m, il_s = _mean_std(pct_hi_il_all)
+        ao_m, ao_s = _mean_std(pct_hi_ao_all)
+        ol_m, ol_s = _mean_std(pct_hi_ol_all)
+
+        ril_m, ril_s = _mean_std(cum_rew_il_all)
+        rao_m, rao_s = _mean_std(cum_rew_ao_all)
+        rol_m, rol_s = _mean_std(cum_rew_ol_all)
+
+        pt_il = np.stack(d["pertrial_il"], axis=0)
+        pt_ao = np.stack(d["pertrial_ao"], axis=0)
+        pt_ol = np.stack(d["pertrial_ol"], axis=0)
+
+        pt_il_mean = pt_il.mean(axis=0)
+        pt_ao_mean = pt_ao.mean(axis=0)
+        pt_ol_mean = pt_ol.mean(axis=0)
+
+        pt_il_se = pt_il.std(axis=0, ddof=0) / np.sqrt(max(1, pt_il.shape[0]))
+        pt_ao_se = pt_ao.std(axis=0, ddof=0) / np.sqrt(max(1, pt_ao.shape[0]))
+        pt_ol_se = pt_ol.std(axis=0, ddof=0) / np.sqrt(max(1, pt_ol.shape[0]))
+
+        g_ao = np.stack(d["gtrace_ao"], axis=0)
+        g_ol = np.stack(d["gtrace_ol"], axis=0)
+
+        gao_n = np.sum(~np.isnan(g_ao), axis=0).clip(min=1)
+        gol_n = np.sum(~np.isnan(g_ol), axis=0).clip(min=1)
+
+        gao_mu = np.nanmean(g_ao, axis=0)
+        gol_mu = np.nanmean(g_ol, axis=0)
+
+        gao_sd = np.nanstd(g_ao, axis=0, ddof=0)
+        gol_sd = np.nanstd(g_ol, axis=0, ddof=0)
+
+        gao_se = gao_sd / np.sqrt(gao_n)
+        gol_se = gol_sd / np.sqrt(gol_n)
+
+        n_sess = len(pct_hi_il_all)
+
+        cell_stats[cell] = {
+            "n_sessions": n_sess,
+
+            # raw per-session values
+            "eval_idx_all": eval_idx_all,
+            "pct_hi_il_all": pct_hi_il_all,
+            "pct_hi_ao_all": pct_hi_ao_all,
+            "pct_hi_ol_all": pct_hi_ol_all,
+            "cum_rew_il_all": cum_rew_il_all,
+            "cum_rew_ao_all": cum_rew_ao_all,
+            "cum_rew_ol_all": cum_rew_ol_all,
+
+            # summary values
+            "pct_hi_il_mean": il_m, "pct_hi_il_std": il_s,
+            "pct_hi_ao_mean": ao_m, "pct_hi_ao_std": ao_s,
+            "pct_hi_ol_mean": ol_m, "pct_hi_ol_std": ol_s,
+
+            "cum_rew_il_mean": ril_m, "cum_rew_il_std": ril_s,
+            "cum_rew_ao_mean": rao_m, "cum_rew_ao_std": rao_s,
+            "cum_rew_ol_mean": rol_m, "cum_rew_ol_std": rol_s,
+
+            "pertrial_il_mean": pt_il_mean, "pertrial_il_se": pt_il_se,
+            "pertrial_ao_mean": pt_ao_mean, "pertrial_ao_se": pt_ao_se,
+            "pertrial_ol_mean": pt_ol_mean, "pertrial_ol_se": pt_ol_se,
+
+            "gtrace_ao_mean": gao_mu, "gtrace_ao_se": gao_se, "gtrace_ao_std": gao_sd,
+            "gtrace_ol_mean": gol_mu, "gtrace_ol_se": gol_se, "gtrace_ol_std": gol_sd,
+
+            "gtrace_ao_mean_over_trials": float(np.nanmean(gao_mu)),
+            "gtrace_ol_mean_over_trials": float(np.nanmean(gol_mu)),
+        }
+
+    return cell_stats    
+
 def meta_ep_rollout(env, agent, device, session_K: int, session_N: int, worker_id: int = 0, print_this_session: bool = False, return_obs: bool = True, memory_lambda: float = 1.0, ablation_g: float | None = None):
     """One full session rollout producing buffers used by update2.
 
@@ -1116,6 +1283,7 @@ def main():
     parser.add_argument('--episodes-per-update', type=int, default=num_grid_cells,
                         help='Rollout sessions per update (B). If --grid-repeats is set, B will be overridden to K*num_grid_cells.')
     parser.add_argument('--num-updates', type=int, default=1500)
+    
 
     # PPO inner-loop
     parser.add_argument('--ppo-epochs', type=int, default=4)
