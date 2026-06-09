@@ -499,6 +499,12 @@ def eval_post_grid2(
             "pertrial_ao_mean": pt_ao_mean, "pertrial_ao_se": pt_ao_se,
             "pertrial_ol_mean": pt_ol_mean, "pertrial_ol_se": pt_ol_se,
 
+            # raw session x trial matrices (n_sessions, N) of per-trial high-arm
+            # hit indicators; consumed by save_session_trial_npz for convergence.
+            "pertrial_il_all": pt_il,
+            "pertrial_ao_all": pt_ao,
+            "pertrial_ol_all": pt_ol,
+
             "gtrace_ao_mean": gao_mu, "gtrace_ao_se": gao_se, "gtrace_ao_std": gao_sd,
             "gtrace_ol_mean": gol_mu, "gtrace_ol_se": gol_se, "gtrace_ol_std": gol_sd,
 
