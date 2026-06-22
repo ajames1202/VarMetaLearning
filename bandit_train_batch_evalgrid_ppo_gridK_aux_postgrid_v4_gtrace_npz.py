@@ -88,8 +88,9 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
 # -----------------------------
 
 # Default training/eval grid (can edit here)
-P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
-
+#P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
+P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4]
+P_HI_GRID_DEFAULT = [0.8, 0.7, 0.6]
 _DEFAULT_TEACHER_MODES = [
     ["expert", {"expert_teacher": True, "unrealiable_teacher": False, "eps": 0.10}],
 ]
@@ -119,7 +120,7 @@ def eval_grid_score(
     workers,
     agent_state_cpu,
     session_K: int,
-    p_hi: float,
+    p_hi_grid,
     p_lo_grid,
     teacher_modes,
     n_sessions_per_cell: int,
@@ -141,7 +142,7 @@ def eval_grid_score(
 
     futures = []
     meta = []
-    for p_lo in p_lo_grid:
+    for (p_hi, p_lo) in zip(p_hi_grid,p_lo_grid):
         for mode_name, cfg in teacher_modes:
             for _ in range(int(n_sessions_per_cell)):
                 probs = sample_probs_this_session(session_K, float(p_hi), float(p_lo), rng)
@@ -157,7 +158,7 @@ def eval_grid_score(
                         ablation_g=ablation_g
                     )
                 )
-                meta.append((float(p_lo), str(mode_name)))
+                meta.append(((p_hi,p_lo), str(mode_name)))
 
     results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
@@ -165,7 +166,7 @@ def eval_grid_score(
     ao_scores = {}
     ol_scores = {}
 
-    for (p_lo, mode_name), res in zip(meta, results):
+    for ((p_hi,p_lo), mode_name), res in zip(meta, results):
         (
             _, _, _,
             _, _, _, _,
@@ -176,7 +177,7 @@ def eval_grid_score(
             *_
         ) = res
 
-        cell = (p_lo, mode_name)
+        cell = ((p_hi,p_lo), mode_name)
         il_scores.setdefault(cell, []).append(float(cum_rew_il))
         ao_scores.setdefault(cell, []).append(float(cum_rew_ao))
         ol_scores.setdefault(cell, []).append(float(cum_rew_ol))
@@ -218,7 +219,7 @@ def eval_post_grid(
     workers,
     agent_state_cpu,
     session_K: int,
-    p_hi: float,
+    p_hi_grid: List[float],
     p_lo_grid: List[float],
     teacher_modes: List[Tuple[str, Dict[str, Any]]],
     n_sessions_per_cell: int,
@@ -231,7 +232,7 @@ def eval_post_grid(
 
     futures = []
     meta = []
-    for p_lo in p_lo_grid:
+    for (p_hi,p_lo) in zip(p_hi_grid,p_lo_grid):
         for mode_name, cfg in teacher_modes:
             for _ in range(int(n_sessions_per_cell)):
                 probs = sample_probs_this_session(session_K, float(p_hi), float(p_lo), rng)
@@ -247,12 +248,12 @@ def eval_post_grid(
                         ablation_g=ablation_g
                     )
                 )
-                meta.append((float(p_lo), str(mode_name)))
+                meta.append(((p_hi,p_lo), str(mode_name)))
 
     results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
     per_cell: Dict[Tuple[float, str], Dict[str, List[Any]]] = {}
-    for (p_lo, mode_name), res in zip(meta, results):
+    for ((p_hi,p_lo), mode_name), res in zip(meta, results):
         (
             _, _, _,
             _, _, _, _,
@@ -267,7 +268,7 @@ def eval_post_grid(
             g_trace_ao, g_trace_ol,
         ) = res
 
-        cell = (p_lo, mode_name)
+        cell = ((p_hi,p_lo), mode_name)
         d = per_cell.setdefault(cell, {
             "pct_hi_il": [], "pct_hi_ao": [], "pct_hi_ol": [],
             "cum_rew_il": [], "cum_rew_ao": [], "cum_rew_ol": [],
@@ -345,7 +346,7 @@ def eval_post_grid2(
     workers,
     agent_state_cpu,
     session_K: int,
-    p_hi: float,
+    p_hi_grid: List[float],
     p_lo_grid: List[float],
     teacher_modes: List[Tuple[str, Dict[str, Any]]],
     n_sessions_per_cell: int,
@@ -358,7 +359,7 @@ def eval_post_grid2(
 
     futures = []
     meta = []
-    for p_lo in p_lo_grid:
+    for (p_hi,p_lo) in zip(p_hi_grid,p_lo_grid):
         for mode_name, cfg in teacher_modes:
             for eval_idx in range(int(n_sessions_per_cell)):
                 probs = sample_probs_this_session(session_K, float(p_hi), float(p_lo), rng)
@@ -374,12 +375,12 @@ def eval_post_grid2(
                         ablation_g=ablation_g,
                     )
                 )
-                meta.append((float(p_lo), str(mode_name), int(eval_idx)))
+                meta.append(((p_hi, p_lo), str(mode_name), int(eval_idx)))
 
     results = _ray_get_in_batches(futures, batch_size=max(len(workers) * 4, 32))
 
     per_cell: Dict[Tuple[float, str], Dict[str, List[Any]]] = {}
-    for (p_lo, mode_name, eval_idx), res in zip(meta, results):
+    for ((p_hi,p_lo), mode_name, eval_idx), res in zip(meta, results):
         (
             _, _, _,
             _, _, _, _,
@@ -394,7 +395,7 @@ def eval_post_grid2(
             g_trace_ao, g_trace_ol,
         ) = res
 
-        cell = (p_lo, mode_name)
+        cell = ((p_hi,p_lo), mode_name)
         d = per_cell.setdefault(cell, {
             "eval_idx": [],
             "pct_hi_il": [], "pct_hi_ao": [], "pct_hi_ol": [],
@@ -1433,8 +1434,8 @@ def main():
     # -----------------------------
     # Balanced training grid (20 cells)
     # -----------------------------
-    train_cells = [(float(p_lo), mode_name, cfg)
-                   for p_lo in P_LO_GRID_DEFAULT
+    train_cells = [((p_lo, p_high), mode_name, cfg)
+                   for (p_lo, p_high) in zip(P_LO_GRID_DEFAULT, P_HI_GRID_DEFAULT)
                    for (mode_name, cfg) in TEACHER_MODES_DEFAULT]
     assert len(train_cells) == num_grid_cells, f'Expected {num_grid_cells} grid cells, got {len(train_cells)}'
 
@@ -1451,9 +1452,9 @@ def main():
     def _dispatch_rollouts(cells, agent_state_ref, update_idx):
         """Fire all B run_session tasks without waiting; returns future list."""
         futures = []
-        for i, (p_lo, mode_name, cfg) in enumerate(cells):
+        for i, ((p_lo, p_hi), mode_name, cfg) in enumerate(cells):
             probs = sample_probs_this_session(
-                session_K, p_hi=float(args.p_hi), p_lo=float(p_lo), rng=rng_train)
+                session_K, p_hi=float(p_hi), p_lo=float(p_lo), rng=rng_train)
             print_flag = (i == 0) and (update_idx % 10 == 0)
             futures.append(
                 workers[i % W].run_session.remote(
@@ -1614,13 +1615,14 @@ def main():
             agent_state_cpu = {k: v.detach().cpu() for k, v in agent.state_dict().items()}
 
             p_lo_grid = P_LO_GRID_DEFAULT
+            p_hi_grid = P_HI_GRID_DEFAULT
             teacher_modes = TEACHER_MODES_DEFAULT
 
             macro, robust, eval_score, il_mean, ao_mean, ol_mean = eval_grid_score(
                 workers=workers,
                 agent_state_cpu=agent_state_cpu,
                 session_K=session_K,
-                p_hi=args.p_hi,
+                p_hi_grid=p_hi_grid,
                 p_lo_grid=p_lo_grid,
                 teacher_modes=teacher_modes,
                 n_sessions_per_cell=args.eval_sessions_per_cell,
@@ -1651,6 +1653,7 @@ def main():
                         "eval_score": float(eval_score),
                         "macro": float(macro),
                         "robust": float(robust),
+                        "p_hi_grid" : list(p_hi_grid),
                         "p_lo_grid": list(p_lo_grid),
                         "teacher_modes": [m for m, _ in teacher_modes],
                         "train_memory_lambda": float(args.train_memory_lambda),
@@ -1777,10 +1780,12 @@ def main():
     # Post-training grid eval (optional): teacher modes × reward probs
     # -----------------------------
     if args.post_grid_eval:
-        p_hi = float(args.p_hi)
-        # p_lo_grid = np.linspace(float(args.p_lo_max), float(args.p_lo_min), int(args.p_lo_steps))
         p_lo_grid = P_LO_GRID_DEFAULT  # fixed p_lo values for clearer plots (can be overridden by args)
+        p_hi_grid = P_HI_GRID_DEFAULT  # diagonal pairing with p_lo_grid (zip semantics)
         teacher_modes = TEACHER_MODES_DEFAULT
+        # diagonal grid: each p_lo has exactly one paired p_hi.
+        # consumer code below keys plots/CSV by p_lo, so map p_lo -> its p_hi.
+        phi_for_plo = {float(pl): float(ph) for ph, pl in zip(p_hi_grid, p_lo_grid)}
 
         print(f"[PostGrid] Evaluating {len(p_lo_grid)} p_lo values × {len(teacher_modes)} teacher modes = {len(p_lo_grid)*len(teacher_modes)} cells")
         print(f"[PostGrid] Sessions per cell: {int(args.post_grid_sessions_per_cell)}")
@@ -1789,7 +1794,7 @@ def main():
             workers=workers,
             agent_state_cpu=agent_state_cpu,
             session_K=session_K,
-            p_hi=p_hi,
+            p_hi_grid=[float(x) for x in p_hi_grid],
             p_lo_grid=[float(x) for x in p_lo_grid],
             teacher_modes=teacher_modes,
             n_sessions_per_cell=int(args.post_grid_sessions_per_cell),
@@ -1811,12 +1816,13 @@ def main():
             )
             for p_lo in p_lo_grid:
                 for mode_name, _cfg in teacher_modes:
-                    k = (float(p_lo), str(mode_name))
+                    p_hi_cell = phi_for_plo[float(p_lo)]
+                    k = ((p_hi_cell, float(p_lo)), str(mode_name))
                     if k not in cell_stats:
                         continue
                     st = cell_stats[k]
                     f.write(
-                        f"{p_hi:.4f},{float(p_lo):.4f},{(p_hi-float(p_lo)):.4f},{mode_name},"
+                        f"{p_hi_cell:.4f},{float(p_lo):.4f},{(p_hi_cell-float(p_lo)):.4f},{mode_name},"
                         f"{st['pct_hi_il_mean']:.4f},{st['pct_hi_il_std']:.4f},{st['pct_hi_ao_mean']:.4f},{st['pct_hi_ao_std']:.4f},{st['pct_hi_ol_mean']:.4f},{st['pct_hi_ol_std']:.4f},"
                         f"{st['cum_rew_il_mean']:.4f},{st['cum_rew_il_std']:.4f},{st['cum_rew_ao_mean']:.4f},{st['cum_rew_ao_std']:.4f},{st['cum_rew_ol_mean']:.4f},{st['cum_rew_ol_std']:.4f},"
                         f"{st['gtrace_ao_mean_over_trials']:.4f},{st['gtrace_ol_mean_over_trials']:.4f}\n"
@@ -1829,7 +1835,7 @@ def main():
         npz_payload: Dict[str, Any] = {}
         for p_lo in p_lo_grid:
             for mode_name, _cfg in teacher_modes:
-                k = (float(p_lo), str(mode_name))
+                k = ((phi_for_plo[float(p_lo)], float(p_lo)), str(mode_name))
                 st = cell_stats.get(k)
                 if st is None:
                     continue
@@ -1871,12 +1877,12 @@ def main():
 
         for p_lo in p_lo_grid:
             for mode_name, _cfg in teacher_modes:
-                k = (float(p_lo), str(mode_name))
+                k = ((phi_for_plo[float(p_lo)], float(p_lo)), str(mode_name))
                 st = cell_stats.get(k)
                 if st is None:
                     continue
                 tag = f"mode={mode_name}__pLo={float(p_lo):.2f}"
-                gap = p_hi - float(p_lo)
+                gap = phi_for_plo[float(p_lo)] - float(p_lo)
 
                 # ── per-trial hit rates (mean and SE, shape (T,)) ──
                 for cond in ("il", "ao", "ol"):
@@ -1944,11 +1950,11 @@ def main():
 
         for p_lo in p_lo_grid:
             for mode_name, _cfg in teacher_modes:
-                k = (float(p_lo), str(mode_name))
+                k = ((phi_for_plo[float(p_lo)], float(p_lo)), str(mode_name))
                 if k not in cell_stats:
                     continue
                 st = cell_stats[k]
-                gap = p_hi - float(p_lo)
+                gap = phi_for_plo[float(p_lo)] - float(p_lo)
 
                 # ----------------------------------------------------------
                 # 1. Per-trial curve  (smoothed mean ± SE, raw mean faint behind)
@@ -2176,7 +2182,7 @@ def main():
         # ------------------
         mode_names = [m for m, _ in teacher_modes]
         p_lo_list = [float(x) for x in p_lo_grid]
-        gaps = np.array([p_hi - x for x in p_lo_list], dtype=np.float32)
+        gaps = np.array([phi_for_plo[x] - x for x in p_lo_list], dtype=np.float32)
 
         # per-mode curves
         for mode_name, _cfg in teacher_modes:
@@ -2184,7 +2190,7 @@ def main():
             ao = []
             ol = []
             for p_lo in p_lo_list:
-                st = cell_stats.get((p_lo, str(mode_name)))
+                st = cell_stats.get(((phi_for_plo[p_lo], p_lo), str(mode_name)))
                 if st is None:
                     il.append(np.nan)
                     ao.append(np.nan)
@@ -2228,7 +2234,7 @@ def main():
         mat_g_ol = np.full_like(mat_il, np.nan)
         for i, p_lo in enumerate(p_lo_list):
             for j, mode_name in enumerate(mode_names):
-                st = cell_stats.get((p_lo, str(mode_name)))
+                st = cell_stats.get(((phi_for_plo[p_lo], p_lo), str(mode_name)))
                 if st is None:
                     continue
                 mat_il[i, j] = st["pct_hi_il_mean"]
@@ -2262,7 +2268,7 @@ def main():
             gaps_ok = []
 
             for p_lo in p_lo_list:
-                st = cell_stats.get((p_lo, str(mode_name)))
+                st = cell_stats.get(((phi_for_plo[p_lo], p_lo), str(mode_name)))
                 if st is None:
                     continue
                 pertrial_il.append(np.asarray(st["pertrial_il_mean"], dtype=np.float32))
@@ -2276,7 +2282,7 @@ def main():
                 pct_il_std.append(float(st["pct_hi_il_std"]))
                 pct_ao_std.append(float(st["pct_hi_ao_std"]))
                 pct_ol_std.append(float(st["pct_hi_ol_std"]))
-                gaps_ok.append(float(p_hi - p_lo))
+                gaps_ok.append(float(phi_for_plo[p_lo] - p_lo))
 
             if len(pertrial_il) == 0:
                 continue
@@ -2351,7 +2357,7 @@ def main():
             ax3.grid(True)
             ax3.legend()
 
-            fig.suptitle(f"Post-grid mega-summary — {mode_name} (p_hi={p_hi:.2f})", y=1.02)
+            fig.suptitle(f"Post-grid mega-summary — {mode_name} (diagonal p_hi/p_lo grid)", y=1.02)
             fig.tight_layout()
             fig.savefig(os.path.join(run_dir, f"PostGrid_MegaSummary_Mode_{mode_name}.png"), dpi=150, bbox_inches="tight")
             plt.close(fig)
