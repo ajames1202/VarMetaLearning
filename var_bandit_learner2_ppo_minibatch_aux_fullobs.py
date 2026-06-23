@@ -797,10 +797,10 @@ class BanditLearner(nn.Module):
                 self.gate_ol(torch.cat([ctx_left_ol_s, ctx_right_ol_s, ctx_left_ol_o, ctx_right_ol_o], dim=-1))
             ).clamp(0.0, 1.0)
 
-            #Ablation test, setting g_ol to 0.1
-            if ablation_g is not None:
-                g_ol = torch.full_like(g_ol, ablation_g)
-                g_ao = torch.full_like(g_ao, ablation_g)
+            # #Ablation test, setting g_ol to 0.1
+            # if ablation_g is not None:
+            #     g_ol = torch.full_like(g_ol, ablation_g)
+            #     g_ao = torch.full_like(g_ao, ablation_g)
 
             #Ablation test, setting g_ol to 0.1
             # g_ao = torch.full_like(g_ao, 0.0)
