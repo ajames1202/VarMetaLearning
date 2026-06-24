@@ -89,8 +89,8 @@ def sample_probs_this_session(session_K: int, p_hi: float, p_lo: float, rng: np.
 
 # Default training/eval grid (can edit here)
 #P_LO_GRID_DEFAULT = [0.2, 0.3, 0.4, 0.5, 0.6]
-P_LO_GRID_DEFAULT = [0.2]
-P_HI_GRID_DEFAULT = [0.8]
+P_LO_GRID_DEFAULT = [0.2,0.3]
+P_HI_GRID_DEFAULT = [0.8, 0.7]
 _DEFAULT_TEACHER_MODES = [
     ["expert", {"expert_teacher": True, "unrealiable_teacher": False, "eps": 0.10}],
 ]
